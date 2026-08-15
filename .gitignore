@@ -1,3 +1,7 @@
+# 依赖与构建产物
+node_modules/
+dist/
+
 # 运行时生成的数据与本地配置(可能含敏感信息)
 data.db
 data.db-shm
@@ -5,9 +9,6 @@ data.db-wal
 server.log
 config.json
 
-# 开发辅助脚本(一次性验证用)
-verify_watchlist.py
-
-# Python
+# Python 旧版遗留
 __pycache__/
 *.pyc

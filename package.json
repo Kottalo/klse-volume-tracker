@@ -1,0 +1,24 @@
+{
+  "name": "klse-volume-tracker",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "马来西亚股票(KLSE)成交量异动追踪 — React + Express + SSE",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.4.1",
+    "vite": "^6.3.5"
+  }
+}
