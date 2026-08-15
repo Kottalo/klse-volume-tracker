@@ -359,7 +359,14 @@ app.get('/api/events', (req, res) => {
   });
   res.write('retry: 3000\n\n');
   clients.add(res);
-  req.on('close', () => clients.delete(res));
+  // 心跳: 每 30s 发一个注释帧, 防止代理层在两次数据间(最长 10 分钟)把连接当空闲断掉
+  const heartbeat = setInterval(() => {
+    try { res.write(': ping\n\n'); } catch { clearInterval(heartbeat); }
+  }, 30000);
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    clients.delete(res);
+  });
 });
 
 app.post('/api/settings', (req, res) => {
