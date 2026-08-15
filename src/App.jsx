@@ -89,14 +89,6 @@ export default function App() {
     setAddCode('');
   }
 
-  async function removeStock(code) {
-    await fetch('/api/watchlist/remove', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code }),
-    });
-  }
-
   function requestNotify() {
     if (typeof Notification === 'undefined') return;
     Notification.requestPermission();
@@ -120,7 +112,6 @@ export default function App() {
             ) : '载入中…'}
           </div>
           <div className="row">
-            <button className="ghost" onClick={() => fetch('/api/poll', { method: 'POST' })}>🔄 立即抓取</button>
             <button className="ghost" onClick={() => setShowSettings((v) => !v)}>⚙ 高级设置</button>
             <button className="ghost" onClick={requestNotify}>🔔 通知</button>
           </div>
@@ -184,7 +175,7 @@ export default function App() {
             <table>
               <thead><tr>
                 <th>代码</th><th>名称</th><th>现价</th>
-                <th>当前时段量</th><th>上一时段量</th><th>比率</th><th>状态</th><th></th>
+                <th>当前时段量</th><th>上一时段量</th><th>比率</th>
               </tr></thead>
               <tbody>
                 {s?.stocks.map((st) => {
@@ -195,10 +186,6 @@ export default function App() {
                       {st.ratio.toFixed(1)}%
                     </span>
                   );
-                  const badge = st.status === 'alert' ? <span className="badge alert">⚠ 异动</span>
-                    : st.status === 'ok' ? <span className="badge ok">正常</span>
-                    : st.status === 'low' ? <span className="badge low">量少</span>
-                    : <span className="badge nodata">无数据</span>;
                   return (
                     <tr key={st.code}>
                       <td><span className="code">{st.code}.KL</span></td>
@@ -207,8 +194,6 @@ export default function App() {
                       <td>{fmt(st.current)}</td>
                       <td>{fmt(st.previous)}</td>
                       <td>{ratioHtml}</td>
-                      <td>{badge}</td>
-                      <td><button className="danger" onClick={() => removeStock(st.code)}>✕</button></td>
                     </tr>
                   );
                 })}
