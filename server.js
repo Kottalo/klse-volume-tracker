@@ -78,6 +78,9 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS samples(
     stock TEXT, ts INTEGER, vol INTEGER, PRIMARY KEY(stock, ts));
   CREATE INDEX IF NOT EXISTS idx_samples ON samples(stock, ts);
+  CREATE TABLE IF NOT EXISTS daily(
+    stock TEXT, date TEXT, volume INTEGER, PRIMARY KEY(stock, date));
+  CREATE INDEX IF NOT EXISTS idx_daily ON daily(stock, date);
   CREATE TABLE IF NOT EXISTS live(
     stock TEXT PRIMARY KEY, name TEXT, price REAL, mtime INTEGER);
   CREATE TABLE IF NOT EXISTS alerts(
@@ -91,6 +94,12 @@ function storeCandles(code, candles) {
   if (!candles.length) return;
   const stmt = db.prepare('INSERT OR IGNORE INTO samples(stock, ts, vol) VALUES(?,?,?)');
   for (const [t, v] of candles) stmt.run(code, Math.floor(t / 300) * 300, v);
+}
+
+function storeDaily(code, rows) {
+  if (!rows.length) return;
+  const stmt = db.prepare('INSERT INTO daily(stock, date, volume) VALUES(?,?,?) ON CONFLICT(stock, date) DO UPDATE SET volume=excluded.volume');
+  for (const [date, volume] of rows) stmt.run(code, date, volume);
 }
 
 function updateLive(code, name, price, mtime) {
@@ -136,6 +145,21 @@ async function fetchBackfill(code) {
   return parseChart(d).candles;
 }
 
+// 日线数据(用于「天」时段): interval=1d + 大 range 拿长期历史
+async function fetchDaily(code, range = '1y') {
+  const d = await yahooGet(`https://query1.finance.yahoo.com/v8/finance/chart/${code}.KL?interval=1d&range=${range}`);
+  const r = d.chart.result[0];
+  const ts = r.timestamp || [];
+  const vol = r.indicators?.quote?.[0]?.volume || [];
+  const out = [];
+  const n = Math.min(ts.length, vol.length);
+  for (let i = 0; i < n; i++) {
+    const v = vol[i];
+    if (v != null && v > 0) out.push([mytDate(ts[i]), v]);
+  }
+  return out;
+}
+
 // ---------------- 成交量计算 ----------------
 function mytDate(tsSec) {  // 马来西亚时区(UTC+8)的日期字符串
   return new Date(tsSec * 1000 + 8 * 3600 * 1000).toISOString().slice(0, 10);
@@ -148,19 +172,13 @@ function computeVolumes(code, window) {
   const now = row.m;
 
   if (pw.unit === 'd') {
-    // n 天 = 最近 n 个交易日累计 vs 前 n 个交易日累计(按马来西亚自然日分桶)
+    // n 天 = 最近 n 个交易日累计 vs 前 n 个交易日累计(日线数据)
     const n = pw.value;
-    const rows = db.prepare('SELECT ts, vol FROM samples WHERE stock=? AND ts > ? ORDER BY ts')
-      .all(code, now - (2 * n + 7) * 86400);
-    const buckets = {};
-    for (const r of rows) {
-      const d = mytDate(r.ts);
-      buckets[d] = (buckets[d] || 0) + r.vol;
-    }
-    const dates = Object.keys(buckets).sort();
-    if (dates.length < 2 * n) return null;
-    const current = dates.slice(-n).reduce((s, d) => s + buckets[d], 0);
-    const previous = dates.slice(-2 * n, -n).reduce((s, d) => s + buckets[d], 0);
+    const rows = db.prepare('SELECT volume FROM daily WHERE stock=? ORDER BY date DESC LIMIT ?')
+      .all(code, 2 * n);
+    if (rows.length < 2 * n) return null;
+    const current = rows.slice(0, n).reduce((s, r) => s + r.volume, 0);
+    const previous = rows.slice(n, 2 * n).reduce((s, r) => s + r.volume, 0);
     return { current, previous };
   }
 
@@ -281,11 +299,13 @@ function poll(backfill = false) {
       const cfg = loadConfig();
       const watchlist = cfg.watchlist;
       if (backfill && !backfilled) {
-        log(`回填 5 日 candle (${watchlist.length} 只)...`);
+        log(`回填历史数据 (${watchlist.length} 只)...`);
         for (const w of watchlist) {
           try { storeCandles(w.code, await fetchBackfill(w.code)); }
           catch (e) { log(`backfill ${w.code} 失败: ${e.message}`); }
-          await sleep(250);
+          try { storeDaily(w.code, await fetchDaily(w.code, '1y')); }
+          catch (e) { log(`daily ${w.code} 失败: ${e.message}`); }
+          await sleep(300);
         }
         backfilled = true;
       }
@@ -295,6 +315,8 @@ function poll(backfill = false) {
           storeCandles(w.code, d.candles);
           if (d.name) updateLive(w.code, d.name, d.price, d.mtime);
         } catch (e) { log(`poll ${w.code} 失败: ${e.message}`); }
+        try { storeDaily(w.code, await fetchDaily(w.code, '5d')); }
+        catch (e) {}
         await sleep(200);
       }
       evaluateAlerts(cfg);
