@@ -321,12 +321,12 @@ async function maybePoll() {
   await poll();
 }
 
-// 有客户端连接时定时抓取推送; 无客户端则跳过(省请求)
+// 后台定时抓取(开市时段): 无人值守也能自动追踪 + 提醒
 let pollTimer = null;
-function ensurePolling() {
+function startPolling() {
   if (pollTimer) return;
   pollTimer = setInterval(() => {
-    if (clients.size > 0) maybePoll();
+    if (isMarketOpen()) maybePoll();  // 内部有节流, 数据陈旧才真抓
   }, 60 * 1000);
 }
 
@@ -386,7 +386,6 @@ app.get('/api/events', (req, res) => {
   });
   res.write('retry: 3000\n\n');
   clients.add(res);
-  ensurePolling();
   maybePoll();  // 连接建立时即时刷新
   // 心跳: 每 30s 发一个注释帧, 防止代理层在两次数据间(最长 10 分钟)把连接当空闲断掉
   const heartbeat = setInterval(() => {
@@ -460,4 +459,5 @@ app.listen(PORT, () => {
   log(`KLSE Volume Tracker 已启动 → http://localhost:${PORT}`);
   log(`自选股 ${loadConfig().watchlist.length} 只, 轮询间隔 ${loadConfig().poll_interval_minutes} 分钟`);
 });
-poll(true);  // 启动时回填历史
+poll(true);      // 启动时回填历史
+startPolling();  // 开市时段后台定时抓取(无人值守追踪)
