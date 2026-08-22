@@ -110,6 +110,19 @@ export default function App() {
   const s = state;
   const open = s?.status.market_open;
 
+  // 初始载入中(尚未拿到数据)显示旋转 loader
+  if (!s) {
+    return (
+      <>
+        <style>{css}</style>
+        <div className="loader-wrap">
+          <div className="spinner"></div>
+          <div className="loader-text">正在载入数据…</div>
+        </div>
+      </>
+    );
+  }
+
   return (
     <>
       <style>{css}</style>
@@ -303,4 +316,8 @@ const css = `
   .seg button{background:transparent;color:var(--dim);border:0;border-radius:7px;padding:6px 13px;cursor:pointer;font-size:13px}
   .seg button:hover{color:var(--text)}
   .seg button.on{background:var(--accent);color:#fff}
+  .loader-wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px}
+  .spinner{width:44px;height:44px;border:4px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+  .loader-text{color:var(--dim);font-size:14px}
+  @keyframes spin{to{transform:rotate(360deg)}}
 `;
