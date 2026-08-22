@@ -270,52 +270,64 @@ function isMarketOpen() {
 }
 
 // ---------------- 调度 ----------------
-let polling = false;
 let backfilled = false;
 let lastPoll = null;
+let pollPromise = null;
 
-async function poll(backfill = false) {
-  if (polling) return;
-  polling = true;
-  try {
-    const cfg = loadConfig();
-    const watchlist = cfg.watchlist;
-    if (backfill && !backfilled) {
-      log(`回填 5 日 candle (${watchlist.length} 只)...`);
-      for (const w of watchlist) {
-        try { storeCandles(w.code, await fetchBackfill(w.code)); }
-        catch (e) { log(`backfill ${w.code} 失败: ${e.message}`); }
-        await sleep(250);
+function poll(backfill = false) {
+  if (pollPromise) return pollPromise;  // 复用进行中的抓取, 避免并发打 Yahoo
+  pollPromise = (async () => {
+    try {
+      const cfg = loadConfig();
+      const watchlist = cfg.watchlist;
+      if (backfill && !backfilled) {
+        log(`回填 5 日 candle (${watchlist.length} 只)...`);
+        for (const w of watchlist) {
+          try { storeCandles(w.code, await fetchBackfill(w.code)); }
+          catch (e) { log(`backfill ${w.code} 失败: ${e.message}`); }
+          await sleep(250);
+        }
+        backfilled = true;
       }
-      backfilled = true;
+      for (const w of watchlist) {
+        try {
+          const d = await fetchIntraday(w.code);
+          storeCandles(w.code, d.candles);
+          if (d.name) updateLive(w.code, d.name, d.price, d.mtime);
+        } catch (e) { log(`poll ${w.code} 失败: ${e.message}`); }
+        await sleep(200);
+      }
+      evaluateAlerts(cfg);
+      prune();
+      lastPoll = Date.now() / 1000;
+      log(`即时抓取完成 (${watchlist.length} 只)`);
+      broadcast();
+    } finally {
+      pollPromise = null;
     }
-    for (const w of watchlist) {
-      try {
-        const d = await fetchIntraday(w.code);
-        storeCandles(w.code, d.candles);
-        if (d.name) updateLive(w.code, d.name, d.price, d.mtime);
-      } catch (e) { log(`poll ${w.code} 失败: ${e.message}`); }
-      await sleep(200);
-    }
-    evaluateAlerts(cfg);
-    prune();
-    lastPoll = Date.now() / 1000;
-    log(`轮询完成 (${watchlist.length} 只)`);
-    broadcast();
-  } finally {
-    polling = false;
-  }
+  })();
+  return pollPromise;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function scheduleNext() {
+// 节流即时抓取: 数据陈旧(超过轮询间隔)才真正抓 Yahoo, 否则直接用缓存
+async function maybePoll() {
+  if (pollPromise) await pollPromise;  // 正在抓, 等它完成
   const cfg = loadConfig();
-  const interval = Math.max(1, cfg.poll_interval_minutes || 10) * 60 * 1000;
-  setTimeout(async () => {
-    if (isMarketOpen()) await poll();
-    scheduleNext();
-  }, interval);
+  const interval = Math.max(1, cfg.poll_interval_minutes || 10) * 60;
+  if (lastPoll && (Date.now() / 1000 - lastPoll) < interval) return;
+  if (!isMarketOpen() && backfilled) return;  // 休市且已回填, 不抓
+  await poll();
+}
+
+// 有客户端连接时定时抓取推送; 无客户端则跳过(省请求)
+let pollTimer = null;
+function ensurePolling() {
+  if (pollTimer) return;
+  pollTimer = setInterval(() => {
+    if (clients.size > 0) maybePoll();
+  }, 60 * 1000);
 }
 
 // ---------------- SSE ----------------
@@ -349,7 +361,7 @@ function buildState() {
     status: {
       market_open: isMarketOpen(),
       last_poll: lastPoll,
-      polling,
+      polling: !!pollPromise,
       now: Math.floor(Date.now() / 1000),
     },
   };
@@ -360,7 +372,10 @@ const app = express();
 app.use(express.json());
 app.use(express.static(DIST));
 
-app.get('/api/state', (req, res) => res.json(buildState()));
+app.get('/api/state', async (req, res) => {
+  await maybePoll();  // 数据陈旧则即时抓取, 否则用缓存
+  res.json(buildState());
+});
 
 app.get('/api/events', (req, res) => {
   res.writeHead(200, {
@@ -371,6 +386,8 @@ app.get('/api/events', (req, res) => {
   });
   res.write('retry: 3000\n\n');
   clients.add(res);
+  ensurePolling();
+  maybePoll();  // 连接建立时即时刷新
   // 心跳: 每 30s 发一个注释帧, 防止代理层在两次数据间(最长 10 分钟)把连接当空闲断掉
   const heartbeat = setInterval(() => {
     try { res.write(': ping\n\n'); } catch { clearInterval(heartbeat); }
@@ -443,4 +460,4 @@ app.listen(PORT, () => {
   log(`KLSE Volume Tracker 已启动 → http://localhost:${PORT}`);
   log(`自选股 ${loadConfig().watchlist.length} 只, 轮询间隔 ${loadConfig().poll_interval_minutes} 分钟`);
 });
-poll(true).then(() => scheduleNext());
+poll(true);  // 启动时回填历史
