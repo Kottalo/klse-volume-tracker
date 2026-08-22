@@ -24,8 +24,14 @@ const DEFAULTS = {
   telegram_chat_id: '',
 };
 
-// 对比时段 -> 5 分钟 candle 数量(交易时段滚动, 自动跳过午休/隔夜)
-const WINDOW_CANDLES = { '10m': 2, '30m': 6, '1h': 12, '2h': 24, '5h': 60 };
+// 解析时段: '10m' | '2h' | '3d' → { value, unit }  (m=分钟 h=小时 d=天)
+function parseWindow(window) {
+  const m = /^(\d{1,4})([mhd])$/.exec(String(window));
+  if (!m) return null;
+  const value = parseInt(m[1], 10);
+  if (value <= 0) return null;
+  return { value, unit: m[2] };
+}
 
 const DEFAULT_WATCHLIST = [
   ['1155', 'Maybank'], ['1295', 'Public Bank'], ['1023', 'CIMB'],
@@ -136,24 +142,31 @@ function mytDate(tsSec) {  // 马来西亚时区(UTC+8)的日期字符串
 }
 
 function computeVolumes(code, window) {
+  const pw = parseWindow(window);
   const row = db.prepare('SELECT MAX(ts) m FROM samples WHERE stock=?').get(code);
-  if (!row || row.m == null) return null;
+  if (!pw || !row || row.m == null) return null;
   const now = row.m;
 
-  if (window === '1d') {
+  if (pw.unit === 'd') {
+    // n 天 = 最近 n 个交易日累计 vs 前 n 个交易日累计(按马来西亚自然日分桶)
+    const n = pw.value;
     const rows = db.prepare('SELECT ts, vol FROM samples WHERE stock=? AND ts > ? ORDER BY ts')
-      .all(code, now - 12 * 86400);
+      .all(code, now - (2 * n + 7) * 86400);
     const buckets = {};
     for (const r of rows) {
       const d = mytDate(r.ts);
       buckets[d] = (buckets[d] || 0) + r.vol;
     }
     const dates = Object.keys(buckets).sort();
-    if (dates.length < 2) return null;
-    return { current: buckets[dates[dates.length - 1]], previous: buckets[dates[dates.length - 2]] };
+    if (dates.length < 2 * n) return null;
+    const current = dates.slice(-n).reduce((s, d) => s + buckets[d], 0);
+    const previous = dates.slice(-2 * n, -n).reduce((s, d) => s + buckets[d], 0);
+    return { current, previous };
   }
 
-  const n = WINDOW_CANDLES[window];
+  // 分钟/小时 -> 5 分钟 candle 数量(交易时段滚动, 自动跳过午休/隔夜)
+  const minutes = pw.unit === 'h' ? pw.value * 60 : pw.value;
+  const n = Math.max(1, Math.round(minutes / 5));
   const rows = db.prepare('SELECT vol FROM samples WHERE stock=? ORDER BY ts DESC LIMIT ?')
     .all(code, 2 * n);
   const current = rows.slice(0, n).reduce((s, r) => s + r.vol, 0);
@@ -338,7 +351,6 @@ function buildState() {
       last_poll: lastPoll,
       polling,
       now: Math.floor(Date.now() / 1000),
-      windows: [...Object.keys(WINDOW_CANDLES), '1d'],
     },
   };
 }

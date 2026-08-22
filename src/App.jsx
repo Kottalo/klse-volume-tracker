@@ -12,13 +12,13 @@ function fmtTime(ts) {
   return new Date(ts * 1000).toLocaleTimeString('zh-CN', { hour12: false });
 }
 
-const WINDOW_LABELS = { '10m': '10分钟', '30m': '30分钟', '1h': '1小时', '2h': '2小时', '5h': '5小时', '1d': '1天' };
-
 export default function App() {
   const [state, setState] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [addCode, setAddCode] = useState('');
   const [thr, setThr] = useState('200');
+  const [winValue, setWinValue] = useState('1');
+  const [winUnit, setWinUnit] = useState('h');
   const lastAlertId = useRef(0);
   const thrFocused = useRef(false);
 
@@ -37,8 +37,15 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (state) setThr(String(state.settings.threshold_percent));
+    if (state && !thrFocused.current) setThr(String(state.settings.threshold_percent));
   }, [state?.settings.threshold_percent]);
+
+  useEffect(() => {
+    if (state?.settings.window) {
+      const m = /^(\d+)([mhd])$/.exec(state.settings.window);
+      if (m) { setWinValue(m[1]); setWinUnit(m[2]); }
+    }
+  }, [state?.settings.window]);
 
   function checkNewAlerts(s) {
     if (!s.alerts?.length) return;
@@ -77,6 +84,12 @@ export default function App() {
       body: JSON.stringify(patch),
     });
     lastAlertId.current = 0;
+  }
+
+  function saveWindow(v, u) {
+    const n = parseInt(v, 10);
+    if (!n || n <= 0) return;
+    setSetting({ window: `${n}${u}` });
   }
 
   async function addStock() {
@@ -121,17 +134,25 @@ export default function App() {
         <div className="panel">
           <div className="quick">
             <span className="qlabel">对比时段</span>
-            <div className="seg">
-              {Object.keys(WINDOW_LABELS).map((w) => (
-                <button key={w} className={s?.settings.window === w ? 'on' : ''}
-                  onClick={() => setSetting({ window: w })}>{WINDOW_LABELS[w]}</button>
-              ))}
-            </div>
+            <input type="number" min="1" value={winValue} style={{ width: 70 }}
+              onChange={(e) => setWinValue(e.target.value)}
+              onBlur={() => saveWindow(winValue, winUnit)}
+              onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }} />
+            <select value={winUnit}
+              onChange={(e) => { setWinUnit(e.target.value); saveWindow(winValue, e.target.value); }}>
+              <option value="m">分钟</option>
+              <option value="h">小时</option>
+              <option value="d">天</option>
+            </select>
             <span className="qlabel">阈值</span>
             <input type="number" min="0" step="5" value={thr}
               onFocus={() => (thrFocused.current = true)}
-              onBlur={() => { thrFocused.current = false; }}
               onChange={(e) => setThr(e.target.value)}
+              onBlur={() => {
+                thrFocused.current = false;
+                const v = parseFloat(thr);
+                if (!isNaN(v) && v >= 0) setSetting({ threshold_percent: v });
+              }}
               onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }}
               style={{ width: 88 }} />
             <span style={{ color: 'var(--dim)' }}>%</span>
@@ -144,7 +165,7 @@ export default function App() {
             </div>
           </div>
           <div className="muted" style={{ marginTop: 10 }}>
-            当「当前时段量」达到「上一时段量」的阈值 % 时提醒。1 天模式 = 今日累计 vs 前一交易日。
+            当「当前时段量」达到「上一时段量」的阈值 % 时提醒。「天」= 最近 N 个交易日 vs 前 N 个交易日。
           </div>
         </div>
 
