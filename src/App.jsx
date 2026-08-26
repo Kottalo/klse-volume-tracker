@@ -16,6 +16,7 @@ export default function App() {
   const [state, setState] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [addCode, setAddCode] = useState('');
+  const [addPhone, setAddPhone] = useState('');
   const [thr, setThr] = useState('200');
   const [winValue, setWinValue] = useState('1');
   const [winUnit, setWinUnit] = useState('h');
@@ -105,6 +106,27 @@ export default function App() {
   function requestNotify() {
     if (typeof Notification === 'undefined') return;
     Notification.requestPermission();
+  }
+
+  async function addPhoneHandler() {
+    const p = addPhone.trim().replace(/\D/g, '');
+    if (!/^01\d{8,9}$/.test(p)) { alert('手机号格式不对 (01 开头, 10-11 位)'); return; }
+    const r = await fetch('/api/recipients/add', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone: p }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (j.error) alert(j.error);
+    setAddPhone('');
+  }
+
+  async function removePhone(p) {
+    await fetch('/api/recipients/remove', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone: p }),
+    });
   }
 
   const s = state;
@@ -237,6 +259,25 @@ export default function App() {
           </div>
         </div>
 
+        {/* 通知名单 */}
+        <div className="panel">
+          <h2>通知名单 <span className="muted">(放量达标时发 WhatsApp)</span></h2>
+          <div className="row" style={{ marginBottom: 12 }}>
+            <input placeholder="手机号 01xxxxxxxxx" style={{ width: 200 }} value={addPhone}
+              onChange={(e) => setAddPhone(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addPhoneHandler()} />
+            <button onClick={addPhoneHandler}>添加</button>
+            <span className="muted">马来西亚手机号, 省略 +60 只填 01 开头</span>
+          </div>
+          <div className="chips">
+            {s?.whatsapp_recipients?.length ? s.whatsapp_recipients.map((p) => (
+              <span className="chip" key={p}>
+                {p}
+                <button className="chip-x" onClick={() => removePhone(p)}>✕</button>
+              </span>
+            )) : <div className="muted">暂无通知号码</div>}
+          </div>
+        </div>
+
         {/* 告警记录 */}
         <div className="panel">
           <h2>告警记录</h2>
@@ -317,6 +358,10 @@ const css = `
   .seg button{background:transparent;color:var(--dim);border:0;border-radius:7px;padding:6px 13px;cursor:pointer;font-size:13px}
   .seg button:hover{color:var(--text)}
   .seg button.on{background:var(--accent);color:#fff}
+  .chips{display:flex;flex-wrap:wrap;gap:8px}
+  .chip{display:inline-flex;align-items:center;gap:6px;background:var(--panel2);border:1px solid var(--border);border-radius:20px;padding:5px 12px;font-size:13px;font-family:ui-monospace,Consolas,monospace}
+  .chip-x{background:transparent;border:0;color:var(--dim);padding:0;cursor:pointer;font-size:13px;line-height:1}
+  .chip-x:hover{color:var(--red)}
   .loader-wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px}
   .spinner{width:44px;height:44px;border:4px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
   .loader-text{color:var(--dim);font-size:14px}

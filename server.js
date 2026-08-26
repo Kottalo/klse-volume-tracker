@@ -26,6 +26,7 @@ const DEFAULTS = {
   twilio_auth_token: '',
   twilio_from: '+15594914664',
   twilio_to: '+601118930633',
+  whatsapp_recipients: [],
 };
 
 // 解析时段: '10m' | '2h' | '3d' → { value, unit }  (m=分钟 h=小时 d=天)
@@ -97,7 +98,7 @@ db.exec(`
     window TEXT, current INTEGER, previous INTEGER, ratio REAL, direction TEXT);
   CREATE TABLE IF NOT EXISTS state(
     stock TEXT PRIMARY KEY, above INTEGER, last_alert INTEGER);
-  CREATE TABLE IF NOT EXISTS whatsapp_sent(
+  CREATE TABLE IF NOT EXISTS daily_alert(
     stock TEXT, date TEXT, ts INTEGER, PRIMARY KEY(stock, date));
 `);
 
@@ -266,12 +267,33 @@ async function sendTelegram(m, window, cfg) {
   } catch (e) { log(`telegram failed: ${e.message}`); }
 }
 
+async function sendTelegramText(text, cfg) {
+  const token = (cfg.telegram_bot_token || '').trim();
+  const chat = (cfg.telegram_chat_id || '').trim();
+  if (!token || !chat) return;
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chat, text }),
+    });
+    if (!res.ok) log(`telegram 失败: HTTP ${res.status}`);
+    else log('telegram 已发送');
+  } catch (e) { log(`telegram 失败: ${e.message}`); }
+}
+
 // ---------------- WhatsApp (Twilio) ----------------
-async function sendWhatsApp(text, cfg) {
+// 马来西亚手机号 01xxxxxxxxx → +60xxxxxxxxx (国际格式); 无效返回 null
+function toWhatsApp(phone) {
+  const p = String(phone || '').replace(/\D/g, '');
+  if (/^01\d{8,9}$/.test(p)) return '+60' + p.slice(1);
+  return null;
+}
+
+async function sendWhatsAppTo(to, text, cfg) {
   const sid = (cfg.twilio_sid || '').trim();
   const token = (cfg.twilio_auth_token || '').trim();
   const from = (cfg.twilio_from || '').trim();
-  const to = (cfg.twilio_to || '').trim();
   if (!sid || !token || !from || !to) return;
   const auth = Buffer.from(`${sid}:${token}`).toString('base64');
   const body = new URLSearchParams({
@@ -287,17 +309,19 @@ async function sendWhatsApp(text, cfg) {
     });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      log(`whatsapp 失败: HTTP ${res.status} ${j.message || j.code || ''}`);
+      log(`whatsapp 失败(${to}): HTTP ${res.status} ${j.message || j.code || ''}`);
     } else {
-      log('whatsapp 已发送');
+      log(`whatsapp 已发送 → ${to}`);
     }
-  } catch (e) { log(`whatsapp 失败: ${e.message}`); }
+  } catch (e) { log(`whatsapp 失败(${to}): ${e.message}`); }
 }
 
-// 日线放量提醒: 今日成交量 >= 昨日 2 倍 → WhatsApp (开市时段, 每天每只最多一次)
-function evaluateDailyWhatsApp(cfg) {
+// 日线放量提醒: 今日成交量 >= 昨日 2 倍 → 通知名单 WhatsApp (开市时段, 每天每只最多一次)
+function evaluateDailyAlert(cfg) {
   if (!isMarketOpen()) return;
-  if (!(cfg.twilio_sid && cfg.twilio_auth_token && cfg.twilio_from && cfg.twilio_to)) return;
+  if (!(cfg.twilio_sid && cfg.twilio_auth_token && cfg.twilio_from)) return;
+  const recips = (cfg.whatsapp_recipients || []).map(toWhatsApp).filter(Boolean);
+  if (!recips.length) return;
   const nowS = Math.floor(Date.now() / 1000);
   for (const w of cfg.watchlist) {
     const rows = db.prepare('SELECT date, volume FROM daily WHERE stock=? ORDER BY date DESC LIMIT 2').all(w.code);
@@ -306,16 +330,16 @@ function evaluateDailyWhatsApp(cfg) {
     if (!yesterday.volume) continue;
     const ratio = today.volume / yesterday.volume * 100;
     if (ratio < 200) continue;
-    const sent = db.prepare('SELECT 1 FROM whatsapp_sent WHERE stock=? AND date=?').get(w.code, today.date);
+    const sent = db.prepare('SELECT 1 FROM daily_alert WHERE stock=? AND date=?').get(w.code, today.date);
     if (sent) continue;
-    db.prepare('INSERT INTO whatsapp_sent(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
+    db.prepare('INSERT INTO daily_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
       .run(w.code, today.date, nowS);
     const live = db.prepare('SELECT price FROM live WHERE stock=?').get(w.code);
     const price = live?.price != null ? String(live.price) : '-';
     const text = `📈 放量提醒 — ${w.name || w.code} (${w.code}.KL)
 今日成交量 ${fmtNum(today.volume)} 已达昨日 ${fmtNum(yesterday.volume)} 的 ${ratio.toFixed(1)}%
 现价 ${price}`;
-    sendWhatsApp(text, cfg);
+    for (const to of recips) sendWhatsAppTo(to, text, cfg);
   }
 }
 
@@ -387,7 +411,7 @@ function poll(backfill = false) {
         await sleep(200);
       }
       evaluateAlerts(cfg);
-      evaluateDailyWhatsApp(cfg);
+      evaluateDailyAlert(cfg);
       prune();
       lastPoll = Date.now() / 1000;
       log(`即时抓取完成 (${watchlist.length} 只)`);
@@ -445,6 +469,7 @@ function buildState() {
       telegram_chat_id: cfg.telegram_chat_id,
     },
     watchlist: cfg.watchlist,
+    whatsapp_recipients: cfg.whatsapp_recipients || [],
     stocks: computeMetrics(cfg),
     alerts: db.prepare(`SELECT id, ts, stock, name, window, current, previous, ratio, direction
       FROM alerts ORDER BY id DESC LIMIT 100`).all(),
@@ -536,7 +561,32 @@ app.post('/api/poll', (req, res) => {
 
 app.post('/api/test-whatsapp', async (req, res) => {
   const cfg = loadConfig();
-  await sendWhatsApp('✅ KLSE Volume Tracker 测试 — WhatsApp 通知已接通', cfg);
+  const recips = (cfg.whatsapp_recipients || []).map(toWhatsApp).filter(Boolean);
+  if (!recips.length) return res.status(400).json({ error: '通知名单为空' });
+  for (const to of recips) await sendWhatsAppTo(to, '✅ KLSE Volume Tracker 测试 — WhatsApp 通知已接通', cfg);
+  res.json({ ok: true, sent: recips.length });
+});
+
+app.post('/api/recipients/add', (req, res) => {
+  const phone = String(req.body.phone || '').replace(/\D/g, '');
+  if (!/^01\d{8,9}$/.test(phone)) {
+    return res.status(400).json({ error: '马来西亚手机号格式不对 (01 开头, 10-11 位)' });
+  }
+  const cfg = loadConfig();
+  if (!Array.isArray(cfg.whatsapp_recipients)) cfg.whatsapp_recipients = [];
+  if (cfg.whatsapp_recipients.includes(phone)) return res.json({ ok: true, dup: true });
+  cfg.whatsapp_recipients.push(phone);
+  saveConfig(cfg);
+  broadcast();
+  res.json({ ok: true });
+});
+
+app.post('/api/recipients/remove', (req, res) => {
+  const phone = String(req.body.phone || '').replace(/\D/g, '');
+  const cfg = loadConfig();
+  cfg.whatsapp_recipients = (cfg.whatsapp_recipients || []).filter((p) => p !== phone);
+  saveConfig(cfg);
+  broadcast();
   res.json({ ok: true });
 });
 
