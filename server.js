@@ -27,6 +27,7 @@ const DEFAULTS = {
   twilio_from: '+15594914664',
   twilio_to: '+601118930633',
   whatsapp_recipients: [],
+  twilio_content_sid: '',
 };
 
 // 解析时段: '10m' | '2h' | '3d' → { value, unit }  (m=分钟 h=小时 d=天)
@@ -74,6 +75,7 @@ function loadConfig() {
   if (process.env.TWILIO_AUTH_TOKEN) cfg.twilio_auth_token = process.env.TWILIO_AUTH_TOKEN;
   if (process.env.TWILIO_FROM) cfg.twilio_from = process.env.TWILIO_FROM;
   if (process.env.TWILIO_TO) cfg.twilio_to = process.env.TWILIO_TO;
+  if (process.env.TWILIO_CONTENT_SID) cfg.twilio_content_sid = process.env.TWILIO_CONTENT_SID;
   return cfg;
 }
 
@@ -290,16 +292,17 @@ function toWhatsApp(phone) {
   return null;
 }
 
-async function sendWhatsAppTo(to, text, cfg) {
+async function sendWhatsAppTemplate(to, contentSid, variables, cfg) {
   const sid = (cfg.twilio_sid || '').trim();
   const token = (cfg.twilio_auth_token || '').trim();
   const from = (cfg.twilio_from || '').trim();
-  if (!sid || !token || !from || !to) return;
+  if (!sid || !token || !from || !to || !contentSid) return;
   const auth = Buffer.from(`${sid}:${token}`).toString('base64');
   const body = new URLSearchParams({
     From: 'whatsapp:' + from.replace(/^whatsapp:/, ''),
     To: 'whatsapp:' + to.replace(/^whatsapp:/, ''),
-    Body: text,
+    ContentSid: contentSid,
+    ContentVariables: JSON.stringify(variables),
   });
   try {
     const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`, {
@@ -320,6 +323,8 @@ async function sendWhatsAppTo(to, text, cfg) {
 function evaluateDailyAlert(cfg) {
   if (!isMarketOpen()) return;
   if (!(cfg.twilio_sid && cfg.twilio_auth_token && cfg.twilio_from)) return;
+  const contentSid = (cfg.twilio_content_sid || '').trim();
+  if (!contentSid) return;
   const recips = (cfg.whatsapp_recipients || []).map(toWhatsApp).filter(Boolean);
   if (!recips.length) return;
   const nowS = Math.floor(Date.now() / 1000);
@@ -335,11 +340,15 @@ function evaluateDailyAlert(cfg) {
     db.prepare('INSERT INTO daily_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
       .run(w.code, today.date, nowS);
     const live = db.prepare('SELECT price FROM live WHERE stock=?').get(w.code);
-    const price = live?.price != null ? String(live.price) : '-';
-    const text = `📈 放量提醒 — ${w.name || w.code} (${w.code}.KL)
-今日成交量 ${fmtNum(today.volume)} 已达昨日 ${fmtNum(yesterday.volume)} 的 ${ratio.toFixed(1)}%
-现价 ${price}`;
-    for (const to of recips) sendWhatsAppTo(to, text, cfg);
+    const variables = {
+      '1': w.name || w.code,
+      '2': w.code,
+      '3': fmtNum(today.volume),
+      '4': ratio.toFixed(1),
+      '5': fmtNum(yesterday.volume),
+      '6': live?.price != null ? String(live.price) : '-',
+    };
+    for (const to of recips) sendWhatsAppTemplate(to, contentSid, variables, cfg);
   }
 }
 
@@ -561,9 +570,12 @@ app.post('/api/poll', (req, res) => {
 
 app.post('/api/test-whatsapp', async (req, res) => {
   const cfg = loadConfig();
+  const contentSid = (cfg.twilio_content_sid || '').trim();
+  if (!contentSid) return res.status(400).json({ error: '未配置模板 ContentSid' });
   const recips = (cfg.whatsapp_recipients || []).map(toWhatsApp).filter(Boolean);
   if (!recips.length) return res.status(400).json({ error: '通知名单为空' });
-  for (const to of recips) await sendWhatsAppTo(to, '✅ KLSE Volume Tracker 测试 — WhatsApp 通知已接通', cfg);
+  const vars = { '1': 'YTL Power', '2': '6742', '3': '30.97M', '4': '458.0', '5': '6.76M', '6': '5.880' };
+  for (const to of recips) await sendWhatsAppTemplate(to, contentSid, vars, cfg);
   res.json({ ok: true, sent: recips.length });
 });
 
