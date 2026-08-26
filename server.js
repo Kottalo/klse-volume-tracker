@@ -14,7 +14,7 @@ const DIST = path.join(__dirname, 'dist');
 const PORT = process.env.PORT || 8080;
 
 const DEFAULTS = {
-  poll_interval_minutes: 10,
+  poll_interval_minutes: 5,   // 开市时段每 5 分钟轮询
   window: '1h',               // 10m | 30m | 1h | 2h | 5h | 1d
   threshold_percent: 200,     // 当前时段量 >= 上一时段量的 n% 时提醒
   direction: 'surge',         // surge=放量 | drop=缩量
@@ -22,6 +22,10 @@ const DEFAULTS = {
   cooldown_minutes: 30,
   telegram_bot_token: '',
   telegram_chat_id: '',
+  twilio_sid: '',
+  twilio_auth_token: '',
+  twilio_from: '+15594914664',
+  twilio_to: '+601118930633',
 };
 
 // 解析时段: '10m' | '2h' | '3d' → { value, unit }  (m=分钟 h=小时 d=天)
@@ -64,6 +68,11 @@ function loadConfig() {
   if (!Array.isArray(cfg.watchlist) || cfg.watchlist.length === 0) {
     cfg.watchlist = DEFAULT_WATCHLIST.map(([code, name]) => ({ code, name }));
   }
+  // 环境变量覆盖(用于 Render 部署, 避免把凭据写进代码库)
+  if (process.env.TWILIO_SID) cfg.twilio_sid = process.env.TWILIO_SID;
+  if (process.env.TWILIO_AUTH_TOKEN) cfg.twilio_auth_token = process.env.TWILIO_AUTH_TOKEN;
+  if (process.env.TWILIO_FROM) cfg.twilio_from = process.env.TWILIO_FROM;
+  if (process.env.TWILIO_TO) cfg.twilio_to = process.env.TWILIO_TO;
   return cfg;
 }
 
@@ -88,6 +97,8 @@ db.exec(`
     window TEXT, current INTEGER, previous INTEGER, ratio REAL, direction TEXT);
   CREATE TABLE IF NOT EXISTS state(
     stock TEXT PRIMARY KEY, above INTEGER, last_alert INTEGER);
+  CREATE TABLE IF NOT EXISTS whatsapp_sent(
+    stock TEXT, date TEXT, ts INTEGER, PRIMARY KEY(stock, date));
 `);
 
 function storeCandles(code, candles) {
@@ -212,8 +223,11 @@ function computeMetrics(cfg) {
         status = 'low';
       }
     }
+    const d5 = db.prepare('SELECT AVG(volume) a FROM (SELECT volume FROM daily WHERE stock=? ORDER BY date DESC LIMIT 5)').get(code);
+    const d20 = db.prepare('SELECT AVG(volume) a FROM (SELECT volume FROM daily WHERE stock=? ORDER BY date DESC LIMIT 20)').get(code);
     out.push({ code, name, price: live?.price ?? null, mtime: live?.mtime ?? null,
-      current, previous, ratio, status });
+      current, previous, ratio, status,
+      avg4w: d20?.a ?? null, avg5d: d5?.a ?? null });
   }
   // 按增长倍率从大到小排列(无数据的排最后)
   out.sort((a, b) => {
@@ -250,6 +264,59 @@ async function sendTelegram(m, window, cfg) {
       body: JSON.stringify({ chat_id: chat, text }),
     });
   } catch (e) { log(`telegram failed: ${e.message}`); }
+}
+
+// ---------------- WhatsApp (Twilio) ----------------
+async function sendWhatsApp(text, cfg) {
+  const sid = (cfg.twilio_sid || '').trim();
+  const token = (cfg.twilio_auth_token || '').trim();
+  const from = (cfg.twilio_from || '').trim();
+  const to = (cfg.twilio_to || '').trim();
+  if (!sid || !token || !from || !to) return;
+  const auth = Buffer.from(`${sid}:${token}`).toString('base64');
+  const body = new URLSearchParams({
+    From: 'whatsapp:' + from.replace(/^whatsapp:/, ''),
+    To: 'whatsapp:' + to.replace(/^whatsapp:/, ''),
+    Body: text,
+  });
+  try {
+    const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Authorization': `Basic ${auth}` },
+      body: body.toString(),
+    });
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      log(`whatsapp 失败: HTTP ${res.status} ${j.message || j.code || ''}`);
+    } else {
+      log('whatsapp 已发送');
+    }
+  } catch (e) { log(`whatsapp 失败: ${e.message}`); }
+}
+
+// 日线放量提醒: 今日成交量 >= 昨日 2 倍 → WhatsApp (开市时段, 每天每只最多一次)
+function evaluateDailyWhatsApp(cfg) {
+  if (!isMarketOpen()) return;
+  if (!(cfg.twilio_sid && cfg.twilio_auth_token && cfg.twilio_from && cfg.twilio_to)) return;
+  const nowS = Math.floor(Date.now() / 1000);
+  for (const w of cfg.watchlist) {
+    const rows = db.prepare('SELECT date, volume FROM daily WHERE stock=? ORDER BY date DESC LIMIT 2').all(w.code);
+    if (rows.length < 2) continue;
+    const today = rows[0], yesterday = rows[1];
+    if (!yesterday.volume) continue;
+    const ratio = today.volume / yesterday.volume * 100;
+    if (ratio < 200) continue;
+    const sent = db.prepare('SELECT 1 FROM whatsapp_sent WHERE stock=? AND date=?').get(w.code, today.date);
+    if (sent) continue;
+    db.prepare('INSERT INTO whatsapp_sent(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
+      .run(w.code, today.date, nowS);
+    const live = db.prepare('SELECT price FROM live WHERE stock=?').get(w.code);
+    const price = live?.price != null ? String(live.price) : '-';
+    const text = `📈 放量提醒 — ${w.name || w.code} (${w.code}.KL)
+今日成交量 ${fmtNum(today.volume)} 已达昨日 ${fmtNum(yesterday.volume)} 的 ${ratio.toFixed(1)}%
+现价 ${price}`;
+    sendWhatsApp(text, cfg);
+  }
 }
 
 function evaluateAlerts(cfg) {
@@ -320,6 +387,7 @@ function poll(backfill = false) {
         await sleep(200);
       }
       evaluateAlerts(cfg);
+      evaluateDailyWhatsApp(cfg);
       prune();
       lastPoll = Date.now() / 1000;
       log(`即时抓取完成 (${watchlist.length} 只)`);
@@ -463,6 +531,12 @@ app.post('/api/watchlist/remove', (req, res) => {
 
 app.post('/api/poll', (req, res) => {
   poll();  // fire-and-forget
+  res.json({ ok: true });
+});
+
+app.post('/api/test-whatsapp', async (req, res) => {
+  const cfg = loadConfig();
+  await sendWhatsApp('✅ KLSE Volume Tracker 测试 — WhatsApp 通知已接通', cfg);
   res.json({ ok: true });
 });
 

@@ -209,7 +209,7 @@ export default function App() {
             <table>
               <thead><tr>
                 <th>代码</th><th>名称</th><th>现价</th>
-                <th>当前时段量</th><th>上一时段量</th><th>比率</th>
+                <th>当前时段量</th><th>上一时段量</th><th>4周/5天均量</th><th>比率</th>
               </tr></thead>
               <tbody>
                 {s?.stocks.map((st) => {
@@ -227,6 +227,7 @@ export default function App() {
                       <td>{st.price != null ? st.price.toFixed(3) : '—'}</td>
                       <td>{fmt(st.current)}</td>
                       <td>{fmt(st.previous)}</td>
+                      <td>{fmt(st.avg4w)} / {fmt(st.avg5d)}</td>
                       <td>{ratioHtml}</td>
                     </tr>
                   );
