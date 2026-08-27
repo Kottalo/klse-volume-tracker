@@ -17,6 +17,7 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [addCode, setAddCode] = useState('');
   const [addPhone, setAddPhone] = useState('');
+  const [showRecipients, setShowRecipients] = useState(false);
   const [thr, setThr] = useState('200');
   const [winValue, setWinValue] = useState('1');
   const [winUnit, setWinUnit] = useState('h');
@@ -161,6 +162,7 @@ export default function App() {
           </div>
           <div className="row">
             <button className="ghost" onClick={() => setShowSettings((v) => !v)}>⚙ 高级设置</button>
+            <button className="ghost" onClick={() => setShowRecipients(true)}>👥 通知名单</button>
             <button className="ghost" onClick={requestNotify}>🔔 通知</button>
           </div>
         </header>
@@ -259,24 +261,32 @@ export default function App() {
           </div>
         </div>
 
-        {/* 通知名单 */}
-        <div className="panel">
-          <h2>通知名单 <span className="muted">(放量达标时发 WhatsApp)</span></h2>
-          <div className="row" style={{ marginBottom: 12 }}>
-            <input placeholder="手机号 01xxxxxxxxx" style={{ width: 200 }} value={addPhone}
-              onChange={(e) => setAddPhone(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addPhoneHandler()} />
-            <button onClick={addPhoneHandler}>添加</button>
-            <span className="muted">马来西亚手机号, 省略 +60 只填 01 开头</span>
+        {/* 通知名单弹窗 */}
+        {showRecipients && (
+          <div className="overlay" onClick={() => setShowRecipients(false)}>
+            <div className="modal" onClick={(e) => e.stopPropagation()}>
+              <div className="modal-head">
+                <h2>通知名单</h2>
+                <button className="chip-x" style={{ fontSize: 18 }} onClick={() => setShowRecipients(false)}>✕</button>
+              </div>
+              <div className="muted" style={{ marginBottom: 12 }}>放量达标时给这些号码发 WhatsApp</div>
+              <div className="row" style={{ marginBottom: 10 }}>
+                <input autoFocus placeholder="手机号 01xxxxxxxxx" style={{ width: 200 }} value={addPhone}
+                  onChange={(e) => setAddPhone(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addPhoneHandler()} />
+                <button onClick={addPhoneHandler}>添加</button>
+              </div>
+              <div className="muted" style={{ marginBottom: 14 }}>马来西亚手机号, 省略 +60 只填 01 开头</div>
+              <div className="chips">
+                {s?.whatsapp_recipients?.length ? s.whatsapp_recipients.map((p) => (
+                  <span className="chip" key={p}>
+                    {p}
+                    <button className="chip-x" onClick={() => removePhone(p)}>✕</button>
+                  </span>
+                )) : <div className="muted">暂无通知号码</div>}
+              </div>
+            </div>
           </div>
-          <div className="chips">
-            {s?.whatsapp_recipients?.length ? s.whatsapp_recipients.map((p) => (
-              <span className="chip" key={p}>
-                {p}
-                <button className="chip-x" onClick={() => removePhone(p)}>✕</button>
-              </span>
-            )) : <div className="muted">暂无通知号码</div>}
-          </div>
-        </div>
+        )}
 
         {/* 告警记录 */}
         <div className="panel">
@@ -362,6 +372,10 @@ const css = `
   .chip{display:inline-flex;align-items:center;gap:6px;background:var(--panel2);border:1px solid var(--border);border-radius:20px;padding:5px 12px;font-size:13px;font-family:ui-monospace,Consolas,monospace}
   .chip-x{background:transparent;border:0;color:var(--dim);padding:0;cursor:pointer;font-size:13px;line-height:1}
   .chip-x:hover{color:var(--red)}
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:100;padding:16px}
+  .modal{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:20px;width:min(440px,92vw);box-shadow:0 16px 48px rgba(0,0,0,.4)}
+  .modal-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+  .modal-head h2{margin:0;font-size:15px;color:var(--text);text-transform:none;letter-spacing:0}
   .loader-wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px}
   .spinner{width:44px;height:44px;border:4px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
   .loader-text{color:var(--dim);font-size:14px}
