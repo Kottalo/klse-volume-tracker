@@ -226,8 +226,10 @@ function computeMetrics(cfg) {
         status = 'low';
       }
     }
-    const d5 = db.prepare('SELECT AVG(volume) a FROM (SELECT volume FROM daily WHERE stock=? ORDER BY date DESC LIMIT 5)').get(code);
-    const d20 = db.prepare('SELECT AVG(volume) a FROM (SELECT volume FROM daily WHERE stock=? ORDER BY date DESC LIMIT 20)').get(code);
+    // 4周/5天均量: 只统计「已收盘」交易日(排除今天盘中), 是固定历史值, 不随盘中数据或时段参数变动
+    const todayStr = mytDate(Date.now() / 1000);
+    const d5 = db.prepare('SELECT AVG(volume) a FROM (SELECT volume FROM daily WHERE stock=? AND date < ? ORDER BY date DESC LIMIT 5)').get(code, todayStr);
+    const d20 = db.prepare('SELECT AVG(volume) a FROM (SELECT volume FROM daily WHERE stock=? AND date < ? ORDER BY date DESC LIMIT 20)').get(code, todayStr);
     out.push({ code, name, price: live?.price ?? null, mtime: live?.mtime ?? null,
       current, previous, ratio, status,
       avg4w: d20?.a ?? null, avg5d: d5?.a ?? null });
