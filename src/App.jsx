@@ -18,6 +18,7 @@ export default function App() {
   const [addCode, setAddCode] = useState('');
   const [addPhone, setAddPhone] = useState('');
   const [showRecipients, setShowRecipients] = useState(false);
+  const [sortBy, setSortBy] = useState('ratio');
   const [thr, setThr] = useState('200');
   const [winValue, setWinValue] = useState('1');
   const [winUnit, setWinUnit] = useState('h');
@@ -222,7 +223,13 @@ export default function App() {
 
         {/* 自选股 */}
         <div className="panel">
-          <h2>自选股 <span className="muted">({s?.watchlist.length ?? 0} 只, 按增长倍率排序)</span></h2>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+            <h2 style={{ margin: 0 }}>自选股 <span className="muted">({s?.watchlist.length ?? 0} 只)</span></h2>
+            <div className="seg">
+              <button className={sortBy === 'ratio' ? 'on' : ''} onClick={() => setSortBy('ratio')}>按倍率</button>
+              <button className={sortBy === 'code' ? 'on' : ''} onClick={() => setSortBy('code')}>按代码</button>
+            </div>
+          </div>
           <div className="row" style={{ marginBottom: 12 }}>
             <input placeholder="股票代码, 如 1155" style={{ width: 160 }} value={addCode}
               onChange={(e) => setAddCode(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addStock()} />
@@ -236,7 +243,9 @@ export default function App() {
                 <th>当前时段量</th><th>上一时段量</th><th>4周/5天均量</th><th>比率</th>
               </tr></thead>
               <tbody>
-                {s?.stocks.map((st) => {
+                {(sortBy === 'code'
+                  ? [...(s?.stocks || [])].sort((a, b) => String(a.code).localeCompare(String(b.code)))
+                  : (s?.stocks || [])).map((st) => {
                   const ratioHtml = st.ratio == null ? '—' : (
                     <span className={s.settings.direction === 'surge'
                       ? (st.ratio >= s.settings.threshold_percent ? 'up' : '')
