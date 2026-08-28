@@ -8,8 +8,9 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CONFIG_PATH = path.join(__dirname, 'config.json');
-const DB_PATH = path.join(__dirname, 'data.db');
+const DATA_DIR = process.env.DATA_DIR || __dirname;  // 持久化目录(Render 磁盘挂载点), 默认同代码目录
+const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
+const DB_PATH = path.join(DATA_DIR, 'data.db');
 const DIST = path.join(__dirname, 'dist');
 const PORT = process.env.PORT || 8080;
 
