@@ -29,6 +29,7 @@ const DEFAULTS = {
   twilio_to: '+601118930633',
   whatsapp_recipients: [],
   twilio_content_sid: '',
+  price_thresholds: [],   // 按股价范围设提醒阈值: [{max, threshold}], max=null=无限; 空=不通知
 };
 
 // 解析时段: '10m' | '2h' | '3d' → { value, unit }  (m=分钟 h=小时 d=天)
@@ -323,6 +324,17 @@ async function sendWhatsAppTemplate(to, contentSid, variables, cfg) {
 }
 
 // 日线放量提醒: 今日成交量 >= 昨日 2 倍 → 通知名单 WhatsApp (开市时段, 每天每只最多一次)
+// 按股价返回提醒阈值%; 无规则或价格不在段内返回 null(不通知)
+function getThresholdForPrice(price, rules) {
+  if (!Array.isArray(rules) || !rules.length) return null;
+  const p = Number(price);
+  if (!Number.isFinite(p)) return null;
+  for (const r of rules) {
+    if (r.max == null || p <= r.max) return r.threshold;
+  }
+  return null;
+}
+
 function evaluateDailyAlert(cfg) {
   if (!isMarketOpen()) return;
   if (!(cfg.twilio_sid && cfg.twilio_auth_token && cfg.twilio_from)) return;
@@ -337,12 +349,14 @@ function evaluateDailyAlert(cfg) {
     const today = rows[0], yesterday = rows[1];
     if (!yesterday.volume) continue;
     const ratio = today.volume / yesterday.volume * 100;
-    if (ratio < 200) continue;
+    const live = db.prepare('SELECT price FROM live WHERE stock=?').get(w.code);
+    const threshold = getThresholdForPrice(live?.price, cfg.price_thresholds);
+    if (threshold == null) continue;   // 无规则或价格不在段内 → 不通知
+    if (ratio < threshold) continue;
     const sent = db.prepare('SELECT 1 FROM daily_alert WHERE stock=? AND date=?').get(w.code, today.date);
     if (sent) continue;
     db.prepare('INSERT INTO daily_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
       .run(w.code, today.date, nowS);
-    const live = db.prepare('SELECT price FROM live WHERE stock=?').get(w.code);
     const variables = {
       '1': w.name || w.code,
       '2': w.code,
@@ -482,6 +496,7 @@ function buildState() {
     },
     watchlist: cfg.watchlist,
     whatsapp_recipients: cfg.whatsapp_recipients || [],
+    price_thresholds: cfg.price_thresholds || [],
     stocks: computeMetrics(cfg),
     alerts: db.prepare(`SELECT id, ts, stock, name, window, current, previous, ratio, direction
       FROM alerts ORDER BY id DESC LIMIT 100`).all(),

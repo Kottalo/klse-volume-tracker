@@ -19,6 +19,7 @@ export default function App() {
   const [addPhone, setAddPhone] = useState('');
   const [showRecipients, setShowRecipients] = useState(false);
   const [sortBy, setSortBy] = useState('ratio');
+  const [priceRules, setPriceRules] = useState(null);
   const [thr, setThr] = useState('200');
   const [winValue, setWinValue] = useState('1');
   const [winUnit, setWinUnit] = useState('h');
@@ -87,6 +88,17 @@ export default function App() {
       body: JSON.stringify(patch),
     });
     lastAlertId.current = 0;
+  }
+
+  useEffect(() => {
+    if (priceRules == null && state?.price_thresholds) {
+      setPriceRules(state.price_thresholds.map((r) => ({ ...r })));
+    }
+  }, [state, priceRules]);
+
+  function handleRulesChange(next, save) {
+    setPriceRules(next);
+    if (save) setSetting({ price_thresholds: next });
   }
 
   function saveWindow(v, u) {
@@ -218,6 +230,8 @@ export default function App() {
               <Field label="Telegram Bot Token" def={s?.settings.telegram_bot_token} save={(v) => setSetting({ telegram_bot_token: v })} />
               <Field label="Telegram Chat ID" def={s?.settings.telegram_chat_id} save={(v) => setSetting({ telegram_chat_id: v })} />
             </div>
+            <h2 style={{ marginTop: 18 }}>价格阈值规则 <span className="muted">(按股价范围设提醒阈值)</span></h2>
+            <ThresholdEditor rules={priceRules || state?.price_thresholds || []} onChange={handleRulesChange} />
           </div>
         )}
 
@@ -318,6 +332,103 @@ export default function App() {
   );
 }
 
+const AXIS_COLORS = ['#3b82f6', '#22c55e', '#f59e0b', '#ec4899', '#8b5cf6'];
+
+function ThresholdEditor({ rules, onChange }) {
+  const axisRef = useRef(null);
+  const [dragIdx, setDragIdx] = useState(null);
+  const rulesRef = useRef(rules || []);
+  rulesRef.current = rules || [];
+
+  const finite = (rules || []).filter((r) => r.max != null);
+  const maxP = finite.length ? Math.max(10, Math.ceil(finite[finite.length - 1].max * 1.5)) : 10;
+  const pct = (p) => (p / maxP) * 100;
+
+  const segs = [];
+  let prev = 0;
+  (rules || []).forEach((r, i) => {
+    const end = r.max == null ? maxP : r.max;
+    const label = r.max == null
+      ? `${prev.toFixed(2)}+`
+      : (i === 0 ? `0 – ${r.max.toFixed(2)}` : `${(prev + 0.01).toFixed(2)} – ${r.max.toFixed(2)}`);
+    segs.push({ widthPct: ((end - prev) / maxP) * 100, label });
+    prev = end;
+  });
+
+  function onMove(e) {
+    if (dragIdx == null || !axisRef.current) return;
+    const rect = axisRef.current.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    let p = (x / rect.width) * maxP;
+    p = Math.max(0.01, Math.min(maxP - 0.01, p));
+    const cur = rulesRef.current.map((r) => ({ ...r }));
+    const fin = cur.filter((r) => r.max != null).map((r) => r.max);
+    if (dragIdx > 0) p = Math.max(p, fin[dragIdx - 1] + 0.01);
+    if (dragIdx < fin.length - 1) p = Math.min(p, fin[dragIdx + 1] - 0.01);
+    p = Math.round(p * 100) / 100;
+    cur[dragIdx].max = p;
+    rulesRef.current = cur;
+    onChange(cur, false);
+  }
+
+  function onUp() {
+    if (dragIdx != null) {
+      onChange(rulesRef.current, true);
+      setDragIdx(null);
+    }
+  }
+
+  if (!(rules || []).length) {
+    return (
+      <div>
+        <div className="muted" style={{ marginBottom: 8 }}>还没有设置阈值规则 → 不会发送任何提醒</div>
+        <button onClick={() => onChange([{ max: 5, threshold: 200 }, { max: null, threshold: 200 }], true)}>+ 添加第一个分割点</button>
+      </div>
+    );
+  }
+
+  const setThr = (i, v) => onChange((rules || []).map((x, j) => j === i ? { ...x, threshold: Math.max(100, Math.round(+v || 200)) } : x), true);
+  const rmSplit = (i) => onChange((rules || []).filter((_, j) => j !== i), true);
+  const addSplit = () => {
+    const cur = (rules || []).map((r) => ({ ...r }));
+    const fin = cur.filter((r) => r.max != null);
+    const lastMax = fin.length ? fin[fin.length - 1].max : 0;
+    const newMax = Math.round((lastMax + 1) * 100) / 100;
+    cur.pop();
+    cur.push({ max: newMax, threshold: 200 });
+    cur.push({ max: null, threshold: 200 });
+    onChange(cur, true);
+  };
+
+  return (
+    <div>
+      <div className="axis" ref={axisRef} onPointerMove={onMove} onPointerUp={onUp} onPointerLeave={onUp}>
+        {segs.map((s, i) => (
+          <div key={i} className="axis-seg" style={{ width: s.widthPct + '%', background: AXIS_COLORS[i % AXIS_COLORS.length] }} />
+        ))}
+        {finite.map((r, i) => (
+          <div key={i} className="split" style={{ left: pct(r.max) + '%' }}
+            onPointerDown={(e) => { e.stopPropagation(); e.preventDefault(); setDragIdx(i); }}>
+            <span className="split-dot" />
+            <span className="split-label">{r.max.toFixed(2)}</span>
+          </div>
+        ))}
+      </div>
+      <div className="thr-rows">
+        {(rules || []).map((r, i) => (
+          <div key={i} className="thr-row">
+            <span className="thr-range">{segs[i].label}</span>
+            <input type="number" min="100" value={r.threshold} onChange={(e) => setThr(i, e.target.value)} />
+            <span className="muted">%</span>
+            {i < finite.length && <button className="chip-x" onClick={() => rmSplit(i)}>✕</button>}
+          </div>
+        ))}
+      </div>
+      <button onClick={addSplit}>+ 添加分割点</button>
+    </div>
+  );
+}
+
 function Field({ label, def, save }) {
   const [v, setV] = useState(def ?? '');
   useEffect(() => { setV(def ?? ''); }, [def]);
@@ -381,6 +492,15 @@ const css = `
   .chip{display:inline-flex;align-items:center;gap:6px;background:var(--panel2);border:1px solid var(--border);border-radius:20px;padding:5px 12px;font-size:13px;font-family:ui-monospace,Consolas,monospace}
   .chip-x{background:transparent;border:0;color:var(--dim);padding:0;cursor:pointer;font-size:13px;line-height:1}
   .chip-x:hover{color:var(--red)}
+  .axis{position:relative;height:48px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;margin:16px 0 26px;touch-action:none}
+  .axis-seg{position:absolute;top:0;bottom:0;opacity:.5}
+  .split{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--text);cursor:ew-resize;z-index:2}
+  .split-dot{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:16px;height:16px;border-radius:50%;background:var(--text);border:3px solid var(--panel)}
+  .split-label{position:absolute;top:-24px;left:50%;transform:translateX(-50%);font-size:11px;color:var(--text);white-space:nowrap;font-family:ui-monospace,Consolas,monospace;background:var(--panel);padding:1px 6px;border-radius:4px;border:1px solid var(--border)}
+  .thr-rows{display:flex;flex-direction:column;gap:6px;margin-bottom:10px}
+  .thr-row{display:flex;align-items:center;gap:8px}
+  .thr-range{flex:1;font-size:12px;color:var(--dim);font-family:ui-monospace,Consolas,monospace}
+  .thr-row input{width:90px}
   .overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:100;padding:16px}
   .modal{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:20px;width:min(440px,92vw);box-shadow:0 16px 48px rgba(0,0,0,.4)}
   .modal-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
