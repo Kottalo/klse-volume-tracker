@@ -175,7 +175,6 @@ export default function App() {
           </div>
           <div className="row">
             <button className="ghost" onClick={() => setShowSettings((v) => !v)}>⚙ 高级设置</button>
-            <button className="ghost" onClick={() => setShowRecipients(true)}>👥 通知名单</button>
             <button className="ghost" onClick={requestNotify}>🔔 通知</button>
           </div>
         </header>
@@ -283,33 +282,6 @@ export default function App() {
             </table>
           </div>
         </div>
-
-        {/* 通知名单弹窗 */}
-        {showRecipients && (
-          <div className="overlay" onClick={() => setShowRecipients(false)}>
-            <div className="modal" onClick={(e) => e.stopPropagation()}>
-              <div className="modal-head">
-                <h2>通知名单</h2>
-                <button className="chip-x" style={{ fontSize: 18 }} onClick={() => setShowRecipients(false)}>✕</button>
-              </div>
-              <div className="muted" style={{ marginBottom: 12 }}>放量达标时给这些号码发 WhatsApp</div>
-              <div className="row" style={{ marginBottom: 10 }}>
-                <input autoFocus placeholder="手机号 01xxxxxxxxx" style={{ width: 200 }} value={addPhone}
-                  onChange={(e) => setAddPhone(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addPhoneHandler()} />
-                <button onClick={addPhoneHandler}>添加</button>
-              </div>
-              <div className="muted" style={{ marginBottom: 14 }}>马来西亚手机号, 省略 +60 只填 01 开头</div>
-              <div className="chips">
-                {s?.whatsapp_recipients?.length ? s.whatsapp_recipients.map((p) => (
-                  <span className="chip" key={p}>
-                    {p}
-                    <button className="chip-x" onClick={() => removePhone(p)}>✕</button>
-                  </span>
-                )) : <div className="muted">暂无通知号码</div>}
-              </div>
-            </div>
-          </div>
-        )}
 
         {/* 告警记录 */}
         <div className="panel">

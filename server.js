@@ -323,7 +323,7 @@ async function sendWhatsAppTemplate(to, contentSid, variables, cfg) {
   } catch (e) { log(`whatsapp 失败(${to}): ${e.message}`); }
 }
 
-// 日线放量提醒: 今日成交量 >= 昨日 2 倍 → 通知名单 WhatsApp (开市时段, 每天每只最多一次)
+// 日线放量提醒: 今日成交量 >= 价位阈值 → Telegram 群 (开市时段, 每天每只最多一次)
 // 按股价返回提醒阈值%; 无规则或价格不在段内返回 null(不通知)
 function getThresholdForPrice(price, rules) {
   if (!Array.isArray(rules) || !rules.length) return null;
@@ -337,11 +337,7 @@ function getThresholdForPrice(price, rules) {
 
 function evaluateDailyAlert(cfg) {
   if (!isMarketOpen()) return;
-  if (!(cfg.twilio_sid && cfg.twilio_auth_token && cfg.twilio_from)) return;
-  const contentSid = (cfg.twilio_content_sid || '').trim();
-  if (!contentSid) return;
-  const recips = (cfg.whatsapp_recipients || []).map(toWhatsApp).filter(Boolean);
-  if (!recips.length) return;
+  if (!(cfg.telegram_bot_token && cfg.telegram_chat_id)) return;
   const nowS = Math.floor(Date.now() / 1000);
   for (const w of cfg.watchlist) {
     const rows = db.prepare('SELECT date, volume FROM daily WHERE stock=? ORDER BY date DESC LIMIT 2').all(w.code);
@@ -357,15 +353,10 @@ function evaluateDailyAlert(cfg) {
     if (sent) continue;
     db.prepare('INSERT INTO daily_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
       .run(w.code, today.date, nowS);
-    const variables = {
-      '1': w.name || w.code,
-      '2': w.code,
-      '3': fmtNum(today.volume),
-      '4': ratio.toFixed(1),
-      '5': fmtNum(yesterday.volume),
-      '6': live?.price != null ? String(live.price) : '-',
-    };
-    for (const to of recips) sendWhatsAppTemplate(to, contentSid, variables, cfg);
+    const text = `📈 放量提醒 — ${w.name || w.code} (${w.code}.KL)
+今日成交量 ${fmtNum(today.volume)} 已达昨日 ${fmtNum(yesterday.volume)} 的 ${ratio.toFixed(1)}%
+现价 ${live?.price ?? '-'}`;
+    sendTelegramText(text, cfg);
   }
 }
 
@@ -586,15 +577,13 @@ app.post('/api/poll', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/test-whatsapp', async (req, res) => {
+app.post('/api/test-telegram', async (req, res) => {
   const cfg = loadConfig();
-  const contentSid = (cfg.twilio_content_sid || '').trim();
-  if (!contentSid) return res.status(400).json({ error: '未配置模板 ContentSid' });
-  const recips = (cfg.whatsapp_recipients || []).map(toWhatsApp).filter(Boolean);
-  if (!recips.length) return res.status(400).json({ error: '通知名单为空' });
-  const vars = { '1': 'YTL Power', '2': '6742', '3': '30.97M', '4': '458.0', '5': '6.76M', '6': '5.880' };
-  for (const to of recips) await sendWhatsAppTemplate(to, contentSid, vars, cfg);
-  res.json({ ok: true, sent: recips.length });
+  if (!(cfg.telegram_bot_token && cfg.telegram_chat_id)) {
+    return res.status(400).json({ error: '未配置 Telegram Bot Token / Chat ID' });
+  }
+  await sendTelegramText('✅ KLSE Volume Tracker 测试 — Telegram 通知已接通', cfg);
+  res.json({ ok: true });
 });
 
 app.post('/api/recipients/add', (req, res) => {
