@@ -30,6 +30,7 @@ const DEFAULTS = {
   whatsapp_recipients: [],
   twilio_content_sid: '',
   price_thresholds: [],   // 按股价范围设提醒阈值: [{max, threshold}], max=null=无限; 空=不通知
+  price_drop_threshold: 40,  // 股价较昨收跌幅 >= 此% 时提醒
 };
 
 // 解析时段: '10m' | '2h' | '3d' → { value, unit }  (m=分钟 h=小时 d=天)
@@ -96,7 +97,7 @@ db.exec(`
     stock TEXT, date TEXT, volume INTEGER, PRIMARY KEY(stock, date));
   CREATE INDEX IF NOT EXISTS idx_daily ON daily(stock, date);
   CREATE TABLE IF NOT EXISTS live(
-    stock TEXT PRIMARY KEY, name TEXT, price REAL, mtime INTEGER);
+    stock TEXT PRIMARY KEY, name TEXT, price REAL, prevClose REAL, mtime INTEGER);
   CREATE TABLE IF NOT EXISTS alerts(
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, stock TEXT, name TEXT,
     window TEXT, current INTEGER, previous INTEGER, ratio REAL, direction TEXT);
@@ -104,7 +105,11 @@ db.exec(`
     stock TEXT PRIMARY KEY, above INTEGER, last_alert INTEGER);
   CREATE TABLE IF NOT EXISTS daily_alert(
     stock TEXT, date TEXT, ts INTEGER, PRIMARY KEY(stock, date));
+  CREATE TABLE IF NOT EXISTS price_drop_alert(
+    stock TEXT, date TEXT, ts INTEGER, PRIMARY KEY(stock, date));
 `);
+// 迁移: 旧库 live 表补 prevClose 列
+try { db.exec('ALTER TABLE live ADD COLUMN prevClose REAL'); } catch (e) {}
 
 function storeCandles(code, candles) {
   if (!candles.length) return;
@@ -118,10 +123,10 @@ function storeDaily(code, rows) {
   for (const [date, volume] of rows) stmt.run(code, date, volume);
 }
 
-function updateLive(code, name, price, mtime) {
-  db.prepare(`INSERT INTO live(stock, name, price, mtime) VALUES(?,?,?,?)
-    ON CONFLICT(stock) DO UPDATE SET name=excluded.name, price=excluded.price, mtime=excluded.mtime`)
-    .run(code, name, price, mtime);
+function updateLive(code, name, price, prevClose, mtime) {
+  db.prepare(`INSERT INTO live(stock, name, price, prevClose, mtime) VALUES(?,?,?,?,?)
+    ON CONFLICT(stock) DO UPDATE SET name=excluded.name, price=excluded.price, prevClose=excluded.prevClose, mtime=excluded.mtime`)
+    .run(code, name, price, prevClose, mtime);
 }
 
 function prune() {
@@ -153,7 +158,7 @@ async function fetchIntraday(code) {
   const d = await yahooGet(`https://query1.finance.yahoo.com/v8/finance/chart/${code}.KL?interval=5m&range=1d`);
   const { meta, candles } = parseChart(d);
   return { code, name: meta.longName || meta.shortName || code,
-    price: meta.regularMarketPrice, mtime: meta.regularMarketTime, candles };
+    price: meta.regularMarketPrice, prevClose: meta.chartPreviousClose, mtime: meta.regularMarketTime, candles };
 }
 
 async function fetchBackfill(code) {
@@ -360,6 +365,28 @@ function evaluateDailyAlert(cfg) {
   }
 }
 
+// 股价暴跌提醒: 现价较昨收跌幅 >= 阈值% → Telegram 群 (开市时段, 每天每只最多一次)
+function evaluatePriceDrop(cfg) {
+  if (!isMarketOpen()) return;
+  if (!(cfg.telegram_bot_token && cfg.telegram_chat_id)) return;
+  const threshold = Number(cfg.price_drop_threshold ?? 40);
+  const date = mytDate(Date.now() / 1000);
+  const nowS = Math.floor(Date.now() / 1000);
+  for (const w of cfg.watchlist) {
+    const l = db.prepare('SELECT price, prevClose FROM live WHERE stock=?').get(w.code);
+    if (!l || l.price == null || l.prevClose == null || l.prevClose <= 0) continue;
+    const drop = (l.prevClose - l.price) / l.prevClose * 100;
+    if (drop < threshold) continue;
+    const sent = db.prepare('SELECT 1 FROM price_drop_alert WHERE stock=? AND date=?').get(w.code, date);
+    if (sent) continue;
+    db.prepare('INSERT INTO price_drop_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
+      .run(w.code, date, nowS);
+    const text = `📉 暴跌提醒 — ${w.name || w.code} (${w.code}.KL)
+现价 ${l.price} 较昨收 ${l.prevClose} 跌 ${drop.toFixed(1)}% (阈值 ${threshold}%)`;
+    sendTelegramText(text, cfg);
+  }
+}
+
 function evaluateAlerts(cfg) {
   const w = cfg.window;
   const nowS = Math.floor(Date.now() / 1000);
@@ -421,7 +448,7 @@ function poll(backfill = false) {
         try {
           const d = await fetchIntraday(w.code);
           storeCandles(w.code, d.candles);
-          if (d.name) updateLive(w.code, d.name, d.price, d.mtime);
+          if (d.name) updateLive(w.code, d.name, d.price, d.prevClose, d.mtime);
         } catch (e) { log(`poll ${w.code} 失败: ${e.message}`); }
         try { storeDaily(w.code, await fetchDaily(w.code, '5d')); }
         catch (e) {}
@@ -429,6 +456,7 @@ function poll(backfill = false) {
       }
       evaluateAlerts(cfg);
       evaluateDailyAlert(cfg);
+      evaluatePriceDrop(cfg);
       prune();
       lastPoll = Date.now() / 1000;
       log(`即时抓取完成 (${watchlist.length} 只)`);
@@ -484,6 +512,7 @@ function buildState() {
       cooldown_minutes: cfg.cooldown_minutes,
       telegram_bot_token: cfg.telegram_bot_token,
       telegram_chat_id: cfg.telegram_chat_id,
+      price_drop_threshold: cfg.price_drop_threshold,
     },
     watchlist: cfg.watchlist,
     whatsapp_recipients: cfg.whatsapp_recipients || [],
