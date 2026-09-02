@@ -323,7 +323,7 @@ function ThresholdEditor({ rules, onChange }) {
     onChange(cur, true);
   };
   const setThrRaw = (i, v) => onChange((rules || []).map((x, j) => j === i ? { ...x, threshold: v } : x), false);
-  const setThrCommit = (i, v) => onChange((rules || []).map((x, j) => j === i ? { ...x, threshold: Math.max(100, Math.round(+v || 200)) } : x), true);
+  const setThrCommit = (i, v) => onChange((rules || []).map((x, j) => j === i ? { ...x, threshold: Math.max(0, Math.round(+v || 200)) } : x), true);
   const rmSplit = (i) => onChange((rules || []).filter((_, j) => j !== i), true);
   const addSplit = () => {
     const cur = (rules || []).map((r) => ({ ...r }));
