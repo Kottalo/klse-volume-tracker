@@ -16,11 +16,6 @@ const PORT = process.env.PORT || 8080;
 
 const DEFAULTS = {
   poll_interval_minutes: 5,   // 开市时段每 5 分钟轮询
-  window: '1h',               // 10m | 30m | 1h | 2h | 5h | 1d
-  threshold_percent: 200,     // 当前时段量 >= 上一时段量的 n% 时提醒
-  direction: 'surge',         // surge=放量 | drop=缩量
-  min_previous_volume: 100000,
-  cooldown_minutes: 30,
   telegram_bot_token: '',
   telegram_chat_id: '',
   twilio_sid: '',
@@ -32,15 +27,6 @@ const DEFAULTS = {
   price_thresholds: [],   // 按股价范围设提醒阈值: [{max, threshold}], max=null=无限; 空=不通知
   price_drop_threshold: 40,  // 股价较昨收跌幅 >= 此% 时提醒
 };
-
-// 解析时段: '10m' | '2h' | '3d' → { value, unit }  (m=分钟 h=小时 d=天)
-function parseWindow(window) {
-  const m = /^(\d{1,4})([mhd])$/.exec(String(window));
-  if (!m) return null;
-  const value = parseInt(m[1], 10);
-  if (value <= 0) return null;
-  return { value, unit: m[2] };
-}
 
 const DEFAULT_WATCHLIST = [
   ['1155', 'Maybank'], ['1295', 'Public Bank'], ['1023', 'CIMB'],
@@ -188,31 +174,11 @@ function mytDate(tsSec) {  // 马来西亚时区(UTC+8)的日期字符串
   return new Date(tsSec * 1000 + 8 * 3600 * 1000).toISOString().slice(0, 10);
 }
 
-function computeVolumes(code, window) {
-  const pw = parseWindow(window);
-  const row = db.prepare('SELECT MAX(ts) m FROM samples WHERE stock=?').get(code);
-  if (!pw || !row || row.m == null) return null;
-  const now = row.m;
-
-  if (pw.unit === 'd') {
-    // n 天 = 最近 n 个交易日累计 vs 前 n 个交易日累计(日线数据)
-    const n = pw.value;
-    const rows = db.prepare('SELECT volume FROM daily WHERE stock=? ORDER BY date DESC LIMIT ?')
-      .all(code, 2 * n);
-    if (rows.length < 2 * n) return null;
-    const current = rows.slice(0, n).reduce((s, r) => s + r.volume, 0);
-    const previous = rows.slice(n, 2 * n).reduce((s, r) => s + r.volume, 0);
-    return { current, previous };
-  }
-
-  // 分钟/小时 -> 5 分钟 candle 数量(交易时段滚动, 自动跳过午休/隔夜)
-  const minutes = pw.unit === 'h' ? pw.value * 60 : pw.value;
-  const n = Math.max(1, Math.round(minutes / 5));
-  const rows = db.prepare('SELECT vol FROM samples WHERE stock=? ORDER BY ts DESC LIMIT ?')
-    .all(code, 2 * n);
-  const current = rows.slice(0, n).reduce((s, r) => s + r.vol, 0);
-  const previous = rows.slice(n, 2 * n).reduce((s, r) => s + r.vol, 0);
-  return { current, previous };
+// 今日成交量 vs 昨日成交量(日线数据)
+function computeVolumes(code) {
+  const rows = db.prepare('SELECT volume FROM daily WHERE stock=? ORDER BY date DESC LIMIT 2').all(code);
+  if (rows.length < 2) return null;
+  return { current: rows[0].volume, previous: rows[1].volume };
 }
 
 function computeMetrics(cfg) {
@@ -222,15 +188,14 @@ function computeMetrics(cfg) {
     let name = w.name || code;
     const live = db.prepare('SELECT name, price, mtime FROM live WHERE stock=?').get(code);
     if (live) name = live.name || name;
-    const vol = computeVolumes(code, cfg.window);
+    const vol = computeVolumes(code);
     let current = null, previous = null, ratio = null, status = 'nodata';
     if (vol) {
       current = vol.current; previous = vol.previous;
-      if (previous != null && previous >= cfg.min_previous_volume) {
+      if (previous > 0) {
         ratio = current / previous * 100;
-        status = (cfg.direction === 'surge'
-          ? ratio >= cfg.threshold_percent
-          : ratio <= cfg.threshold_percent) ? 'alert' : 'ok';
+        const threshold = getThresholdForPrice(live?.price, cfg.price_thresholds);
+        status = (threshold != null && ratio >= threshold) ? 'alert' : 'ok';
       } else {
         status = 'low';
       }
@@ -261,23 +226,6 @@ function fmtNum(n) {
   if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
   return String(n);
-}
-
-async function sendTelegram(m, window, cfg) {
-  const token = (cfg.telegram_bot_token || '').trim();
-  const chat = (cfg.telegram_chat_id || '').trim();
-  if (!token || !chat) return;
-  const arrow = cfg.direction === 'surge' ? '📈 放量' : '📉 缩量';
-  const text = `${arrow}提醒 — ${m.name} (${m.code}.KL)\n` +
-    `时段: ${window} | 当前 ${fmtNum(m.current)} vs 上一时段 ${fmtNum(m.previous)} (${m.ratio.toFixed(1)}%)\n` +
-    `现价 ${m.price ?? '-'}`;
-  try {
-    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chat, text }),
-    });
-  } catch (e) { log(`telegram failed: ${e.message}`); }
 }
 
 async function sendTelegramText(text, cfg) {
@@ -389,32 +337,6 @@ function evaluatePriceDrop(cfg) {
   }
 }
 
-function evaluateAlerts(cfg) {
-  const w = cfg.window;
-  const nowS = Math.floor(Date.now() / 1000);
-  const cooldown = Math.max(1, cfg.cooldown_minutes || 30) * 60;
-  for (const m of computeMetrics(cfg)) {
-    if (m.status !== 'alert') {
-      db.prepare(`INSERT INTO state(stock, above, last_alert) VALUES(?,0,0)
-        ON CONFLICT(stock) DO UPDATE SET above=0`).run(m.code);
-      continue;
-    }
-    const st = db.prepare('SELECT above, last_alert FROM state WHERE stock=?').get(m.code);
-    const wasAbove = st?.above || 0;
-    let lastAlert = st?.last_alert || 0;
-    let should = false;
-    if (!wasAbove && (nowS - lastAlert) >= cooldown) { should = true; lastAlert = nowS; }
-    db.prepare(`INSERT INTO state(stock, above, last_alert) VALUES(?,1,?)
-      ON CONFLICT(stock) DO UPDATE SET above=1, last_alert=excluded.last_alert`).run(m.code, lastAlert);
-    if (should) {
-      db.prepare(`INSERT INTO alerts(ts, stock, name, window, current, previous, ratio, direction)
-        VALUES(?,?,?,?,?,?,?,?)`)
-        .run(nowS, m.code, m.name, w, m.current, m.previous, Math.round(m.ratio * 10) / 10, cfg.direction);
-      sendTelegram(m, w, cfg);
-    }
-  }
-}
-
 // ---------------- 市场时段 ----------------
 function isMarketOpen() {
   const now = new Date(Date.now() + 8 * 3600 * 1000);  // UTC+8
@@ -456,7 +378,6 @@ function poll(backfill = false) {
         catch (e) {}
         await sleep(200);
       }
-      evaluateAlerts(cfg);
       evaluateDailyAlert(cfg);
       evaluatePriceDrop(cfg);
       prune();
@@ -507,19 +428,13 @@ function buildState() {
   return {
     settings: {
       poll_interval_minutes: cfg.poll_interval_minutes,
-      window: cfg.window,
-      threshold_percent: cfg.threshold_percent,
-      direction: cfg.direction,
-      min_previous_volume: cfg.min_previous_volume,
-      cooldown_minutes: cfg.cooldown_minutes,
       price_drop_threshold: cfg.price_drop_threshold,
     },
     watchlist: cfg.watchlist,
     whatsapp_recipients: cfg.whatsapp_recipients || [],
     price_thresholds: cfg.price_thresholds || [],
     stocks: computeMetrics(cfg),
-    alerts: db.prepare(`SELECT id, ts, stock, name, window, current, previous, ratio, direction
-      FROM alerts ORDER BY id DESC LIMIT 100`).all(),
+    alerts: [],
     status: {
       market_open: isMarketOpen(),
       last_poll: lastPoll,

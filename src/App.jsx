@@ -20,11 +20,8 @@ export default function App() {
   const [showRecipients, setShowRecipients] = useState(false);
   const [sortBy, setSortBy] = useState('ratio');
   const [priceRules, setPriceRules] = useState(null);
-  const [thr, setThr] = useState('200');
-  const [winValue, setWinValue] = useState('1');
-  const [winUnit, setWinUnit] = useState('h');
+  const [pollVal, setPollVal] = useState('5');
   const lastAlertId = useRef(0);
-  const thrFocused = useRef(false);
 
   // 初始快照 + SSE 订阅
   useEffect(() => {
@@ -41,15 +38,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (state && !thrFocused.current) setThr(String(state.settings.threshold_percent));
-  }, [state?.settings.threshold_percent]);
-
-  useEffect(() => {
-    if (state?.settings.window) {
-      const m = /^(\d+)([mhd])$/.exec(state.settings.window);
-      if (m) { setWinValue(m[1]); setWinUnit(m[2]); }
-    }
-  }, [state?.settings.window]);
+    if (state?.settings.poll_interval_minutes) setPollVal(String(state.settings.poll_interval_minutes));
+  }, [state?.settings.poll_interval_minutes]);
 
   function checkNewAlerts(s) {
     if (!s.alerts?.length) return;
@@ -99,12 +89,6 @@ export default function App() {
   function handleRulesChange(next, save) {
     setPriceRules(next);
     if (save) setSetting({ price_thresholds: next });
-  }
-
-  function saveWindow(v, u) {
-    const n = parseInt(v, 10);
-    if (!n || n <= 0) return;
-    setSetting({ window: `${n}${u}` });
   }
 
   async function addStock() {
@@ -179,42 +163,15 @@ export default function App() {
           </div>
         </header>
 
-        {/* 快捷控制条 */}
+        {/* 快捷控制条: 轮询间隔 */}
         <div className="panel">
           <div className="quick">
-            <span className="qlabel">对比时段</span>
-            <input type="number" min="1" value={winValue} style={{ width: 70 }}
-              onChange={(e) => setWinValue(e.target.value)}
-              onBlur={() => saveWindow(winValue, winUnit)}
+            <span className="qlabel">轮询间隔</span>
+            <input type="number" min="1" value={pollVal} style={{ width: 70 }}
+              onChange={(e) => setPollVal(e.target.value)}
+              onBlur={() => { const n = +pollVal; if (n > 0) setSetting({ poll_interval_minutes: n }); }}
               onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }} />
-            <select value={winUnit}
-              onChange={(e) => { setWinUnit(e.target.value); saveWindow(winValue, e.target.value); }}>
-              <option value="m">分钟</option>
-              <option value="h">小时</option>
-              <option value="d">天</option>
-            </select>
-            <span className="qlabel">阈值</span>
-            <input type="number" min="0" step="5" value={thr}
-              onFocus={() => (thrFocused.current = true)}
-              onChange={(e) => setThr(e.target.value)}
-              onBlur={() => {
-                thrFocused.current = false;
-                const v = parseFloat(thr);
-                if (!isNaN(v) && v >= 0) setSetting({ threshold_percent: v });
-              }}
-              onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }}
-              style={{ width: 88 }} />
-            <span style={{ color: 'var(--dim)' }}>%</span>
-            <span className="qlabel">方向</span>
-            <div className="seg">
-              <button className={s?.settings.direction === 'surge' ? 'on' : ''}
-                onClick={() => setSetting({ direction: 'surge' })}>📈 放量 ≥</button>
-              <button className={s?.settings.direction === 'drop' ? 'on' : ''}
-                onClick={() => setSetting({ direction: 'drop' })}>📉 缩量 ≤</button>
-            </div>
-          </div>
-          <div className="muted" style={{ marginTop: 10 }}>
-            当「当前时段量」达到「上一时段量」的阈值 % 时提醒。「天」= 最近 N 个交易日 vs 前 N 个交易日。
+            <span className="muted">分钟 (多久抓一次数据)</span>
           </div>
         </div>
 
@@ -222,12 +179,7 @@ export default function App() {
         {showSettings && (
           <div className="panel">
             <h2>高级设置</h2>
-            <div className="settings">
-              <Field label="轮询间隔(分)" def={s?.settings.poll_interval_minutes} save={(v) => setSetting({ poll_interval_minutes: +v })} />
-              <Field label="上一时段最小量" def={s?.settings.min_previous_volume} save={(v) => setSetting({ min_previous_volume: +v })} />
-              <Field label="重复提醒间隔(分)" def={s?.settings.cooldown_minutes} save={(v) => setSetting({ cooldown_minutes: +v })} />
-            </div>
-            <h2 style={{ marginTop: 18 }}>价格阈值规则 <span className="muted">(按股价范围设提醒阈值)</span></h2>
+            <h2 style={{ marginTop: 4 }}>价格阈值规则 <span className="muted">(按股价范围设提醒阈值)</span></h2>
             <ThresholdEditor rules={priceRules || state?.price_thresholds || []} onChange={handleRulesChange} />
           </div>
         )}
@@ -251,16 +203,14 @@ export default function App() {
             <table>
               <thead><tr>
                 <th>代码</th><th>名称</th><th>现价</th>
-                <th>当前时段量</th><th>上一时段量</th><th>4周/5天均量</th><th>比率</th>
+                <th>今日量</th><th>昨日量</th><th>4周/5天均量</th><th>比率</th>
               </tr></thead>
               <tbody>
                 {(sortBy === 'code'
                   ? [...(s?.stocks || [])].sort((a, b) => String(a.code).localeCompare(String(b.code)))
                   : (s?.stocks || [])).map((st) => {
                   const ratioHtml = st.ratio == null ? '—' : (
-                    <span className={s.settings.direction === 'surge'
-                      ? (st.ratio >= s.settings.threshold_percent ? 'up' : '')
-                      : (st.ratio <= s.settings.threshold_percent ? 'down' : '')}>
+                    <span className={st.status === 'alert' ? 'up' : ''}>
                       {st.ratio.toFixed(1)}%
                     </span>
                   );
@@ -281,22 +231,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* 告警记录 */}
-        <div className="panel">
-          <h2>告警记录</h2>
-          <div className="alerts">
-            {s?.alerts.length ? s.alerts.map((a) => (
-              <div className="alert-item" key={a.id}>
-                <span className="t">{fmtTime(a.ts)}</span>
-                <span className="code">{a.stock}.KL</span>
-                <span>{a.name}</span>
-                <span className="grow muted">时段 {a.window} · {fmt(a.current)} / {fmt(a.previous)}</span>
-                <span className="spark">{a.ratio.toFixed(1)}%</span>
-                <span>{a.direction === 'surge' ? '📈 放量' : '📉 缩量'}</span>
-              </div>
-            )) : <div className="muted">暂无告警</div>}
-          </div>
-        </div>
       </div>
     </>
   );
@@ -378,7 +312,8 @@ function ThresholdEditor({ rules, onChange }) {
     );
   }
 
-  const setMax = (i, v) => {
+  const setMaxRaw = (i, v) => onChange((rules || []).map((x, j) => j === i ? { ...x, max: v } : x), false);
+  const setMaxCommit = (i, v) => {
     let val = Math.max(0.01, Math.round((+v || 0) * 100) / 100);
     const cur = (rules || []).map((r) => ({ ...r }));
     const fin = cur.filter((r) => r.max != null);
@@ -387,7 +322,8 @@ function ThresholdEditor({ rules, onChange }) {
     cur[i].max = val;
     onChange(cur, true);
   };
-  const setThr = (i, v) => onChange((rules || []).map((x, j) => j === i ? { ...x, threshold: Math.max(100, Math.round(+v || 200)) } : x), true);
+  const setThrRaw = (i, v) => onChange((rules || []).map((x, j) => j === i ? { ...x, threshold: v } : x), false);
+  const setThrCommit = (i, v) => onChange((rules || []).map((x, j) => j === i ? { ...x, threshold: Math.max(100, Math.round(+v || 200)) } : x), true);
   const rmSplit = (i) => onChange((rules || []).filter((_, j) => j !== i), true);
   const addSplit = () => {
     const cur = (rules || []).map((r) => ({ ...r }));
@@ -422,15 +358,17 @@ function ThresholdEditor({ rules, onChange }) {
             {r.max != null ? (
               <>
                 <span className="muted">上限</span>
-                <input type="number" step="0.01" min="0.01" value={r.max}
-                  onChange={(e) => setMax(i, e.target.value)} />
+                <input type="number" step="0.01" value={r.max}
+                  onChange={(e) => setMaxRaw(i, e.target.value)}
+                  onBlur={(e) => setMaxCommit(i, e.target.value)} />
               </>
             ) : (
               <span className="muted">无上限</span>
             )}
             <span className="muted">阈值</span>
-            <input type="number" min="100" value={r.threshold}
-              onChange={(e) => setThr(i, e.target.value)} />
+            <input type="number" value={r.threshold}
+              onChange={(e) => setThrRaw(i, e.target.value)}
+              onBlur={(e) => setThrCommit(i, e.target.value)} />
             <span className="muted">%</span>
             {r.max != null && <button className="chip-x" onClick={() => rmSplit(i)}>✕</button>}
           </div>
