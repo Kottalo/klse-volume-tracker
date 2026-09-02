@@ -17,7 +17,6 @@ const PORT = process.env.PORT || 8080;
 const DEFAULTS = {
   poll_interval_minutes: 5,   // 开市时段每 5 分钟轮询
   window: '1h',               // 时段间隔: 30m/1h/2h/5h/1d
-  threshold_percent: 200,     // 盘中放量阈值%
   cooldown_minutes: 30,       // 盘中提醒重复间隔(分)
   telegram_bot_token: '',
   telegram_chat_id: '',
@@ -227,7 +226,8 @@ function computeMetrics(cfg) {
       current = vol.current; previous = vol.previous;
       if (previous > 0) {
         ratio = current / previous * 100;
-        status = ratio >= (cfg.threshold_percent ?? 200) ? 'alert' : 'ok';
+        const threshold = getThresholdForPrice(live?.price, cfg.price_thresholds);
+        status = (threshold != null && ratio >= threshold) ? 'alert' : 'ok';
       } else {
         status = 'low';
       }
@@ -501,7 +501,6 @@ function buildState() {
     settings: {
       poll_interval_minutes: cfg.poll_interval_minutes,
       window: cfg.window,
-      threshold_percent: cfg.threshold_percent,
       price_drop_threshold: cfg.price_drop_threshold,
     },
     watchlist: cfg.watchlist,

@@ -23,9 +23,7 @@ export default function App() {
   const [pollVal, setPollVal] = useState('5');
   const [winValue, setWinValue] = useState('1');
   const [winUnit, setWinUnit] = useState('h');
-  const [thr, setThr] = useState('200');
   const lastAlertId = useRef(0);
-  const thrFocused = useRef(false);
 
   // 初始快照 + SSE 订阅
   useEffect(() => {
@@ -44,10 +42,6 @@ export default function App() {
   useEffect(() => {
     if (state?.settings.poll_interval_minutes) setPollVal(String(state.settings.poll_interval_minutes));
   }, [state?.settings.poll_interval_minutes]);
-
-  useEffect(() => {
-    if (state && !thrFocused.current) setThr(String(state.settings.threshold_percent));
-  }, [state?.settings.threshold_percent]);
 
   useEffect(() => {
     if (state?.settings.window) {
@@ -198,13 +192,6 @@ export default function App() {
               <option value="h">小时</option>
               <option value="d">天</option>
             </select>
-            <span className="qlabel">阈值</span>
-            <input type="number" min="0" value={thr} style={{ width: 64 }}
-              onFocus={() => (thrFocused.current = true)}
-              onChange={(e) => setThr(e.target.value)}
-              onBlur={() => { thrFocused.current = false; const v = parseFloat(thr); if (!isNaN(v) && v >= 0) setSetting({ threshold_percent: v }); }}
-              onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }} />
-            <span className="muted">%</span>
           </div>
         </div>
 
