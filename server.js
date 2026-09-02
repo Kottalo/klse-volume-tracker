@@ -16,6 +16,9 @@ const PORT = process.env.PORT || 8080;
 
 const DEFAULTS = {
   poll_interval_minutes: 5,   // 开市时段每 5 分钟轮询
+  window: '1h',               // 时段间隔: 30m/1h/2h/5h/1d
+  threshold_percent: 200,     // 盘中放量阈值%
+  cooldown_minutes: 30,       // 盘中提醒重复间隔(分)
   telegram_bot_token: '',
   telegram_chat_id: '',
   twilio_sid: '',
@@ -174,11 +177,41 @@ function mytDate(tsSec) {  // 马来西亚时区(UTC+8)的日期字符串
   return new Date(tsSec * 1000 + 8 * 3600 * 1000).toISOString().slice(0, 10);
 }
 
+// 解析时段: '10m' | '2h' | '3d' → { value, unit }  (m=分钟 h=小时 d=天)
+function parseWindow(window) {
+  const m = /^(\d{1,4})([mhd])$/.exec(String(window));
+  if (!m) return null;
+  const value = parseInt(m[1], 10);
+  if (value <= 0) return null;
+  return { value, unit: m[2] };
+}
+
+// 盘中时段对比: 当前时段 vs 上一时段(5m candle 滚动 / 日线)
+function computeVolumes(code, window) {
+  const pw = parseWindow(window);
+  if (!pw) return null;
+  if (pw.unit === 'd') {
+    const n = pw.value;
+    const rows = db.prepare('SELECT volume FROM daily WHERE stock=? ORDER BY date DESC LIMIT ?').all(code, 2 * n);
+    if (rows.length < 2 * n) return null;
+    const current = rows.slice(0, n).reduce((s, r) => s + r.volume, 0);
+    const previous = rows.slice(n, 2 * n).reduce((s, r) => s + r.volume, 0);
+    return { current, previous };
+  }
+  const minutes = pw.unit === 'h' ? pw.value * 60 : pw.value;
+  const n = Math.max(1, Math.round(minutes / 5));
+  const rows = db.prepare('SELECT vol FROM samples WHERE stock=? ORDER BY ts DESC LIMIT ?').all(code, 2 * n);
+  if (rows.length < 2 * n) return null;
+  const current = rows.slice(0, n).reduce((s, r) => s + r.vol, 0);
+  const previous = rows.slice(n, 2 * n).reduce((s, r) => s + r.vol, 0);
+  return { current, previous };
+}
+
 // 今日成交量 vs 昨日成交量(日线数据)
-function computeVolumes(code) {
+function computeDaily(code) {
   const rows = db.prepare('SELECT volume FROM daily WHERE stock=? ORDER BY date DESC LIMIT 2').all(code);
   if (rows.length < 2) return null;
-  return { current: rows[0].volume, previous: rows[1].volume };
+  return { today: rows[0].volume, yesterday: rows[1].volume };
 }
 
 function computeMetrics(cfg) {
@@ -188,16 +221,28 @@ function computeMetrics(cfg) {
     let name = w.name || code;
     const live = db.prepare('SELECT name, price, mtime FROM live WHERE stock=?').get(code);
     if (live) name = live.name || name;
-    const vol = computeVolumes(code);
+    const vol = computeVolumes(code, cfg.window);
     let current = null, previous = null, ratio = null, status = 'nodata';
     if (vol) {
       current = vol.current; previous = vol.previous;
       if (previous > 0) {
         ratio = current / previous * 100;
-        const threshold = getThresholdForPrice(live?.price, cfg.price_thresholds);
-        status = (threshold != null && ratio >= threshold) ? 'alert' : 'ok';
+        status = ratio >= (cfg.threshold_percent ?? 200) ? 'alert' : 'ok';
       } else {
         status = 'low';
+      }
+    }
+
+    const dv = computeDaily(code);
+    let todayVol = null, yesterdayVol = null, dailyRatio = null, dailyStatus = 'nodata';
+    if (dv) {
+      todayVol = dv.today; yesterdayVol = dv.yesterday;
+      if (dv.yesterday > 0) {
+        dailyRatio = dv.today / dv.yesterday * 100;
+        const t = getThresholdForPrice(live?.price, cfg.price_thresholds);
+        dailyStatus = (t != null && dailyRatio >= t) ? 'alert' : 'ok';
+      } else {
+        dailyStatus = 'low';
       }
     }
     // 4周/5天均量: 只统计「已收盘」交易日(排除今天盘中), 是固定历史值, 不随盘中数据或时段参数变动
@@ -206,6 +251,7 @@ function computeMetrics(cfg) {
     const d20 = db.prepare('SELECT AVG(volume) a FROM (SELECT volume FROM daily WHERE stock=? AND date < ? ORDER BY date DESC LIMIT 20)').get(code, todayStr);
     out.push({ code, name, price: live?.price ?? null, mtime: live?.mtime ?? null,
       current, previous, ratio, status,
+      todayVol, yesterdayVol, dailyRatio, dailyStatus,
       avg4w: d20?.a ?? null, avg5d: d5?.a ?? null });
   }
   // 按增长倍率从大到小排列(无数据的排最后)
@@ -288,6 +334,31 @@ function getThresholdForPrice(price, rules) {
     if (r.max == null || p <= r.max) return r.threshold;
   }
   return null;
+}
+
+// 盘中放量提醒: 当前时段量 vs 上一时段量达到阈值% → Telegram (边沿触发 + cooldown 去重)
+function evaluateAlerts(cfg) {
+  if (!isMarketOpen()) return;
+  if (!(cfg.telegram_bot_token && cfg.telegram_chat_id)) return;
+  const window = cfg.window;
+  const nowS = Math.floor(Date.now() / 1000);
+  const cooldown = Math.max(1, cfg.cooldown_minutes || 30) * 60;
+  for (const m of computeMetrics(cfg)) {
+    if (m.status !== 'alert') {
+      db.prepare('INSERT INTO state(stock, above, last_alert) VALUES(?,0,0) ON CONFLICT(stock) DO UPDATE SET above=0').run(m.code);
+      continue;
+    }
+    const st = db.prepare('SELECT above, last_alert FROM state WHERE stock=?').get(m.code);
+    const wasAbove = st?.above || 0;
+    let lastAlert = st?.last_alert || 0;
+    let should = false;
+    if (!wasAbove && (nowS - lastAlert) >= cooldown) { should = true; lastAlert = nowS; }
+    db.prepare('INSERT INTO state(stock, above, last_alert) VALUES(?,1,?) ON CONFLICT(stock) DO UPDATE SET above=1, last_alert=excluded.last_alert').run(m.code, lastAlert);
+    if (should) {
+      const text = `📈 盘中放量 — ${m.name} (${m.code}.KL)\n时段 ${window}: 当前 ${fmtNum(m.current)} vs 上一时段 ${fmtNum(m.previous)} (${m.ratio.toFixed(1)}%)\n现价 ${m.price ?? '-'}`;
+      sendTelegramText(text, cfg);
+    }
+  }
 }
 
 function evaluateDailyAlert(cfg) {
@@ -378,6 +449,7 @@ function poll(backfill = false) {
         catch (e) {}
         await sleep(200);
       }
+      evaluateAlerts(cfg);
       evaluateDailyAlert(cfg);
       evaluatePriceDrop(cfg);
       prune();
@@ -428,6 +500,8 @@ function buildState() {
   return {
     settings: {
       poll_interval_minutes: cfg.poll_interval_minutes,
+      window: cfg.window,
+      threshold_percent: cfg.threshold_percent,
       price_drop_threshold: cfg.price_drop_threshold,
     },
     watchlist: cfg.watchlist,

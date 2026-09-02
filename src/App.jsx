@@ -21,7 +21,11 @@ export default function App() {
   const [sortBy, setSortBy] = useState('ratio');
   const [priceRules, setPriceRules] = useState(null);
   const [pollVal, setPollVal] = useState('5');
+  const [winValue, setWinValue] = useState('1');
+  const [winUnit, setWinUnit] = useState('h');
+  const [thr, setThr] = useState('200');
   const lastAlertId = useRef(0);
+  const thrFocused = useRef(false);
 
   // 初始快照 + SSE 订阅
   useEffect(() => {
@@ -40,6 +44,17 @@ export default function App() {
   useEffect(() => {
     if (state?.settings.poll_interval_minutes) setPollVal(String(state.settings.poll_interval_minutes));
   }, [state?.settings.poll_interval_minutes]);
+
+  useEffect(() => {
+    if (state && !thrFocused.current) setThr(String(state.settings.threshold_percent));
+  }, [state?.settings.threshold_percent]);
+
+  useEffect(() => {
+    if (state?.settings.window) {
+      const m = /^(\d+)([mhd])$/.exec(state.settings.window);
+      if (m) { setWinValue(m[1]); setWinUnit(m[2]); }
+    }
+  }, [state?.settings.window]);
 
   function checkNewAlerts(s) {
     if (!s.alerts?.length) return;
@@ -163,15 +178,33 @@ export default function App() {
           </div>
         </header>
 
-        {/* 快捷控制条: 轮询间隔 */}
+        {/* 快捷控制条: 轮询间隔 + 时段间隔 + 阈值 */}
         <div className="panel">
           <div className="quick">
             <span className="qlabel">轮询间隔</span>
-            <input type="number" min="1" value={pollVal} style={{ width: 70 }}
+            <input type="number" min="1" value={pollVal} style={{ width: 60 }}
               onChange={(e) => setPollVal(e.target.value)}
               onBlur={() => { const n = +pollVal; if (n > 0) setSetting({ poll_interval_minutes: n }); }}
               onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }} />
-            <span className="muted">分钟 (多久抓一次数据)</span>
+            <span className="muted">分</span>
+            <span className="qlabel">时段间隔</span>
+            <input type="number" min="1" value={winValue} style={{ width: 60 }}
+              onChange={(e) => setWinValue(e.target.value)}
+              onBlur={() => { const n = parseInt(winValue, 10); if (n > 0) setSetting({ window: `${n}${winUnit}` }); }}
+              onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }} />
+            <select value={winUnit}
+              onChange={(e) => { setWinUnit(e.target.value); const n = parseInt(winValue, 10); if (n > 0) setSetting({ window: `${n}${e.target.value}` }); }}>
+              <option value="m">分钟</option>
+              <option value="h">小时</option>
+              <option value="d">天</option>
+            </select>
+            <span className="qlabel">阈值</span>
+            <input type="number" min="0" value={thr} style={{ width: 64 }}
+              onFocus={() => (thrFocused.current = true)}
+              onChange={(e) => setThr(e.target.value)}
+              onBlur={() => { thrFocused.current = false; const v = parseFloat(thr); if (!isNaN(v) && v >= 0) setSetting({ threshold_percent: v }); }}
+              onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }} />
+            <span className="muted">%</span>
           </div>
         </div>
 
@@ -203,7 +236,8 @@ export default function App() {
             <table>
               <thead><tr>
                 <th>代码</th><th>名称</th><th>现价</th>
-                <th>今日量</th><th>昨日量</th><th>4周/5天均量</th><th>比率</th>
+                <th>当前时段量</th><th>上一时段量</th><th>时段比率</th>
+                <th>今日量</th><th>昨日量</th><th>4周/5天均量</th>
               </tr></thead>
               <tbody>
                 {(sortBy === 'code'
@@ -221,8 +255,10 @@ export default function App() {
                       <td>{st.price != null ? st.price.toFixed(3) : '—'}</td>
                       <td>{fmt(st.current)}</td>
                       <td>{fmt(st.previous)}</td>
-                      <td>{fmt(st.avg4w)} / {fmt(st.avg5d)}</td>
                       <td>{ratioHtml}</td>
+                      <td>{fmt(st.todayVol)}</td>
+                      <td>{fmt(st.yesterdayVol)}</td>
+                      <td>{fmt(st.avg4w)} / {fmt(st.avg5d)}</td>
                     </tr>
                   );
                 })}
