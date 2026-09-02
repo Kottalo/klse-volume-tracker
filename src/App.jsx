@@ -311,21 +311,25 @@ function ThresholdEditor({ rules, onChange }) {
   const [dragIdx, setDragIdx] = useState(null);
   const rulesRef = useRef(rules || []);
   rulesRef.current = rules || [];
-  const maxPRef = useRef(10);
+  const maxPRef = useRef(5);
 
   const finite = (rules || []).filter((r) => r.max != null);
-  // 拖动中固定 maxP(比例尺), 避免拖动最大分割点时整轴缩放→不跟手
+  // 拖动中固定 maxP(比例尺); 非拖动时按最大分割点自适应(不强制下限10, 方便设小价格如1.50)
   if (dragIdx == null) {
-    maxPRef.current = finite.length ? Math.max(10, Math.ceil(finite[finite.length - 1].max * 1.5)) : 10;
+    const m = finite.length ? finite[finite.length - 1].max : 5;
+    maxPRef.current = Math.max(1, Math.ceil(m * 1.5 * 100) / 100);
   }
   const maxP = maxPRef.current;
   const pct = (p) => (p / maxP) * 100;
 
   const segs = [];
   let prev = 0;
-  (rules || []).forEach((r) => {
+  (rules || []).forEach((r, i) => {
     const end = r.max == null ? maxP : r.max;
-    segs.push({ start: prev, end, widthPct: ((end - prev) / maxP) * 100 });
+    const label = r.max == null
+      ? `${prev.toFixed(2)}+`
+      : (i === 0 ? `0 – ${r.max.toFixed(2)}` : `${(prev + 0.01).toFixed(2)} – ${r.max.toFixed(2)}`);
+    segs.push({ start: prev, end, widthPct: ((end - prev) / maxP) * 100, label });
     prev = end;
   });
 
@@ -370,16 +374,33 @@ function ThresholdEditor({ rules, onChange }) {
   if (!(rules || []).length) {
     return (
       <div>
-        <div className="muted" style={{ marginBottom: 8 }}>还没有阈值规则 → 不会发提醒。点下面色条添加第一个分割点。</div>
-        <div className="axis axis-empty" ref={axisRef} onClick={onAxisClick}>
-          <span className="axis-hint">点击添加分割点</span>
-        </div>
+        <div className="muted" style={{ marginBottom: 8 }}>还没有阈值规则 → 不会发提醒。</div>
+        <button onClick={() => onChange([{ max: 1.5, threshold: 200 }, { max: null, threshold: 200 }], true)}>+ 添加第一个分割点 (默认 1.50)</button>
       </div>
     );
   }
 
+  const setMax = (i, v) => {
+    let val = Math.max(0.01, Math.round((+v || 0) * 100) / 100);
+    const cur = (rules || []).map((r) => ({ ...r }));
+    const fin = cur.filter((r) => r.max != null);
+    if (i > 0) val = Math.max(val, fin[i - 1] + 0.01);
+    if (i < fin.length - 1) val = Math.min(val, fin[i + 1] - 0.01);
+    cur[i].max = val;
+    onChange(cur, true);
+  };
   const setThr = (i, v) => onChange((rules || []).map((x, j) => j === i ? { ...x, threshold: Math.max(100, Math.round(+v || 200)) } : x), true);
   const rmSplit = (i) => onChange((rules || []).filter((_, j) => j !== i), true);
+  const addSplit = () => {
+    const cur = (rules || []).map((r) => ({ ...r }));
+    const fin = cur.filter((r) => r.max != null);
+    const lastMax = fin.length ? fin[fin.length - 1].max : 0;
+    const newMax = Math.round((lastMax + 1) * 100) / 100;
+    cur.pop();
+    cur.push({ max: newMax, threshold: 200 });
+    cur.push({ max: null, threshold: 200 });
+    onChange(cur, true);
+  };
 
   return (
     <div>
@@ -388,24 +409,37 @@ function ThresholdEditor({ rules, onChange }) {
         {segs.map((s, i) => (
           <div key={i} className="axis-seg" style={{ left: pct(s.start) + '%', width: s.widthPct + '%', background: AXIS_COLORS[i % AXIS_COLORS.length] }} />
         ))}
-        {segs.map((s, i) => (
-          <div key={'t' + i} className="axis-thr" style={{ left: pct(s.start) + '%', width: s.widthPct + '%' }}>
-            <input type="number" min="100" value={(rules || [])[i].threshold}
-              onClick={(e) => e.stopPropagation()}
-              onChange={(e) => setThr(i, e.target.value)} />
-            <span className="muted">%</span>
-          </div>
-        ))}
         {finite.map((r, i) => (
           <div key={'s' + i} className="split" style={{ left: pct(r.max) + '%' }}
             onPointerDown={(e) => { e.stopPropagation(); e.preventDefault(); setDragIdx(i); }}>
             <span className="split-dot" />
             <span className="split-label">{r.max.toFixed(2)}</span>
-            <button className="split-x" onClick={(e) => { e.stopPropagation(); rmSplit(i); }}>✕</button>
           </div>
         ))}
       </div>
-      <div className="muted">拖动圆点改位置 · 点色条空白处添加分割点 · 点 ✕ 删除</div>
+      <div className="thr-rows">
+        {(rules || []).map((r, i) => (
+          <div key={'row' + i} className="thr-row">
+            <span className="thr-range">{segs[i].label}</span>
+            {r.max != null ? (
+              <>
+                <span className="muted">上限</span>
+                <input type="number" step="0.01" min="0.01" value={r.max}
+                  onChange={(e) => setMax(i, e.target.value)} />
+              </>
+            ) : (
+              <span className="muted">无上限</span>
+            )}
+            <span className="muted">阈值</span>
+            <input type="number" min="100" value={r.threshold}
+              onChange={(e) => setThr(i, e.target.value)} />
+            <span className="muted">%</span>
+            {r.max != null && <button className="chip-x" onClick={() => rmSplit(i)}>✕</button>}
+          </div>
+        ))}
+      </div>
+      <button onClick={addSplit}>+ 添加分割点</button>
+      <div className="muted">拖动圆点粗调 · 列表里输入框精确改价格</div>
     </div>
   );
 }
@@ -473,17 +507,19 @@ const css = `
   .chip{display:inline-flex;align-items:center;gap:6px;background:var(--panel2);border:1px solid var(--border);border-radius:20px;padding:5px 12px;font-size:13px;font-family:ui-monospace,Consolas,monospace}
   .chip-x{background:transparent;border:0;color:var(--dim);padding:0;cursor:pointer;font-size:13px;line-height:1}
   .chip-x:hover{color:var(--red)}
-  .axis{position:relative;height:94px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;margin:18px 0 10px;touch-action:none;cursor:copy}
+  .axis{position:relative;height:56px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;margin:18px 0 10px;touch-action:none;cursor:copy}
   .axis-empty{height:56px;display:flex;align-items:center;justify-content:center;margin-top:2px}
   .axis-hint{color:var(--dim);font-size:12px}
-  .axis-seg{position:absolute;top:0;height:46px;opacity:.75;border-right:1px solid var(--bg)}
-  .axis-thr{position:absolute;top:50px;display:flex;align-items:center;justify-content:center;gap:2px}
-  .axis-thr input{width:58px;padding:2px 4px;font-size:12px;text-align:center}
-  .split{position:absolute;top:0;height:46px;width:2px;background:var(--text);cursor:ew-resize;z-index:2}
+  .axis-seg{position:absolute;top:0;height:56px;opacity:.6;border-right:1px solid var(--bg)}
+  .split{position:absolute;top:0;height:56px;width:2px;background:var(--text);cursor:ew-resize;z-index:2}
   .split-dot{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:16px;height:16px;border-radius:50%;background:var(--text);border:3px solid var(--panel)}
   .split-label{position:absolute;top:-22px;left:50%;transform:translateX(-50%);font-size:11px;color:var(--text);white-space:nowrap;font-family:ui-monospace,Consolas,monospace;background:var(--panel);padding:1px 6px;border-radius:4px;border:1px solid var(--border)}
   .split-x{position:absolute;top:-20px;left:50%;transform:translateX(20px);font-size:11px;color:var(--dim);cursor:pointer;background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:0 4px;line-height:1.4}
   .split-x:hover{color:var(--red)}
+  .thr-rows{display:flex;flex-direction:column;gap:6px;margin-bottom:10px}
+  .thr-row{display:flex;align-items:center;gap:8px;font-size:13px}
+  .thr-range{flex:1;font-size:12px;color:var(--dim);font-family:ui-monospace,Consolas,monospace}
+  .thr-row input{width:80px;padding:4px 6px}
   .overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:100;padding:16px}
   .modal{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:20px;width:min(440px,92vw);box-shadow:0 16px 48px rgba(0,0,0,.4)}
   .modal-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
