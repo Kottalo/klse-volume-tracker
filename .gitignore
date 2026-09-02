@@ -8,6 +8,7 @@ data.db-shm
 data.db-wal
 server.log
 config.json
+.env
 
 # Python 旧版遗留
 __pycache__/

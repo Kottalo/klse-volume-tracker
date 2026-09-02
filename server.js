@@ -1,6 +1,7 @@
 // KLSE Volume Tracker — 马来西亚股票成交量异动追踪
 // Node.js + Express + 内置 node:sqlite + SSE 推送
 // 数据源: Yahoo Finance 免费盘中接口(无需 key)
+import 'dotenv/config';
 import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
