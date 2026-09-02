@@ -79,6 +79,8 @@ function loadConfig() {
   if (process.env.TWILIO_FROM) cfg.twilio_from = process.env.TWILIO_FROM;
   if (process.env.TWILIO_TO) cfg.twilio_to = process.env.TWILIO_TO;
   if (process.env.TWILIO_CONTENT_SID) cfg.twilio_content_sid = process.env.TWILIO_CONTENT_SID;
+  if (process.env.TELEGRAM_BOT_TOKEN) cfg.telegram_bot_token = process.env.TELEGRAM_BOT_TOKEN;
+  if (process.env.TELEGRAM_CHAT_ID) cfg.telegram_chat_id = process.env.TELEGRAM_CHAT_ID;
   return cfg;
 }
 
@@ -510,8 +512,6 @@ function buildState() {
       direction: cfg.direction,
       min_previous_volume: cfg.min_previous_volume,
       cooldown_minutes: cfg.cooldown_minutes,
-      telegram_bot_token: cfg.telegram_bot_token,
-      telegram_chat_id: cfg.telegram_chat_id,
       price_drop_threshold: cfg.price_drop_threshold,
     },
     watchlist: cfg.watchlist,

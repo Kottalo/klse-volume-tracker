@@ -226,8 +226,6 @@ export default function App() {
               <Field label="轮询间隔(分)" def={s?.settings.poll_interval_minutes} save={(v) => setSetting({ poll_interval_minutes: +v })} />
               <Field label="上一时段最小量" def={s?.settings.min_previous_volume} save={(v) => setSetting({ min_previous_volume: +v })} />
               <Field label="重复提醒间隔(分)" def={s?.settings.cooldown_minutes} save={(v) => setSetting({ cooldown_minutes: +v })} />
-              <Field label="Telegram Bot Token" def={s?.settings.telegram_bot_token} save={(v) => setSetting({ telegram_bot_token: v })} />
-              <Field label="Telegram Chat ID" def={s?.settings.telegram_chat_id} save={(v) => setSetting({ telegram_chat_id: v })} />
             </div>
             <h2 style={{ marginTop: 18 }}>价格阈值规则 <span className="muted">(按股价范围设提醒阈值)</span></h2>
             <ThresholdEditor rules={priceRules || state?.price_thresholds || []} onChange={handleRulesChange} />

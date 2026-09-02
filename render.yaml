@@ -10,13 +10,9 @@ services:
         value: "24"
       - key: DATA_DIR
         value: /var/data
-      - key: TWILIO_SID
+      - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: TWILIO_AUTH_TOKEN
-        sync: false
-      - key: TWILIO_FROM
-        sync: false
-      - key: TWILIO_CONTENT_SID
+      - key: TELEGRAM_CHAT_ID
         sync: false
     disk:
       name: data
