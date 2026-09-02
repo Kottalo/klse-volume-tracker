@@ -4,7 +4,7 @@ services:
     runtime: node
     buildCommand: npm install && npm run build
     startCommand: node server.js
-    healthCheckPath: /api/state
+    healthCheckPath: /healthz
     envVars:
       - key: NODE_VERSION
         value: "24"

@@ -534,6 +534,8 @@ const app = express();
 app.use(express.json());
 app.use(express.static(DIST));
 
+app.get('/healthz', (req, res) => res.json({ ok: true }));
+
 app.get('/api/state', async (req, res) => {
   await maybePoll();  // 数据陈旧则即时抓取, 否则用缓存
   res.json(buildState());
