@@ -29,6 +29,7 @@ const DEFAULTS = {
   twilio_content_sid: '',
   price_thresholds: [],   // 按股价范围设提醒阈值: [{max, threshold}], max=null=无限; 空=不通知
   price_drop_threshold: 40,  // 股价较昨收跌幅 >= 此% 时提醒
+  gap_up_threshold: 5,       // 股价较开盘涨幅 >= 此% 时提醒
 };
 
 const DEFAULT_WATCHLIST = [
@@ -88,7 +89,7 @@ db.exec(`
     stock TEXT, date TEXT, volume INTEGER, PRIMARY KEY(stock, date));
   CREATE INDEX IF NOT EXISTS idx_daily ON daily(stock, date);
   CREATE TABLE IF NOT EXISTS live(
-    stock TEXT PRIMARY KEY, name TEXT, price REAL, prevClose REAL, mtime INTEGER);
+    stock TEXT PRIMARY KEY, name TEXT, price REAL, prevClose REAL, open REAL, mtime INTEGER);
   CREATE TABLE IF NOT EXISTS alerts(
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, stock TEXT, name TEXT,
     window TEXT, current INTEGER, previous INTEGER, ratio REAL, direction TEXT);
@@ -98,9 +99,12 @@ db.exec(`
     stock TEXT, date TEXT, ts INTEGER, PRIMARY KEY(stock, date));
   CREATE TABLE IF NOT EXISTS price_drop_alert(
     stock TEXT, date TEXT, ts INTEGER, PRIMARY KEY(stock, date));
+  CREATE TABLE IF NOT EXISTS gap_up_alert(
+    stock TEXT, date TEXT, ts INTEGER, PRIMARY KEY(stock, date));
 `);
-// 迁移: 旧库 live 表补 prevClose 列
+// 迁移: 旧库 live 表补 prevClose / open 列
 try { db.exec('ALTER TABLE live ADD COLUMN prevClose REAL'); } catch (e) {}
+try { db.exec('ALTER TABLE live ADD COLUMN open REAL'); } catch (e) {}
 
 function storeCandles(code, candles) {
   if (!candles.length) return;
@@ -114,10 +118,10 @@ function storeDaily(code, rows) {
   for (const [date, volume] of rows) stmt.run(code, date, volume);
 }
 
-function updateLive(code, name, price, prevClose, mtime) {
-  db.prepare(`INSERT INTO live(stock, name, price, prevClose, mtime) VALUES(?,?,?,?,?)
-    ON CONFLICT(stock) DO UPDATE SET name=excluded.name, price=excluded.price, prevClose=excluded.prevClose, mtime=excluded.mtime`)
-    .run(code, name, price, prevClose, mtime);
+function updateLive(code, name, price, prevClose, open, mtime) {
+  db.prepare(`INSERT INTO live(stock, name, price, prevClose, open, mtime) VALUES(?,?,?,?,?,?)
+    ON CONFLICT(stock) DO UPDATE SET name=excluded.name, price=excluded.price, prevClose=excluded.prevClose, open=excluded.open, mtime=excluded.mtime`)
+    .run(code, name, price, prevClose, open, mtime);
 }
 
 function prune() {
@@ -148,8 +152,12 @@ function parseChart(d) {
 async function fetchIntraday(code) {
   const d = await yahooGet(`https://query1.finance.yahoo.com/v8/finance/chart/${code}.KL?interval=5m&range=1d`);
   const { meta, candles } = parseChart(d);
+  // 当天开盘价 = 第一个非空的 open(5m candle, 即 9:00 开盘价)
+  const openArr = d.chart?.result?.[0]?.indicators?.quote?.[0]?.open || [];
+  let open = null;
+  for (const o of openArr) { if (o != null && o > 0) { open = o; break; } }
   return { code, name: meta.longName || meta.shortName || code,
-    price: meta.regularMarketPrice, prevClose: meta.chartPreviousClose, mtime: meta.regularMarketTime, candles };
+    price: meta.regularMarketPrice, prevClose: meta.chartPreviousClose, open, mtime: meta.regularMarketTime, candles };
 }
 
 async function fetchBackfill(code) {
@@ -362,30 +370,6 @@ function evaluateAlerts(cfg) {
   }
 }
 
-function evaluateDailyAlert(cfg) {
-  if (!isMarketOpen()) return;
-  if (!(cfg.telegram_bot_token && cfg.telegram_chat_id)) return;
-  const nowS = Math.floor(Date.now() / 1000);
-  for (const w of cfg.watchlist) {
-    const rows = db.prepare('SELECT date, volume FROM daily WHERE stock=? ORDER BY date DESC LIMIT 2').all(w.code);
-    if (rows.length < 2) continue;
-    const today = rows[0], yesterday = rows[1];
-    if (!yesterday.volume) continue;
-    const ratio = today.volume / yesterday.volume * 100;
-    const live = db.prepare('SELECT price FROM live WHERE stock=?').get(w.code);
-    const threshold = getThresholdForPrice(live?.price, cfg.price_thresholds);
-    if (threshold == null) continue;   // 无规则或价格不在段内 → 不通知
-    if (ratio < threshold) continue;
-    const sent = db.prepare('SELECT 1 FROM daily_alert WHERE stock=? AND date=?').get(w.code, today.date);
-    if (sent) continue;
-    db.prepare('INSERT INTO daily_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
-      .run(w.code, today.date, nowS);
-    const text = `📈 放量提醒 — ${w.name || w.code} (${w.code}.KL)
-今日成交量 ${fmtNum(today.volume)} 已达昨日 ${fmtNum(yesterday.volume)} 的 ${ratio.toFixed(1)}%
-现价 ${live?.price ?? '-'}`;
-    sendTelegramText(text, cfg);
-  }
-}
 
 // 股价暴跌提醒: 现价较昨收跌幅 >= 阈值% → Telegram 群 (开市时段, 每天每只最多一次)
 function evaluatePriceDrop(cfg) {
@@ -405,6 +389,28 @@ function evaluatePriceDrop(cfg) {
       .run(w.code, date, nowS);
     const text = `📉 暴跌提醒 — ${w.name || w.code} (${w.code}.KL)
 现价 ${l.price} 较昨收 ${l.prevClose} 跌 ${drop.toFixed(1)}% (阈值 ${threshold}%)`;
+    sendTelegramText(text, cfg);
+  }
+}
+
+// 开盘急涨提醒: 现价较开盘涨幅 >= 阈值% → Telegram 群 (开市时段, 每天每只最多一次)
+function evaluateGapUp(cfg) {
+  if (!isMarketOpen()) return;
+  if (!(cfg.telegram_bot_token && cfg.telegram_chat_id)) return;
+  const threshold = Number(cfg.gap_up_threshold ?? 5);
+  const date = mytDate(Date.now() / 1000);
+  const nowS = Math.floor(Date.now() / 1000);
+  for (const w of cfg.watchlist) {
+    const l = db.prepare('SELECT name, price, open FROM live WHERE stock=?').get(w.code);
+    if (!l || l.price == null || l.open == null || l.open <= 0) continue;
+    const gain = (l.price - l.open) / l.open * 100;
+    if (gain < threshold) continue;
+    const sent = db.prepare('SELECT 1 FROM gap_up_alert WHERE stock=? AND date=?').get(w.code, date);
+    if (sent) continue;
+    db.prepare('INSERT INTO gap_up_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
+      .run(w.code, date, nowS);
+    const text = `🚀 开盘急涨 — ${l.name || w.code} (${w.code}.KL)
+现价 ${l.price.toFixed(3)} 较开盘 ${l.open.toFixed(3)} 涨 ${gain.toFixed(1)}% (阈值 ${threshold}%)`;
     sendTelegramText(text, cfg);
   }
 }
@@ -444,15 +450,15 @@ function poll(backfill = false) {
         try {
           const d = await fetchIntraday(w.code);
           storeCandles(w.code, d.candles);
-          if (d.name) updateLive(w.code, d.name, d.price, d.prevClose, d.mtime);
+          if (d.name) updateLive(w.code, d.name, d.price, d.prevClose, d.open, d.mtime);
         } catch (e) { log(`poll ${w.code} 失败: ${e.message}`); }
         try { storeDaily(w.code, await fetchDaily(w.code, '5d')); }
         catch (e) {}
         await sleep(200);
       }
       evaluateAlerts(cfg);
-      evaluateDailyAlert(cfg);
       evaluatePriceDrop(cfg);
+      evaluateGapUp(cfg);
       prune();
       lastPoll = Date.now() / 1000;
       log(`即时抓取完成 (${watchlist.length} 只)`);
