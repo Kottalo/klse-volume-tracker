@@ -224,7 +224,7 @@ export default function App() {
               <thead><tr>
                 <th>代码</th><th>名称</th><th>现价</th>
                 <th>当前时段量</th><th>上一时段量</th><th>时段比率</th>
-                <th>今日量</th><th>昨日量</th><th>4周/5天均量</th>
+                <th>今日量</th><th>昨日量</th><th>4W/5D均量</th>
               </tr></thead>
               <tbody>
                 {(sortBy === 'code'

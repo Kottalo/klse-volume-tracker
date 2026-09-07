@@ -222,6 +222,14 @@ function computeDaily(code) {
   return { today: rows[0].volume, yesterday: rows[1].volume };
 }
 
+// 4周/5天均量(排除今天未收盘交易日, 固定历史值)
+function getAvgVolumes(code) {
+  const todayStr = mytDate(Date.now() / 1000);
+  const d5 = db.prepare('SELECT AVG(volume) a FROM (SELECT volume FROM daily WHERE stock=? AND date < ? ORDER BY date DESC LIMIT 5)').get(code, todayStr);
+  const d20 = db.prepare('SELECT AVG(volume) a FROM (SELECT volume FROM daily WHERE stock=? AND date < ? ORDER BY date DESC LIMIT 20)').get(code, todayStr);
+  return { avg4w: d20?.a ?? null, avg5d: d5?.a ?? null };
+}
+
 function computeMetrics(cfg) {
   const out = [];
   for (const w of cfg.watchlist) {
@@ -364,7 +372,7 @@ function evaluateAlerts(cfg) {
     if (!wasAbove && (nowS - lastAlert) >= cooldown) { should = true; lastAlert = nowS; }
     db.prepare('INSERT INTO state(stock, above, last_alert) VALUES(?,1,?) ON CONFLICT(stock) DO UPDATE SET above=1, last_alert=excluded.last_alert').run(m.code, lastAlert);
     if (should) {
-      const text = `📈 盘中放量 — ${m.name} (${m.code}.KL)\n时段 ${window}: 当前 ${fmtNum(m.current)} vs 上一时段 ${fmtNum(m.previous)} (${m.ratio.toFixed(1)}%)\n现价 ${m.price ?? '-'}`;
+      const text = `📈 盘中放量 — ${m.name} (${m.code}.KL)\n时段 ${window}: 当前 ${fmtNum(m.current)} vs 上一时段 ${fmtNum(m.previous)} (${m.ratio.toFixed(1)}%)\n现价 ${m.price ?? '-'} | 均量 4W ${fmtNum(m.avg4w)} / 5D ${fmtNum(m.avg5d)}\n👉 https://www.synthe-fantasia.site`;
       sendTelegramText(text, cfg);
     }
   }
@@ -387,8 +395,8 @@ function evaluatePriceDrop(cfg) {
     if (sent) continue;
     db.prepare('INSERT INTO price_drop_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
       .run(w.code, date, nowS);
-    const text = `📉 暴跌提醒 — ${w.name || w.code} (${w.code}.KL)
-现价 ${l.price} 较昨收 ${l.prevClose} 跌 ${drop.toFixed(1)}% (阈值 ${threshold}%)`;
+    const av = getAvgVolumes(w.code);
+    const text = `📉 暴跌提醒 — ${w.name || w.code} (${w.code}.KL)\n现价 ${l.price} 较昨收 ${l.prevClose} 跌 ${drop.toFixed(1)}% (阈值 ${threshold}%)\n均量 4W ${fmtNum(av.avg4w)} / 5D ${fmtNum(av.avg5d)}\n👉 https://www.synthe-fantasia.site`;
     sendTelegramText(text, cfg);
   }
 }
@@ -409,8 +417,8 @@ function evaluateGapUp(cfg) {
     if (sent) continue;
     db.prepare('INSERT INTO gap_up_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
       .run(w.code, date, nowS);
-    const text = `🚀 开盘急涨 — ${l.name || w.code} (${w.code}.KL)
-现价 ${l.price.toFixed(3)} 较开盘 ${l.open.toFixed(3)} 涨 ${gain.toFixed(1)}% (阈值 ${threshold}%)`;
+    const av = getAvgVolumes(w.code);
+    const text = `🚀 开盘急涨 — ${l.name || w.code} (${w.code}.KL)\n现价 ${l.price.toFixed(3)} 较开盘 ${l.open.toFixed(3)} 涨 ${gain.toFixed(1)}% (阈值 ${threshold}%)\n均量 4W ${fmtNum(av.avg4w)} / 5D ${fmtNum(av.avg5d)}\n👉 https://www.synthe-fantasia.site`;
     sendTelegramText(text, cfg);
   }
 }
