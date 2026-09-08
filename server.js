@@ -372,7 +372,7 @@ function evaluateAlerts(cfg) {
     if (!wasAbove && (nowS - lastAlert) >= cooldown) { should = true; lastAlert = nowS; }
     db.prepare('INSERT INTO state(stock, above, last_alert) VALUES(?,1,?) ON CONFLICT(stock) DO UPDATE SET above=1, last_alert=excluded.last_alert').run(m.code, lastAlert);
     if (should) {
-      const text = `📈 盘中放量 — ${m.name} (${m.code}.KL)\n时段 ${window}: 当前 ${fmtNum(m.current)} vs 上一时段 ${fmtNum(m.previous)} (${m.ratio.toFixed(1)}%)\n现价 ${m.price ?? '-'} | 均量 4W ${fmtNum(m.avg4w)} / 5D ${fmtNum(m.avg5d)}\n👉 https://www.synthe-fantasia.site`;
+      const text = `📊 放量提醒 — ${m.name} (${m.code}.KL)\n时段 ${window}: 当前 ${fmtNum(m.current)} vs 上一时段 ${fmtNum(m.previous)} (${m.ratio.toFixed(1)}%)\n现价 ${m.price ?? '-'} | 均量 4W ${fmtNum(m.avg4w)} / 5D ${fmtNum(m.avg5d)}\n👉 https://www.synthe-fantasia.site`;
       sendTelegramText(text, cfg);
     }
   }
@@ -418,7 +418,7 @@ function evaluateGapUp(cfg) {
     db.prepare('INSERT INTO gap_up_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
       .run(w.code, date, nowS);
     const av = getAvgVolumes(w.code);
-    const text = `🚀 开盘急涨 — ${l.name || w.code} (${w.code}.KL)\n现价 ${l.price.toFixed(3)} 较开盘 ${l.open.toFixed(3)} 涨 ${gain.toFixed(1)}% (阈值 ${threshold}%)\n均量 4W ${fmtNum(av.avg4w)} / 5D ${fmtNum(av.avg5d)}\n👉 https://www.synthe-fantasia.site`;
+    const text = `🚀 急涨提醒 — ${l.name || w.code} (${w.code}.KL)\n现价 ${l.price.toFixed(3)} 较开盘 ${l.open.toFixed(3)} 涨 ${gain.toFixed(1)}% (阈值 ${threshold}%)\n均量 4W ${fmtNum(av.avg4w)} / 5D ${fmtNum(av.avg5d)}\n👉 https://www.synthe-fantasia.site`;
     sendTelegramText(text, cfg);
   }
 }
