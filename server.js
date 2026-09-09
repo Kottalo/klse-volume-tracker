@@ -270,42 +270,35 @@ async function mapCodeToNumeric(ticker) {
   } catch { return null; }
 }
 
-// 后台: 给全市场填「数字代码」映射 (一次性)
-async function mapAllCodes() {
-  const rows = db.prepare('SELECT stock FROM universe WHERE code IS NULL').all();
-  if (!rows.length) return;
-  log(`开始映射 ${rows.length} 只股票的数字代码(Yahoo search)...`);
-  let done = 0;
-  for (const u of rows) {
-    const code = await mapCodeToNumeric(u.stock);
-    if (code) { db.prepare('UPDATE universe SET code=? WHERE stock=?').run(code, u.stock); done++; }
-    await sleep(250);
+// 按需: 通知触发时用 Yahoo 临时算 4W/5D 均量(带缓存, 不用回填全市场)
+async function getAvgVolumesOnDemand(ticker) {
+  const cached = db.prepare('SELECT avg4w, avg5d FROM live WHERE stock=?').get(ticker);
+  if (cached && cached.avg4w != null) return { avg4w: cached.avg4w, avg5d: cached.avg5d };
+  let code = db.prepare('SELECT code FROM universe WHERE stock=?').get(ticker)?.code;
+  if (!code) {
+    code = await mapCodeToNumeric(ticker);
+    if (code) db.prepare('UPDATE universe SET code=? WHERE stock=?').run(code, ticker);
   }
-  log(`映射完成 ${done}/${rows.length} 只`);
-}
-
-// 后台: 用 Yahoo 日线回填每日总量历史(一次性, 立即有4W/5D均量)
-async function backfillDailyVol() {
-  const rows = db.prepare('SELECT stock, code FROM universe WHERE code IS NOT NULL').all();
-  if (!rows.length) return;
-  log(`开始回填 ${rows.length} 只股票的日线历史(Yahoo)...`);
-  for (const u of rows) {
-    try {
-      const d = await yahooGet(`https://query1.finance.yahoo.com/v8/finance/chart/${u.code}.KL?interval=1d&range=1y`);
-      const r = d.chart.result[0];
-      const ts = r.timestamp || [];
-      const vol = r.indicators?.quote?.[0]?.volume || [];
-      const n = Math.min(ts.length, vol.length);
-      for (let i = 0; i < n; i++) {
-        if (vol[i] != null && vol[i] > 0) {
-          db.prepare('INSERT INTO daily_vol(stock, date, volume) VALUES(?,?,?) ON CONFLICT(stock, date) DO UPDATE SET volume=excluded.volume')
-            .run(u.stock, mytDate(ts[i]), vol[i]);
-        }
+  if (!code) return { avg4w: null, avg5d: null };
+  try {
+    const d = await yahooGet(`https://query1.finance.yahoo.com/v8/finance/chart/${code}.KL?interval=1d&range=3mo`);
+    const r = d.chart.result[0];
+    const ts = r.timestamp || [];
+    const vol = r.indicators?.quote?.[0]?.volume || [];
+    const today = mytDate(Date.now() / 1000);
+    const past = [];
+    for (let i = 0; i < Math.min(ts.length, vol.length); i++) {
+      if (vol[i] != null && vol[i] > 0) {
+        const dt = mytDate(ts[i]);
+        if (dt < today) past.push(vol[i]);  // 排除今天(未收盘)
       }
-    } catch {}
-    await sleep(300);
-  }
-  log('日线历史回填完成');
+    }
+    const avgN = (n) => (past.length >= n) ? past.slice(-n).reduce((s, v) => s + v, 0) / n : (past.length ? past.reduce((s, v) => s + v, 0) / past.length : null);
+    const avg4w = avgN(20);
+    const avg5d = avgN(5);
+    db.prepare('UPDATE live SET avg4w=?, avg5d=? WHERE stock=?').run(avg4w, avg5d, ticker);
+    return { avg4w, avg5d };
+  } catch { return { avg4w: null, avg5d: null }; }
 }
 
 // ---------------- 成交量计算 ----------------
@@ -355,7 +348,7 @@ function computeMetrics(cfg) {
   const universe = db.prepare('SELECT stock, name FROM universe').all();
   for (const w of universe) {
     const code = w.stock;
-    const live = db.prepare('SELECT name, price, open, prevClose, volume, mtime FROM live WHERE stock=?').get(code);
+    const live = db.prepare('SELECT name, price, open, prevClose, volume, avg4w, avg5d, mtime FROM live WHERE stock=?').get(code);
     if (!live) continue;
     const vol = computeVolumes(code, cfg.window);
     let current = null, previous = null, ratio = null, status = 'nodata';
@@ -369,11 +362,8 @@ function computeMetrics(cfg) {
         status = 'low';
       }
     }
-    const todayStr = mytDate(Date.now() / 1000);
-    const d5 = db.prepare('SELECT AVG(volume) a FROM (SELECT volume FROM daily_vol WHERE stock=? AND date < ? ORDER BY date DESC LIMIT 5)').get(code, todayStr);
-    const d20 = db.prepare('SELECT AVG(volume) a FROM (SELECT volume FROM daily_vol WHERE stock=? AND date < ? ORDER BY date DESC LIMIT 20)').get(code, todayStr);
     out.push({ code, name: live.name || w.name || code, price: live.price, open: live.open, prevClose: live.prevClose,
-      volume: live.volume, avg4w: d20?.a ?? null, avg5d: d5?.a ?? null, mtime: live.mtime,
+      volume: live.volume, avg4w: live.avg4w ?? null, avg5d: live.avg5d ?? null, mtime: live.mtime,
       current, previous, ratio, status });
   }
   // 按增长倍率从大到小排列
@@ -459,7 +449,7 @@ function getThresholdForPrice(price, rules) {
 }
 
 // 盘中放量提醒: 当前时段量 vs 上一时段量达到阈值% → Telegram (边沿触发 + cooldown 去重)
-function evaluateAlerts(cfg) {
+async function evaluateAlerts(cfg) {
   if (!isMarketOpen()) return;
   if (!(cfg.telegram_bot_token && cfg.telegram_chat_id)) return;
   const window = cfg.window;
@@ -477,7 +467,8 @@ function evaluateAlerts(cfg) {
     if (!wasAbove && (nowS - lastAlert) >= cooldown) { should = true; lastAlert = nowS; }
     db.prepare('INSERT INTO state(stock, above, last_alert) VALUES(?,1,?) ON CONFLICT(stock) DO UPDATE SET above=1, last_alert=excluded.last_alert').run(m.code, lastAlert);
     if (should) {
-      const text = `📊 放量提醒 — ${m.name} (${m.code})\n时段 ${window}: 当前 ${fmtNum(m.current)} vs 上一时段 ${fmtNum(m.previous)} (${m.ratio.toFixed(1)}%)\n现价 ${m.price ?? '-'} | 均量 4W ${fmtNum(m.avg4w)} / 5D ${fmtNum(m.avg5d)}\n👉 https://www.synthe-fantasia.site`;
+      const av = await getAvgVolumesOnDemand(m.code);
+      const text = `📊 放量提醒 — ${m.name} (${m.code})\n时段 ${window}: 当前 ${fmtNum(m.current)} vs 上一时段 ${fmtNum(m.previous)} (${m.ratio.toFixed(1)}%)\n现价 ${m.price ?? '-'} | 均量 4W ${fmtNum(av.avg4w)} / 5D ${fmtNum(av.avg5d)}\n👉 https://www.synthe-fantasia.site`;
       sendTelegramText(text, cfg);
     }
   }
@@ -485,7 +476,7 @@ function evaluateAlerts(cfg) {
 
 
 // 股价暴跌提醒: 现价较昨收跌幅 >= 阈值% → Telegram 群 (开市时段, 每天每只最多一次)
-function evaluatePriceDrop(cfg) {
+async function evaluatePriceDrop(cfg) {
   if (!isMarketOpen()) return;
   if (!(cfg.telegram_bot_token && cfg.telegram_chat_id)) return;
   const threshold = Number(cfg.price_drop_threshold ?? 40);
@@ -493,7 +484,7 @@ function evaluatePriceDrop(cfg) {
   const nowS = Math.floor(Date.now() / 1000);
   const universe = db.prepare('SELECT stock, name FROM universe').all();
   for (const w of universe) {
-    const l = db.prepare('SELECT name, price, prevClose, avg10d, avg30d FROM live WHERE stock=?').get(w.stock);
+    const l = db.prepare('SELECT name, price, prevClose FROM live WHERE stock=?').get(w.stock);
     if (!l || l.price == null || l.prevClose == null || l.prevClose <= 0) continue;
     const drop = (l.prevClose - l.price) / l.prevClose * 100;
     if (drop < threshold) continue;
@@ -501,13 +492,14 @@ function evaluatePriceDrop(cfg) {
     if (sent) continue;
     db.prepare('INSERT INTO price_drop_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
       .run(w.stock, date, nowS);
-    const text = `📉 暴跌提醒 — ${l.name || w.stock} (${w.stock})\n现价 ${l.price} 较昨收 ${l.prevClose} 跌 ${drop.toFixed(1)}% (阈值 ${threshold}%)\n均量 4W ${fmtNum(l.avg4w)} / 5D ${fmtNum(l.avg5d)}\n👉 https://www.synthe-fantasia.site`;
+    const av = await getAvgVolumesOnDemand(w.stock);
+    const text = `📉 暴跌提醒 — ${l.name || w.stock} (${w.stock})\n现价 ${l.price} 较昨收 ${l.prevClose} 跌 ${drop.toFixed(1)}% (阈值 ${threshold}%)\n均量 4W ${fmtNum(av.avg4w)} / 5D ${fmtNum(av.avg5d)}\n👉 https://www.synthe-fantasia.site`;
     sendTelegramText(text, cfg);
   }
 }
 
 // 开盘急涨提醒: 现价较开盘涨幅 >= 阈值% → Telegram 群 (开市时段, 每天每只最多一次)
-function evaluateGapUp(cfg) {
+async function evaluateGapUp(cfg) {
   if (!isMarketOpen()) return;
   if (!(cfg.telegram_bot_token && cfg.telegram_chat_id)) return;
   const threshold = Number(cfg.gap_up_threshold ?? 5);
@@ -515,7 +507,7 @@ function evaluateGapUp(cfg) {
   const nowS = Math.floor(Date.now() / 1000);
   const universe = db.prepare('SELECT stock, name FROM universe').all();
   for (const w of universe) {
-    const l = db.prepare('SELECT name, price, open, avg10d, avg30d FROM live WHERE stock=?').get(w.stock);
+    const l = db.prepare('SELECT name, price, open FROM live WHERE stock=?').get(w.stock);
     if (!l || l.price == null || l.open == null || l.open <= 0) continue;
     const gain = (l.price - l.open) / l.open * 100;
     if (gain < threshold) continue;
@@ -523,7 +515,8 @@ function evaluateGapUp(cfg) {
     if (sent) continue;
     db.prepare('INSERT INTO gap_up_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
       .run(w.stock, date, nowS);
-    const text = `🚀 急涨提醒 — ${l.name || w.stock} (${w.stock})\n现价 ${l.price.toFixed(3)} 较开盘 ${l.open.toFixed(3)} 涨 ${gain.toFixed(1)}% (阈值 ${threshold}%)\n均量 4W ${fmtNum(l.avg4w)} / 5D ${fmtNum(l.avg5d)}\n👉 https://www.synthe-fantasia.site`;
+    const av = await getAvgVolumesOnDemand(w.stock);
+    const text = `🚀 急涨提醒 — ${l.name || w.stock} (${w.stock})\n现价 ${l.price.toFixed(3)} 较开盘 ${l.open.toFixed(3)} 涨 ${gain.toFixed(1)}% (阈值 ${threshold}%)\n均量 4W ${fmtNum(av.avg4w)} / 5D ${fmtNum(av.avg5d)}\n👉 https://www.synthe-fantasia.site`;
     sendTelegramText(text, cfg);
   }
 }
@@ -555,9 +548,9 @@ function poll(backfill = false) {
         recordDailyVolume(q.ticker, q.volume);
       }
       const cnt = db.prepare('SELECT COUNT(*) c FROM universe').get().c;
-      evaluateAlerts(cfg);
-      evaluatePriceDrop(cfg);
-      evaluateGapUp(cfg);
+      await evaluateAlerts(cfg);
+      await evaluatePriceDrop(cfg);
+      await evaluateGapUp(cfg);
       prune();
       lastPoll = Date.now() / 1000;
       log(`全市场抓取完成 (${cnt} 只)`);
@@ -746,10 +739,4 @@ app.listen(PORT, () => {
 });
 poll();          // 启动时立即抓全市场
 startPolling();  // 开市时段后台定时抓取(无人值守追踪)
-// 后台: 等首次 poll 填好 universe 后, 映射数字代码 → 回填日线历史(一次性, 立即有4W/5D均量)
-(async () => {
-  await sleep(5000);
-  await mapAllCodes();
-  await backfillDailyVol();
-  broadcast();
-})();
+
