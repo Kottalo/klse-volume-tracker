@@ -379,7 +379,7 @@ function computeMetrics(cfg) {
 
 // ---------------- 告警引擎 ----------------
 function fmtNum(n) {
-  if (n == null) return '0';
+  if (n == null) return '—';
   if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
   if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
