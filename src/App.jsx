@@ -207,24 +207,24 @@ export default function App() {
         {/* 自选股 */}
         <div className="panel">
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-            <h2 style={{ margin: 0 }}>自选股 <span className="muted">({s?.watchlist.length ?? 0} 只)</span></h2>
+            <h2 style={{ margin: 0 }}>全市场 <span className="muted">({s?.universe_count ?? s?.stocks?.length ?? 0} 只)</span></h2>
             <div className="seg">
               <button className={sortBy === 'ratio' ? 'on' : ''} onClick={() => setSortBy('ratio')}>按倍率</button>
               <button className={sortBy === 'code' ? 'on' : ''} onClick={() => setSortBy('code')}>按代码</button>
             </div>
           </div>
           <div className="row" style={{ marginBottom: 12 }}>
-            <input placeholder="股票代码, 如 1155" style={{ width: 160 }} value={addCode}
+            <input placeholder="字母 ticker, 如 MAYBANK" style={{ width: 160 }} value={addCode}
               onChange={(e) => setAddCode(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addStock()} />
             <button onClick={addStock}>添加</button>
-            <span className="muted">马股代码纯数字, 自动加 .KL 后缀</span>
+            <span className="muted">字母 ticker (全市场已自动抓取, 这里可额外加)</span>
           </div>
           <div style={{ overflowX: 'auto' }}>
             <table>
               <thead><tr>
                 <th>代码</th><th>名称</th><th>现价</th>
                 <th>当前时段量</th><th>上一时段量</th><th>时段比率</th>
-                <th>今日量</th><th>昨日量</th><th>4W/5D均量</th>
+                <th>今日量</th><th>10D/30D均量</th>
               </tr></thead>
               <tbody>
                 {(sortBy === 'code'
@@ -237,15 +237,14 @@ export default function App() {
                   );
                   return (
                     <tr key={st.code}>
-                      <td><span className="code">{st.code}.KL</span></td>
+                      <td><span className="code">{st.code}</span></td>
                       <td>{st.name}</td>
                       <td>{st.price != null ? st.price.toFixed(3) : '—'}</td>
                       <td>{fmt(st.current)}</td>
                       <td>{fmt(st.previous)}</td>
                       <td>{ratioHtml}</td>
-                      <td>{fmt(st.todayVol)}</td>
-                      <td>{fmt(st.yesterdayVol)}</td>
-                      <td>{fmt(st.avg4w)} / {fmt(st.avg5d)}</td>
+                      <td>{fmt(st.volume)}</td>
+                      <td>{fmt(st.avg10d)} / {fmt(st.avg30d)}</td>
                     </tr>
                   );
                 })}
