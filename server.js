@@ -14,6 +14,7 @@ const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 const DB_PATH = path.join(DATA_DIR, 'data.db');
 const DIST = path.join(__dirname, 'dist');
 const PORT = process.env.PORT || 8080;
+const VERSION = 'v9.09-emoji3';  // 部署版本探针
 
 const DEFAULTS = {
   poll_interval_minutes: 5,   // 开市时段每 5 分钟轮询
@@ -598,6 +599,7 @@ function buildState() {
   const cfg = loadConfig();
   const universeCount = db.prepare('SELECT COUNT(*) c FROM universe').get().c;
   return {
+    version: VERSION,
     universe_count: universeCount,
     settings: {
       poll_interval_minutes: cfg.poll_interval_minutes,
