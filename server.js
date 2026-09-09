@@ -119,6 +119,8 @@ try { db.exec('ALTER TABLE live ADD COLUMN volume INTEGER'); } catch (e) {}
 try { db.exec('ALTER TABLE live ADD COLUMN avg10d REAL'); } catch (e) {}
 try { db.exec('ALTER TABLE live ADD COLUMN avg30d REAL'); } catch (e) {}
 try { db.exec('ALTER TABLE universe ADD COLUMN code TEXT'); } catch (e) {}
+try { db.exec('ALTER TABLE live ADD COLUMN avg4w REAL'); } catch (e) {}
+try { db.exec('ALTER TABLE live ADD COLUMN avg5d REAL'); } catch (e) {}
 
 function storeCandles(code, candles) {
   if (!candles.length) return;
