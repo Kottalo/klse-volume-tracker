@@ -224,7 +224,7 @@ export default function App() {
               <thead><tr>
                 <th>代码</th><th>名称</th><th>现价</th>
                 <th>当前时段量</th><th>上一时段量</th><th>时段比率</th>
-                <th>今日量</th><th>10D/30D均量</th>
+                <th>今日量</th><th>4W/5D均量</th>
               </tr></thead>
               <tbody>
                 {(sortBy === 'code'
@@ -244,7 +244,7 @@ export default function App() {
                       <td>{fmt(st.previous)}</td>
                       <td>{ratioHtml}</td>
                       <td>{fmt(st.volume)}</td>
-                      <td>{fmt(st.avg10d)} / {fmt(st.avg30d)}</td>
+                      <td>{fmt(st.avg4w)} / {fmt(st.avg5d)}</td>
                     </tr>
                   );
                 })}

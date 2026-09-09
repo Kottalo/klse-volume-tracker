@@ -108,6 +108,8 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS volume_ts(
     stock TEXT, ts INTEGER, cum_volume INTEGER, PRIMARY KEY(stock, ts));
   CREATE INDEX IF NOT EXISTS idx_volume_ts ON volume_ts(stock, ts);
+  CREATE TABLE IF NOT EXISTS daily_vol(
+    stock TEXT, date TEXT, volume INTEGER, PRIMARY KEY(stock, date));
 `);
 // 迁移: 旧库 live 表补 prevClose / open 列
 try { db.exec('ALTER TABLE live ADD COLUMN prevClose REAL'); } catch (e) {}
@@ -115,6 +117,7 @@ try { db.exec('ALTER TABLE live ADD COLUMN open REAL'); } catch (e) {}
 try { db.exec('ALTER TABLE live ADD COLUMN volume INTEGER'); } catch (e) {}
 try { db.exec('ALTER TABLE live ADD COLUMN avg10d REAL'); } catch (e) {}
 try { db.exec('ALTER TABLE live ADD COLUMN avg30d REAL'); } catch (e) {}
+try { db.exec('ALTER TABLE universe ADD COLUMN code TEXT'); } catch (e) {}
 
 function storeCandles(code, candles) {
   if (!candles.length) return;
@@ -247,6 +250,64 @@ function recordVolume(code, cumVolume) {
   db.prepare('INSERT OR REPLACE INTO volume_ts(stock, ts, cum_volume) VALUES(?,?,?)').run(code, ts, cumVolume);
 }
 
+// 记录每日总量(用于自己算4周/5天均量; 收盘后=最终总量)
+function recordDailyVolume(code, volume) {
+  if (volume == null) return;
+  const date = mytDate(Date.now() / 1000);
+  db.prepare('INSERT INTO daily_vol(stock, date, volume) VALUES(?,?,?) ON CONFLICT(stock, date) DO UPDATE SET volume=excluded.volume').run(code, date, volume);
+}
+
+// 字母 ticker → 数字代码 (Yahoo search, 用于日线历史)
+async function mapCodeToNumeric(ticker) {
+  try {
+    const res = await fetch(`https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(ticker)}&quotesCount=5&newsCount=0`, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+    });
+    if (!res.ok) return null;
+    const d = await res.json();
+    const q = (d.quotes || []).find((x) => x.symbol && x.symbol.endsWith('.KL') && (x.shortname || '').toUpperCase() === ticker.toUpperCase());
+    return q ? q.symbol.replace('.KL', '') : null;
+  } catch { return null; }
+}
+
+// 后台: 给全市场填「数字代码」映射 (一次性)
+async function mapAllCodes() {
+  const rows = db.prepare('SELECT stock FROM universe WHERE code IS NULL').all();
+  if (!rows.length) return;
+  log(`开始映射 ${rows.length} 只股票的数字代码(Yahoo search)...`);
+  let done = 0;
+  for (const u of rows) {
+    const code = await mapCodeToNumeric(u.stock);
+    if (code) { db.prepare('UPDATE universe SET code=? WHERE stock=?').run(code, u.stock); done++; }
+    await sleep(250);
+  }
+  log(`映射完成 ${done}/${rows.length} 只`);
+}
+
+// 后台: 用 Yahoo 日线回填每日总量历史(一次性, 立即有4W/5D均量)
+async function backfillDailyVol() {
+  const rows = db.prepare('SELECT stock, code FROM universe WHERE code IS NOT NULL').all();
+  if (!rows.length) return;
+  log(`开始回填 ${rows.length} 只股票的日线历史(Yahoo)...`);
+  for (const u of rows) {
+    try {
+      const d = await yahooGet(`https://query1.finance.yahoo.com/v8/finance/chart/${u.code}.KL?interval=1d&range=1y`);
+      const r = d.chart.result[0];
+      const ts = r.timestamp || [];
+      const vol = r.indicators?.quote?.[0]?.volume || [];
+      const n = Math.min(ts.length, vol.length);
+      for (let i = 0; i < n; i++) {
+        if (vol[i] != null && vol[i] > 0) {
+          db.prepare('INSERT INTO daily_vol(stock, date, volume) VALUES(?,?,?) ON CONFLICT(stock, date) DO UPDATE SET volume=excluded.volume')
+            .run(u.stock, mytDate(ts[i]), vol[i]);
+        }
+      }
+    } catch {}
+    await sleep(300);
+  }
+  log('日线历史回填完成');
+}
+
 // ---------------- 成交量计算 ----------------
 function mytDate(tsSec) {  // 马来西亚时区(UTC+8)的日期字符串
   return new Date(tsSec * 1000 + 8 * 3600 * 1000).toISOString().slice(0, 10);
@@ -294,7 +355,7 @@ function computeMetrics(cfg) {
   const universe = db.prepare('SELECT stock, name FROM universe').all();
   for (const w of universe) {
     const code = w.stock;
-    const live = db.prepare('SELECT name, price, open, prevClose, volume, avg10d, avg30d, mtime FROM live WHERE stock=?').get(code);
+    const live = db.prepare('SELECT name, price, open, prevClose, volume, mtime FROM live WHERE stock=?').get(code);
     if (!live) continue;
     const vol = computeVolumes(code, cfg.window);
     let current = null, previous = null, ratio = null, status = 'nodata';
@@ -308,8 +369,11 @@ function computeMetrics(cfg) {
         status = 'low';
       }
     }
+    const todayStr = mytDate(Date.now() / 1000);
+    const d5 = db.prepare('SELECT AVG(volume) a FROM (SELECT volume FROM daily_vol WHERE stock=? AND date < ? ORDER BY date DESC LIMIT 5)').get(code, todayStr);
+    const d20 = db.prepare('SELECT AVG(volume) a FROM (SELECT volume FROM daily_vol WHERE stock=? AND date < ? ORDER BY date DESC LIMIT 20)').get(code, todayStr);
     out.push({ code, name: live.name || w.name || code, price: live.price, open: live.open, prevClose: live.prevClose,
-      volume: live.volume, avg10d: live.avg10d, avg30d: live.avg30d, mtime: live.mtime,
+      volume: live.volume, avg4w: d20?.a ?? null, avg5d: d5?.a ?? null, mtime: live.mtime,
       current, previous, ratio, status });
   }
   // 按增长倍率从大到小排列
@@ -413,7 +477,7 @@ function evaluateAlerts(cfg) {
     if (!wasAbove && (nowS - lastAlert) >= cooldown) { should = true; lastAlert = nowS; }
     db.prepare('INSERT INTO state(stock, above, last_alert) VALUES(?,1,?) ON CONFLICT(stock) DO UPDATE SET above=1, last_alert=excluded.last_alert').run(m.code, lastAlert);
     if (should) {
-      const text = `📊 放量提醒 — ${m.name} (${m.code})\n时段 ${window}: 当前 ${fmtNum(m.current)} vs 上一时段 ${fmtNum(m.previous)} (${m.ratio.toFixed(1)}%)\n现价 ${m.price ?? '-'} | 均量 10D ${fmtNum(m.avg10d)} / 30D ${fmtNum(m.avg30d)}\n👉 https://www.synthe-fantasia.site`;
+      const text = `📊 放量提醒 — ${m.name} (${m.code})\n时段 ${window}: 当前 ${fmtNum(m.current)} vs 上一时段 ${fmtNum(m.previous)} (${m.ratio.toFixed(1)}%)\n现价 ${m.price ?? '-'} | 均量 4W ${fmtNum(m.avg4w)} / 5D ${fmtNum(m.avg5d)}\n👉 https://www.synthe-fantasia.site`;
       sendTelegramText(text, cfg);
     }
   }
@@ -437,7 +501,7 @@ function evaluatePriceDrop(cfg) {
     if (sent) continue;
     db.prepare('INSERT INTO price_drop_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
       .run(w.stock, date, nowS);
-    const text = `📉 暴跌提醒 — ${l.name || w.stock} (${w.stock})\n现价 ${l.price} 较昨收 ${l.prevClose} 跌 ${drop.toFixed(1)}% (阈值 ${threshold}%)\n均量 10D ${fmtNum(l.avg10d)} / 30D ${fmtNum(l.avg30d)}\n👉 https://www.synthe-fantasia.site`;
+    const text = `📉 暴跌提醒 — ${l.name || w.stock} (${w.stock})\n现价 ${l.price} 较昨收 ${l.prevClose} 跌 ${drop.toFixed(1)}% (阈值 ${threshold}%)\n均量 4W ${fmtNum(l.avg4w)} / 5D ${fmtNum(l.avg5d)}\n👉 https://www.synthe-fantasia.site`;
     sendTelegramText(text, cfg);
   }
 }
@@ -459,7 +523,7 @@ function evaluateGapUp(cfg) {
     if (sent) continue;
     db.prepare('INSERT INTO gap_up_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
       .run(w.stock, date, nowS);
-    const text = `🚀 急涨提醒 — ${l.name || w.stock} (${w.stock})\n现价 ${l.price.toFixed(3)} 较开盘 ${l.open.toFixed(3)} 涨 ${gain.toFixed(1)}% (阈值 ${threshold}%)\n均量 10D ${fmtNum(l.avg10d)} / 30D ${fmtNum(l.avg30d)}\n👉 https://www.synthe-fantasia.site`;
+    const text = `🚀 急涨提醒 — ${l.name || w.stock} (${w.stock})\n现价 ${l.price.toFixed(3)} 较开盘 ${l.open.toFixed(3)} 涨 ${gain.toFixed(1)}% (阈值 ${threshold}%)\n均量 4W ${fmtNum(l.avg4w)} / 5D ${fmtNum(l.avg5d)}\n👉 https://www.synthe-fantasia.site`;
     sendTelegramText(text, cfg);
   }
 }
@@ -488,6 +552,7 @@ function poll(backfill = false) {
       for (const q of quotes) {
         updateQuote(q);
         recordVolume(q.ticker, q.volume);
+        recordDailyVolume(q.ticker, q.volume);
       }
       const cnt = db.prepare('SELECT COUNT(*) c FROM universe').get().c;
       evaluateAlerts(cfg);
@@ -681,3 +746,10 @@ app.listen(PORT, () => {
 });
 poll();          // 启动时立即抓全市场
 startPolling();  // 开市时段后台定时抓取(无人值守追踪)
+// 后台: 等首次 poll 填好 universe 后, 映射数字代码 → 回填日线历史(一次性, 立即有4W/5D均量)
+(async () => {
+  await sleep(5000);
+  await mapAllCodes();
+  await backfillDailyVol();
+  broadcast();
+})();
