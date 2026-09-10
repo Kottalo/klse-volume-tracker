@@ -273,35 +273,48 @@ async function mapCodeToNumeric(ticker) {
   } catch { return null; }
 }
 
-// 按需: 通知触发时用 Yahoo 临时算 4W/5D 均量(带缓存, 不用回填全市场)
-async function getAvgVolumesOnDemand(ticker) {
-  const cached = db.prepare('SELECT avg4w, avg5d FROM live WHERE stock=?').get(ticker);
-  if (cached && cached.avg4w != null) return { avg4w: cached.avg4w, avg5d: cached.avg5d };
-  let code = db.prepare('SELECT code FROM universe WHERE stock=?').get(ticker)?.code;
-  if (!code) {
-    code = await mapCodeToNumeric(ticker);
-    if (code) db.prepare('UPDATE universe SET code=? WHERE stock=?').run(code, ticker);
-  }
-  if (!code) return { avg4w: null, avg5d: null };
-  try {
-    const d = await yahooGet(`https://query1.finance.yahoo.com/v8/finance/chart/${code}.KL?interval=1d&range=3mo`);
-    const r = d.chart.result[0];
-    const ts = r.timestamp || [];
-    const vol = r.indicators?.quote?.[0]?.volume || [];
-    const today = mytDate(Date.now() / 1000);
-    const past = [];
-    for (let i = 0; i < Math.min(ts.length, vol.length); i++) {
-      if (vol[i] != null && vol[i] > 0) {
-        const dt = mytDate(ts[i]);
-        if (dt < today) past.push(vol[i]);  // 排除今天(未收盘)
-      }
+// 回填每日量历史(Yahoo 日线 API 直接拿, 不用自己记录快照): 供「昨日量」对比 + 4W/5D均量
+async function backfillDailyVol() {
+  // 1. 先给没映射的股票补「字母→数字」映射
+  const unmapped = db.prepare('SELECT stock FROM universe WHERE code IS NULL').all();
+  if (unmapped.length) {
+    log(`映射 ${unmapped.length} 只股票的数字代码(Yahoo search)...`);
+    for (const u of unmapped) {
+      const c = await mapCodeToNumeric(u.stock);
+      if (c) db.prepare('UPDATE universe SET code=? WHERE stock=?').run(c, u.stock);
+      await sleep(200);
     }
-    const avgN = (n) => (past.length >= n) ? past.slice(-n).reduce((s, v) => s + v, 0) / n : (past.length ? past.reduce((s, v) => s + v, 0) / past.length : null);
-    const avg4w = avgN(20);
-    const avg5d = avgN(5);
-    db.prepare('UPDATE live SET avg4w=?, avg5d=? WHERE stock=?').run(avg4w, avg5d, ticker);
-    return { avg4w, avg5d };
-  } catch { return { avg4w: null, avg5d: null }; }
+  }
+  // 2. 回填日线历史到 daily_vol
+  const rows = db.prepare('SELECT stock, code FROM universe WHERE code IS NOT NULL').all();
+  log(`回填 ${rows.length} 只股票日线历史(Yahoo)...`);
+  let done = 0;
+  for (const u of rows) {
+    try {
+      const d = await yahooGet(`https://query1.finance.yahoo.com/v8/finance/chart/${u.code}.KL?interval=1d&range=3mo`);
+      const r = d.chart.result[0];
+      const ts = r.timestamp || [];
+      const vol = r.indicators?.quote?.[0]?.volume || [];
+      const n = Math.min(ts.length, vol.length);
+      for (let i = 0; i < n; i++) {
+        if (vol[i] != null && vol[i] > 0) {
+          db.prepare('INSERT INTO daily_vol(stock, date, volume) VALUES(?,?,?) ON CONFLICT(stock, date) DO UPDATE SET volume=excluded.volume')
+            .run(u.stock, mytDate(ts[i]), vol[i]);
+        }
+      }
+      done++;
+    } catch {}
+    await sleep(300);
+  }
+  log(`日线回填完成 ${done}/${rows.length} 只`);
+}
+
+// 从 daily_vol 算 4W/5D 均量(同步, 回填后即有数据)
+function getAvgVolumes(code) {
+  const todayStr = mytDate(Date.now() / 1000);
+  const d5 = db.prepare('SELECT AVG(volume) a FROM (SELECT volume FROM daily_vol WHERE stock=? AND date < ? ORDER BY date DESC LIMIT 5)').get(code, todayStr);
+  const d20 = db.prepare('SELECT AVG(volume) a FROM (SELECT volume FROM daily_vol WHERE stock=? AND date < ? ORDER BY date DESC LIMIT 20)').get(code, todayStr);
+  return { avg4w: d20?.a ?? null, avg5d: d5?.a ?? null };
 }
 
 // ---------------- 成交量计算 ----------------
@@ -327,13 +340,12 @@ function computeVolumes(code, window) {
   const pw = parseWindow(window);
   if (!pw) return null;
   if (pw.unit === 'd') {
-    // 日线对比: 今日累计量 vs 昨日总量(昨日量=volume_ts 昨日最后一条快照)
-    const now = Math.floor(Date.now() / 1000);
-    const todayStart = Math.floor((now + 8 * 3600) / 86400) * 86400 - 8 * 3600;  // 今天0点(马来西亚)的UTC秒
+    // 日线对比: 今日累计量 vs 昨日总量(昨日量=daily_vol 回填的最近交易日)
+    const todayStr = mytDate(Date.now() / 1000);
     const live = db.prepare('SELECT volume FROM live WHERE stock=?').get(code);
-    const yesterday = db.prepare('SELECT cum_volume FROM volume_ts WHERE stock=? AND ts < ? ORDER BY ts DESC LIMIT 1').get(code, todayStart);
-    if (!live || !live.volume || !yesterday || !yesterday.cum_volume) return null;
-    return { current: live.volume, previous: yesterday.cum_volume };
+    const yesterday = db.prepare('SELECT volume FROM daily_vol WHERE stock=? AND date < ? ORDER BY date DESC LIMIT 1').get(code, todayStr);
+    if (!live || !live.volume || !yesterday || !yesterday.volume) return null;
+    return { current: live.volume, previous: yesterday.volume };
   }
   // 天内时段对比: volume_ts 累计量差值(同一天内累计单调递增)
   const minutes = pw.unit === 'h' ? pw.value * 60 : pw.value;
@@ -361,7 +373,7 @@ function computeMetrics(cfg) {
   const universe = db.prepare('SELECT stock, name FROM universe').all();
   for (const w of universe) {
     const code = w.stock;
-    const live = db.prepare('SELECT name, price, open, prevClose, volume, avg4w, avg5d, mtime FROM live WHERE stock=?').get(code);
+    const live = db.prepare('SELECT name, price, open, prevClose, volume, mtime FROM live WHERE stock=?').get(code);
     if (!live) continue;
     const vol = computeVolumes(code, cfg.window);
     let current = null, previous = null, ratio = null, status = 'nodata';
@@ -375,8 +387,9 @@ function computeMetrics(cfg) {
         status = 'low';
       }
     }
+    const av = getAvgVolumes(code);
     out.push({ code, name: live.name || w.name || code, price: live.price, open: live.open, prevClose: live.prevClose,
-      volume: live.volume, avg4w: live.avg4w ?? null, avg5d: live.avg5d ?? null, mtime: live.mtime,
+      volume: live.volume, avg4w: av.avg4w, avg5d: av.avg5d, mtime: live.mtime,
       current, previous, ratio, status });
   }
   // 按增长倍率从大到小排列
@@ -480,8 +493,7 @@ async function evaluateAlerts(cfg) {
     if (!wasAbove && (nowS - lastAlert) >= cooldown) { should = true; lastAlert = nowS; }
     db.prepare('INSERT INTO state(stock, above, last_alert) VALUES(?,1,?) ON CONFLICT(stock) DO UPDATE SET above=1, last_alert=excluded.last_alert').run(m.code, lastAlert);
     if (should) {
-      const av = await getAvgVolumesOnDemand(m.code);
-      const text = `📊 放量提醒 — ${m.name} (${m.code})\n时段 ${window}: 当前 ${fmtNum(m.current)} vs 上一时段 ${fmtNum(m.previous)} (${m.ratio.toFixed(1)}%)\n现价 ${m.price ?? '-'} | 均量 4W ${fmtNum(av.avg4w)} / 5D ${fmtNum(av.avg5d)}\n👉 https://www.synthe-fantasia.site`;
+      const text = `📊 放量提醒 — ${m.name} (${m.code})\n时段 ${window}: 当前 ${fmtNum(m.current)} vs 上一时段 ${fmtNum(m.previous)} (${m.ratio.toFixed(1)}%)\n现价 ${m.price ?? '-'} | 均量 4W ${fmtNum(m.avg4w)} / 5D ${fmtNum(m.avg5d)}\n👉 https://www.synthe-fantasia.site`;
       sendTelegramText(text, cfg);
     }
   }
@@ -505,7 +517,7 @@ async function evaluatePriceDrop(cfg) {
     if (sent) continue;
     db.prepare('INSERT INTO price_drop_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
       .run(w.stock, date, nowS);
-    const av = await getAvgVolumesOnDemand(w.stock);
+    const av = getAvgVolumes(w.stock);
     const text = `🔴 暴跌提醒 — ${l.name || w.stock} (${w.stock})\n现价 ${l.price} 较昨收 ${l.prevClose} 跌 ${drop.toFixed(1)}% (阈值 ${threshold}%)\n均量 4W ${fmtNum(av.avg4w)} / 5D ${fmtNum(av.avg5d)}\n👉 https://www.synthe-fantasia.site`;
     sendTelegramText(text, cfg);
   }
@@ -528,7 +540,7 @@ async function evaluateGapUp(cfg) {
     if (sent) continue;
     db.prepare('INSERT INTO gap_up_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
       .run(w.stock, date, nowS);
-    const av = await getAvgVolumesOnDemand(w.stock);
+    const av = getAvgVolumes(w.stock);
     const text = `🟢 急涨提醒 — ${l.name || w.stock} (${w.stock})\n现价 ${l.price.toFixed(3)} 较开盘 ${l.open.toFixed(3)} 涨 ${gain.toFixed(1)}% (阈值 ${threshold}%)\n均量 4W ${fmtNum(av.avg4w)} / 5D ${fmtNum(av.avg5d)}\n👉 https://www.synthe-fantasia.site`;
     sendTelegramText(text, cfg);
   }
@@ -753,4 +765,10 @@ app.listen(PORT, () => {
 });
 poll();          // 启动时立即抓全市场
 startPolling();  // 开市时段后台定时抓取(无人值守追踪)
+// 后台: 回填每日量历史(Yahoo日线), 供放量「昨日量」对比 + 4W/5D均量
+(async () => {
+  await sleep(5000);
+  await backfillDailyVol();
+  broadcast();
+})();
 
