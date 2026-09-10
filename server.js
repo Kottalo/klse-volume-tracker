@@ -326,7 +326,17 @@ function cumAt(code, targetTs) {
 function computeVolumes(code, window) {
   const pw = parseWindow(window);
   if (!pw) return null;
-  const minutes = pw.unit === 'h' ? pw.value * 60 : pw.unit === 'd' ? pw.value * 1440 : pw.value;
+  if (pw.unit === 'd') {
+    // 日线对比: 今日累计量 vs 昨日总量(昨日量=volume_ts 昨日最后一条快照)
+    const now = Math.floor(Date.now() / 1000);
+    const todayStart = Math.floor((now + 8 * 3600) / 86400) * 86400 - 8 * 3600;  // 今天0点(马来西亚)的UTC秒
+    const live = db.prepare('SELECT volume FROM live WHERE stock=?').get(code);
+    const yesterday = db.prepare('SELECT cum_volume FROM volume_ts WHERE stock=? AND ts < ? ORDER BY ts DESC LIMIT 1').get(code, todayStart);
+    if (!live || !live.volume || !yesterday || !yesterday.cum_volume) return null;
+    return { current: live.volume, previous: yesterday.cum_volume };
+  }
+  // 天内时段对比: volume_ts 累计量差值(同一天内累计单调递增)
+  const minutes = pw.unit === 'h' ? pw.value * 60 : pw.value;
   const wSec = minutes * 60;
   const now = Math.floor(Date.now() / 1000);
   const cNow = cumAt(code, now);
