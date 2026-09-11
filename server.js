@@ -496,9 +496,9 @@ async function evaluateAlerts(cfg) {
     if (should) fired.push(m);
   }
   if (fired.length) {
-    const lines = fired.slice(0, 30).map((m) => `• ${m.name} (${m.code}) ${m.ratio.toFixed(1)}% · 4W ${fmtNum(m.avg4w)}/5D ${fmtNum(m.avg5d)}`);
+    const lines = fired.slice(0, 30).map((m) => `• ${m.name} (${m.code}) 价 ${m.price ?? '-'} · 放量 ${m.ratio.toFixed(1)}%\n  今日 ${fmtNum(m.current)} vs 昨日 ${fmtNum(m.previous)} · 4W ${fmtNum(m.avg4w)} / 5D ${fmtNum(m.avg5d)}`);
     const more = fired.length > 30 ? `\n…等共 ${fired.length} 只` : '';
-    const text = `📊 放量提醒 ${fired.length} 只\n${lines.join('\n')}${more}\n👉 https://www.synthe-fantasia.site`;
+    const text = `📊 放量提醒 ${fired.length} 只\n\n${lines.join('\n\n')}${more}\n\n👉 https://www.synthe-fantasia.site`;
     sendTelegramText(text, cfg);
   }
 }
@@ -523,12 +523,12 @@ async function evaluatePriceDrop(cfg) {
     db.prepare('INSERT INTO price_drop_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
       .run(w.stock, date, nowS);
     const av = getAvgVolumes(w.stock);
-    fired.push({ name: l.name || w.stock, stock: w.stock, drop, avg4w: av.avg4w, avg5d: av.avg5d });
+    fired.push({ name: l.name || w.stock, stock: w.stock, price: l.price, prevClose: l.prevClose, drop, avg4w: av.avg4w, avg5d: av.avg5d });
   }
   if (fired.length) {
-    const lines = fired.slice(0, 30).map((x) => `• ${x.name} (${x.stock}) -${x.drop.toFixed(1)}% · 4W ${fmtNum(x.avg4w)}/5D ${fmtNum(x.avg5d)}`);
+    const lines = fired.slice(0, 30).map((x) => `• ${x.name} (${x.stock}) 现价 ${x.price} · 跌 ${x.drop.toFixed(1)}%\n  昨收 ${x.prevClose} · 4W ${fmtNum(x.avg4w)} / 5D ${fmtNum(x.avg5d)}`);
     const more = fired.length > 30 ? `\n…等共 ${fired.length} 只` : '';
-    const text = `🔴 暴跌提醒 ${fired.length} 只\n${lines.join('\n')}${more}\n👉 https://www.synthe-fantasia.site`;
+    const text = `🔴 暴跌提醒 ${fired.length} 只\n\n${lines.join('\n\n')}${more}\n\n👉 https://www.synthe-fantasia.site`;
     sendTelegramText(text, cfg);
   }
 }
@@ -552,12 +552,12 @@ async function evaluateGapUp(cfg) {
     db.prepare('INSERT INTO gap_up_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
       .run(w.stock, date, nowS);
     const av = getAvgVolumes(w.stock);
-    fired.push({ name: l.name || w.stock, stock: w.stock, gain, avg4w: av.avg4w, avg5d: av.avg5d });
+    fired.push({ name: l.name || w.stock, stock: w.stock, price: l.price, open: l.open, gain, avg4w: av.avg4w, avg5d: av.avg5d });
   }
   if (fired.length) {
-    const lines = fired.slice(0, 30).map((x) => `• ${x.name} (${x.stock}) +${x.gain.toFixed(1)}% · 4W ${fmtNum(x.avg4w)}/5D ${fmtNum(x.avg5d)}`);
+    const lines = fired.slice(0, 30).map((x) => `• ${x.name} (${x.stock}) 现价 ${x.price} · 涨 ${x.gain.toFixed(1)}%\n  开盘 ${x.open} · 4W ${fmtNum(x.avg4w)} / 5D ${fmtNum(x.avg5d)}`);
     const more = fired.length > 30 ? `\n…等共 ${fired.length} 只` : '';
-    const text = `🟢 急涨提醒 ${fired.length} 只\n${lines.join('\n')}${more}\n👉 https://www.synthe-fantasia.site`;
+    const text = `🟢 急涨提醒 ${fired.length} 只\n\n${lines.join('\n\n')}${more}\n\n👉 https://www.synthe-fantasia.site`;
     sendTelegramText(text, cfg);
   }
 }
