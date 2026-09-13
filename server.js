@@ -504,26 +504,27 @@ async function evaluateAlerts(cfg) {
 }
 
 
-// 股价暴跌提醒: 现价较昨收跌幅 >= 阈值% → Telegram 群 (开市时段, 每天每只最多一次)
+// 股价暴跌提醒: 当日跌幅 top 30 里, 现价较昨收跌幅 >= 阈值% → Telegram 群 (开市时段, 每天每只最多一次)
 async function evaluatePriceDrop(cfg) {
   if (!isMarketOpen()) return;
   if (!(cfg.telegram_bot_token && cfg.telegram_chat_id)) return;
   const threshold = Number(cfg.price_drop_threshold ?? 40);
   const date = mytDate(Date.now() / 1000);
   const nowS = Math.floor(Date.now() / 1000);
-  const universe = db.prepare('SELECT stock, name FROM universe').all();
+  // 只限「当日跌幅 top 30 losers」(口径同 pickastock 的 Loss% 榜: 按跌幅%降序)
+  const universe = db.prepare(`SELECT stock, name, price, prevClose, (prevClose - price) * 100.0 / prevClose AS drop
+    FROM live WHERE price IS NOT NULL AND prevClose IS NOT NULL AND prevClose > 0
+    ORDER BY drop DESC LIMIT 30`).all();
   const fired = [];
-  for (const w of universe) {
-    const l = db.prepare('SELECT name, price, prevClose FROM live WHERE stock=?').get(w.stock);
-    if (!l || l.price == null || l.prevClose == null || l.prevClose <= 0) continue;
-    const drop = (l.prevClose - l.price) / l.prevClose * 100;
+  for (const l of universe) {
+    const drop = l.drop;
     if (drop < threshold) continue;
-    const sent = db.prepare('SELECT 1 FROM price_drop_alert WHERE stock=? AND date=?').get(w.stock, date);
+    const sent = db.prepare('SELECT 1 FROM price_drop_alert WHERE stock=? AND date=?').get(l.stock, date);
     if (sent) continue;
     db.prepare('INSERT INTO price_drop_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
-      .run(w.stock, date, nowS);
-    const av = getAvgVolumes(w.stock);
-    fired.push({ name: l.name || w.stock, stock: w.stock, price: l.price, prevClose: l.prevClose, drop, avg4w: av.avg4w, avg5d: av.avg5d });
+      .run(l.stock, date, nowS);
+    const av = getAvgVolumes(l.stock);
+    fired.push({ name: l.name || l.stock, stock: l.stock, price: l.price, prevClose: l.prevClose, drop, avg4w: av.avg4w, avg5d: av.avg5d });
   }
   if (fired.length) {
     const lines = fired.slice(0, 30).map((x) => `• ${x.name} (${x.stock}) 现价 ${x.price} · 跌 ${x.drop.toFixed(1)}%\n  昨收 ${x.prevClose} · 4W ${fmtNum(x.avg4w)} / 5D ${fmtNum(x.avg5d)}`);
