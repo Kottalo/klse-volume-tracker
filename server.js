@@ -30,7 +30,7 @@ const DEFAULTS = {
   twilio_content_sid: '',
   price_thresholds: [],   // 按股价范围设提醒阈值: [{max, threshold}], max=null=无限; 空=不通知
   price_drop_threshold: 40,  // 股价较昨收跌幅 >= 此% 时提醒
-  gap_up_threshold: 5,       // 股价较开盘涨幅 >= 此% 时提醒
+  gap_up_threshold: 7,       // 股价较开盘涨幅 >= 此% 时提醒 (只限当日成交量 top 30)
   oanor_api_key: '',          // oanor 备份数据源 key(可选)
 };
 
@@ -537,22 +537,22 @@ async function evaluatePriceDrop(cfg) {
 async function evaluateGapUp(cfg) {
   if (!isMarketOpen()) return;
   if (!(cfg.telegram_bot_token && cfg.telegram_chat_id)) return;
-  const threshold = Number(cfg.gap_up_threshold ?? 5);
+  const threshold = Number(cfg.gap_up_threshold ?? 7);
   const date = mytDate(Date.now() / 1000);
   const nowS = Math.floor(Date.now() / 1000);
-  const universe = db.prepare('SELECT stock, name FROM universe').all();
+  // 只限「当日成交量 top 30」(口径同 pickastock 榜单: 今日成交量降序)
+  const universe = db.prepare('SELECT stock, name, price, open FROM live WHERE volume IS NOT NULL ORDER BY volume DESC LIMIT 30').all();
   const fired = [];
-  for (const w of universe) {
-    const l = db.prepare('SELECT name, price, open FROM live WHERE stock=?').get(w.stock);
-    if (!l || l.price == null || l.open == null || l.open <= 0) continue;
+  for (const l of universe) {
+    if (l.price == null || l.open == null || l.open <= 0) continue;
     const gain = (l.price - l.open) / l.open * 100;
     if (gain < threshold) continue;
-    const sent = db.prepare('SELECT 1 FROM gap_up_alert WHERE stock=? AND date=?').get(w.stock, date);
+    const sent = db.prepare('SELECT 1 FROM gap_up_alert WHERE stock=? AND date=?').get(l.stock, date);
     if (sent) continue;
     db.prepare('INSERT INTO gap_up_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
-      .run(w.stock, date, nowS);
-    const av = getAvgVolumes(w.stock);
-    fired.push({ name: l.name || w.stock, stock: w.stock, price: l.price, open: l.open, gain, avg4w: av.avg4w, avg5d: av.avg5d });
+      .run(l.stock, date, nowS);
+    const av = getAvgVolumes(l.stock);
+    fired.push({ name: l.name || l.stock, stock: l.stock, price: l.price, open: l.open, gain, avg4w: av.avg4w, avg5d: av.avg5d });
   }
   if (fired.length) {
     const lines = fired.slice(0, 30).map((x) => `• ${x.name} (${x.stock}) 现价 ${x.price} · 涨 ${x.gain.toFixed(1)}%\n  开盘 ${x.open} · 4W ${fmtNum(x.avg4w)} / 5D ${fmtNum(x.avg5d)}`);
