@@ -657,6 +657,7 @@ function buildState() {
       poll_interval_minutes: cfg.poll_interval_minutes,
       window: cfg.window,
       price_drop_threshold: cfg.price_drop_threshold,
+      gap_up_threshold: cfg.gap_up_threshold ?? 7,
     },
     watchlist: cfg.watchlist,
     whatsapp_recipients: cfg.whatsapp_recipients || [],
