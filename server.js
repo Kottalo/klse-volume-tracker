@@ -340,12 +340,20 @@ function computeVolumes(code, window) {
   const pw = parseWindow(window);
   if (!pw) return null;
   if (pw.unit === 'd') {
-    // 日线对比: 今日累计量 vs 昨日总量(昨日量=daily_vol 回填的最近交易日)
+    // 日线对比: 「最近 N 天」vs「前 N 天」(N = window 的天数, 不 hard code)
+    //   N=1 → 今日 vs 昨日       N=2 → (今日+昨日) vs (前天+大前天)
+    const N = pw.value;
     const todayStr = mytDate(Date.now() / 1000);
     const live = db.prepare('SELECT volume FROM live WHERE stock=?').get(code);
-    const yesterday = db.prepare('SELECT volume FROM daily_vol WHERE stock=? AND date < ? ORDER BY date DESC LIMIT 1').get(code, todayStr);
-    if (!live || !live.volume || !yesterday || !yesterday.volume) return null;
-    return { current: live.volume, previous: yesterday.volume };
+    if (!live || !live.volume) return null;
+    const rows = db.prepare('SELECT volume FROM daily_vol WHERE stock=? AND date < ? ORDER BY date DESC LIMIT ?')
+      .all(code, todayStr, 2 * N - 1);
+    if (rows.length < 2 * N - 1) return null;  // 历史不够(冷启动)
+    const sum = (a) => a.reduce((s, r) => s + (r.volume || 0), 0);
+    const current = live.volume + sum(rows.slice(0, N - 1));   // 今天 + 前 N-1 天
+    const previous = sum(rows.slice(N - 1, 2 * N - 1));        // 再往前 N 天
+    if (current <= 0 || previous <= 0) return null;
+    return { current, previous };
   }
   // 天内时段对比: volume_ts 累计量差值(同一天内累计单调递增)
   const minutes = pw.unit === 'h' ? pw.value * 60 : pw.value;
