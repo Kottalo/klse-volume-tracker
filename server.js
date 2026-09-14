@@ -512,12 +512,12 @@ async function evaluatePriceDrop(cfg) {
   const date = mytDate(Date.now() / 1000);
   const nowS = Math.floor(Date.now() / 1000);
   // 只限「当日跌幅 top 30 losers」(口径同 pickastock 的 Loss% 榜: 按跌幅%降序)
-  const universe = db.prepare(`SELECT stock, name, price, prevClose, (prevClose - price) * 100.0 / prevClose AS drop
+  const universe = db.prepare(`SELECT stock, name, price, prevClose, (prevClose - price) * 100.0 / prevClose AS drop_pct
     FROM live WHERE price IS NOT NULL AND prevClose IS NOT NULL AND prevClose > 0
-    ORDER BY drop DESC LIMIT 30`).all();
+    ORDER BY drop_pct DESC LIMIT 30`).all();
   const fired = [];
   for (const l of universe) {
-    const drop = l.drop;
+    const drop = l.drop_pct;
     if (drop < threshold) continue;
     const sent = db.prepare('SELECT 1 FROM price_drop_alert WHERE stock=? AND date=?').get(l.stock, date);
     if (sent) continue;
