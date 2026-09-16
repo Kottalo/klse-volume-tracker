@@ -595,7 +595,8 @@ function poll(backfill = false) {
       for (const q of quotes) {
         updateQuote(q);
         recordVolume(q.ticker, q.volume);
-        recordDailyVolume(q.ticker, q.volume);
+        // 注意: 不再调用 recordDailyVolume —— 它写的是「盘中某刻的累计量」而非收盘总量,
+        // 会污染 daily_vol 的昨日量(导致放量对比失真)。daily_vol 只由 Yahoo 回填(backfillDailyVol)写入。
       }
       const cnt = db.prepare('SELECT COUNT(*) c FROM universe').get().c;
       await evaluateAlerts(cfg);
@@ -711,6 +712,12 @@ app.get('/api/events', (req, res) => {
     clearInterval(heartbeat);
     clients.delete(res);
   });
+});
+
+// 手动触发 Yahoo 日线回填(修正 daily_vol 的昨日量)
+app.post('/api/backfill', async (req, res) => {
+  res.json({ ok: true, msg: '回填已启动, 约需 3-10 分钟, 完成后自动刷新' });
+  try { await backfillDailyVol(); broadcast(); } catch (e) { log('手动回填失败: ' + e.message); }
 });
 
 app.post('/api/settings', (req, res) => {
