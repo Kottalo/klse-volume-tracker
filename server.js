@@ -261,28 +261,41 @@ function recordDailyVolume(code, volume) {
 }
 
 // 字母 ticker → 数字代码 (Yahoo search, 用于日线历史)
-async function mapCodeToNumeric(ticker) {
-  try {
-    const res = await fetch(`https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(ticker)}&quotesCount=5&newsCount=0`, {
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-    });
-    if (!res.ok) return null;
-    const d = await res.json();
-    const q = (d.quotes || []).find((x) => x.symbol && x.symbol.endsWith('.KL') && (x.shortname || '').toUpperCase() === ticker.toUpperCase());
-    return q ? q.symbol.replace('.KL', '') : null;
-  } catch { return null; }
+// 短 ticker(如 QL/G3/NEXG)直接搜会被外国股票淹没, 所以搜不到时改用「公司名」再搜一次
+async function mapCodeToNumeric(ticker, desc) {
+  const trySearch = async (q) => {
+    try {
+      const res = await fetch(`https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=8&newsCount=0`, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+      });
+      if (!res.ok) return null;
+      const d = await res.json();
+      const hit = (d.quotes || []).find((x) => x.symbol && x.symbol.endsWith('.KL') && (x.shortname || '').toUpperCase() === ticker.toUpperCase());
+      return hit ? hit.symbol.replace('.KL', '') : null;
+    } catch { return null; }
+  };
+  let c = await trySearch(ticker);
+  if (c || !desc) return c;
+  // 用公司名前两个词再试 (e.g. 'QL Resources Bhd.' → 'QL Resources')
+  const short = String(desc).replace(/\b(Bhd|Berhad|BHD|SDN|Sdn)\.?/gi, ' ').trim().split(/\s+/).slice(0, 2).join(' ');
+  if (short && short.toUpperCase() !== ticker.toUpperCase()) {
+    c = await trySearch(short);
+    if (c) return c;
+  }
+  c = await trySearch(desc);
+  return c;
 }
 
 // 回填每日量历史(Yahoo 日线 API 直接拿, 不用自己记录快照): 供「昨日量」对比 + 4W/5D均量
 async function backfillDailyVol() {
   // 1. 先给没映射的股票补「字母→数字」映射
-  const unmapped = db.prepare('SELECT stock FROM universe WHERE code IS NULL').all();
+  const unmapped = db.prepare('SELECT stock, name FROM universe WHERE code IS NULL').all();
   if (unmapped.length) {
     log(`映射 ${unmapped.length} 只股票的数字代码(Yahoo search)...`);
     for (const u of unmapped) {
-      const c = await mapCodeToNumeric(u.stock);
+      const c = await mapCodeToNumeric(u.stock, u.name);
       if (c) db.prepare('UPDATE universe SET code=? WHERE stock=?').run(c, u.stock);
-      await sleep(200);
+      await sleep(250);
     }
   }
   // 2. 回填日线历史到 daily_vol
