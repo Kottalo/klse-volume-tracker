@@ -615,6 +615,9 @@ function findDoubleBottom(code, cfg) {
       if (bIdx < 0) continue;
       const barsSince = after.length - 1 - bIdx;
       if (barsSince > freshDays) continue;                            // 只要新鲜突破
+      // 关键: 现价必须仍站在颈线上方, 否则就是「突破后回落」的假信号
+      const nowClose = rows[rows.length - 1].close;
+      if (nowClose < B.high) continue;
 
       // 3. 评分(0~100) —— 容错靠这里
       const brk = after[bIdx];
