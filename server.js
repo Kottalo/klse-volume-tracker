@@ -737,12 +737,12 @@ async function evaluateGapUp(cfg) {
   const hi = Number(cfg.gap_up_threshold_high ?? 7);      // 区间上限%
   const date = mytDate(Date.now() / 1000);
   const nowS = Math.floor(Date.now() / 1000);
-  // 候选池 = pickastock 的 Volume 榜 top30 (拿不到就退回用自己数据按成交量排序)
-  let pool = await fetchPickTop(0);
+  // 候选池 = pickastock 的 Gain% 涨幅榜 top30 (拿不到就退回用自己数据按涨幅排序)
+  let pool = await fetchPickTop(3);   // 候选池 = pickastock 涨幅榜(Gain%)
   if (!pool) {
     pool = db.prepare(`SELECT stock AS code, price, open AS ref, volume,
         CASE WHEN open > 0 THEN (price - open) * 100.0 / open ELSE NULL END AS pct
-      FROM live WHERE volume IS NOT NULL ORDER BY volume DESC LIMIT 30`).all();
+      FROM live WHERE open IS NOT NULL AND open > 0 ORDER BY pct DESC LIMIT 30`).all();
   }
   const fired = [];
   for (const l of pool) {
