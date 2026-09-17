@@ -884,6 +884,23 @@ app.get('/api/state', async (req, res) => {
   res.json(buildState());
 });
 
+// 双底形态扫描(验证/调试用): /api/db-scan?min=70
+app.get('/api/db-scan', (req, res) => {
+  const cfg = loadConfig();
+  const minScore = Number(req.query.min ?? cfg.db_min_score ?? 70);
+  const list = db.prepare('SELECT stock FROM universe WHERE code IS NOT NULL').all();
+  const out = [];
+  let withOhlc = 0;
+  for (const r of list) {
+    try {
+      const p = findDoubleBottom(r.stock, cfg);
+      if (p) { withOhlc++; if (p.score >= minScore) out.push({ code: r.stock, ...p }); }
+    } catch (e) {}
+  }
+  out.sort((a, b) => b.score - a.score);
+  res.json({ scanned: list.length, matched: withOhlc, aboveThreshold: out.length, minScore, results: out.slice(0, 40) });
+});
+
 app.get('/api/events', (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
