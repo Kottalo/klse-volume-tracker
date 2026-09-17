@@ -33,6 +33,13 @@ const DEFAULTS = {
   gap_up_threshold: 5,       // 急涨区间下限% (相对开盘)
   gap_up_threshold_high: 7,  // 急涨区间上限% (只推这个区间内的)
   price_drop_threshold_high: 50,  // 暴跌区间上限%(相对开盘)
+  // ---- 双底(W底/N字底)识别参数 ----
+  db_min_score: 70,   // 评分门槛(0~100), 越高越严、通知越少
+  db_tol: 5,          // 两个低点价格相差容忍 %
+  db_min_gap: 15,     // 两底最少间隔(交易日)
+  db_max_gap: 80,     // 两底最多间隔
+  db_min_neck: 5,     // 颈线相对低点至少高 %
+  db_fresh: 5,        // 突破必须发生在最近 N 个交易日内
   oanor_api_key: '',          // oanor 备份数据源 key(可选)
 };
 
@@ -111,7 +118,9 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS volume_ts(
     stock TEXT, ts INTEGER, cum_volume INTEGER, PRIMARY KEY(stock, ts));
   CREATE INDEX IF NOT EXISTS idx_volume_ts ON volume_ts(stock, ts);
-  CREATE TABLE IF NOT EXISTS daily_vol(
+  CREATE TABLE IF NOT EXISTS db_bottom_alert(
+  key TEXT PRIMARY KEY, stock TEXT, date TEXT, ts INTEGER);
+CREATE TABLE IF NOT EXISTS daily_vol(
     stock TEXT, date TEXT, volume INTEGER, PRIMARY KEY(stock, date));
 `);
 // 迁移: 旧库 live 表补 prevClose / open 列
@@ -123,6 +132,11 @@ try { db.exec('ALTER TABLE live ADD COLUMN avg30d REAL'); } catch (e) {}
 try { db.exec('ALTER TABLE universe ADD COLUMN code TEXT'); } catch (e) {}
 try { db.exec('ALTER TABLE live ADD COLUMN avg4w REAL'); } catch (e) {}
 try { db.exec('ALTER TABLE live ADD COLUMN avg5d REAL'); } catch (e) {}
+// 迁移: daily_vol 补 OHLC 列(双底/N字底形态识别需要)
+try { db.exec('ALTER TABLE daily_vol ADD COLUMN open REAL'); } catch (e) {}
+try { db.exec('ALTER TABLE daily_vol ADD COLUMN high REAL'); } catch (e) {}
+try { db.exec('ALTER TABLE daily_vol ADD COLUMN low REAL'); } catch (e) {}
+try { db.exec('ALTER TABLE daily_vol ADD COLUMN close REAL'); } catch (e) {}
 
 function storeCandles(code, candles) {
   if (!candles.length) return;
@@ -326,15 +340,18 @@ async function backfillDailyVol() {
   let done = 0;
   for (const u of rows) {
     try {
-      const d = await yahooGet(`https://query1.finance.yahoo.com/v8/finance/chart/${u.code}.KL?interval=1d&range=3mo`);
+      const d = await yahooGet(`https://query1.finance.yahoo.com/v8/finance/chart/${u.code}.KL?interval=1d&range=6mo`);
       const r = d.chart.result[0];
       const ts = r.timestamp || [];
-      const vol = r.indicators?.quote?.[0]?.volume || [];
+      const q = r.indicators?.quote?.[0] || {};
+      const vol = q.volume || [], oArr = q.open || [], hArr = q.high || [], lArr = q.low || [], cArr = q.close || [];
       const n = Math.min(ts.length, vol.length);
       for (let i = 0; i < n; i++) {
         if (vol[i] != null && vol[i] > 0) {
-          db.prepare('INSERT INTO daily_vol(stock, date, volume) VALUES(?,?,?) ON CONFLICT(stock, date) DO UPDATE SET volume=excluded.volume')
-            .run(u.stock, mytDate(ts[i]), vol[i]);
+          db.prepare(`INSERT INTO daily_vol(stock, date, volume, open, high, low, close) VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(stock, date) DO UPDATE SET volume=excluded.volume, open=excluded.open,
+              high=excluded.high, low=excluded.low, close=excluded.close`)
+            .run(u.stock, mytDate(ts[i]), vol[i], oArr[i] ?? null, hArr[i] ?? null, lArr[i] ?? null, cArr[i] ?? null);
         }
       }
       done++;
@@ -547,6 +564,123 @@ async function evaluateAlerts(cfg) {
 }
 
 
+
+// ---------------- 双底(W底/N字底)形态识别 ----------------
+// 结构: A(低点1) → B(颈线, A~C之间最高) → C(低点2, 不深破A) → 突破B = 买点
+// 参考经典 W 底定义(Bulkowski) + 突破放量确认 + 峰谷宽度/高度约束(李进财N字理论)
+function findDoubleBottom(code, cfg) {
+  const rows = db.prepare(`SELECT date, open, high, low, close, volume FROM daily_vol
+    WHERE stock=? AND low IS NOT NULL AND high IS NOT NULL AND close IS NOT NULL
+    ORDER BY date ASC`).all(code);
+  if (rows.length < 45) return null;
+
+  const k = 3;                                                        // 摆动点判定窗口(左右各3根)
+  const tolPct = Number(cfg.db_tol ?? 5);                             // 两底价格相近容忍 %
+  const minGap = Number(cfg.db_min_gap ?? 15);                        // 两底最少间隔(交易日)
+  const maxGap = Number(cfg.db_max_gap ?? 80);                        // 最多间隔
+  const minNeck = Number(cfg.db_min_neck ?? 5);                       // 颈线相对低点至少高 %
+  const freshDays = Number(cfg.db_fresh ?? 5);                        // 突破要在最近 N 天内
+
+  // 1. 找摆动低点/高点(局部极值)
+  const lows = [];
+  for (let i = k; i < rows.length - k; i++) {
+    const w = rows.slice(i - k, i + k + 1);
+    if (rows[i].low === Math.min(...w.map((x) => x.low))) lows.push({ i, p: rows[i].low, d: rows[i].date });
+  }
+  if (lows.length < 2) return null;
+
+  const last = rows.length - 1;
+
+  // 2. 从最近的摆动低点开始配对(C = 较近的低点)
+  for (let ci = lows.length - 1; ci >= 1; ci--) {
+    const C = lows[ci];
+    if (last - C.i > maxGap) break;                                   // C 太老就不必再往前
+    for (let ai = ci - 1; ai >= 0; ai--) {
+      const A = lows[ai];
+      const gap = C.i - A.i;
+      if (gap < minGap) continue;
+      if (gap > maxGap) break;
+      const diffPct = Math.abs(C.p - A.p) / A.p * 100;                // 两底价差
+      if (diffPct > tolPct) continue;
+      // 颈线 B = A、C 之间的最高点
+      const between = rows.slice(A.i + 1, C.i);
+      if (!between.length) continue;
+      const B = between.reduce((mx, x) => (x.high > mx.high ? x : mx), between[0]);
+      const base = Math.min(A.p, C.p);
+      const neckUp = (B.high - base) / base * 100;
+      if (neckUp < minNeck) continue;
+      // 突破: C 之后出现收盘价站上颈线
+      const after = rows.slice(C.i + 1);
+      const bIdx = after.findIndex((x) => x.close > B.high * 1.005);
+      if (bIdx < 0) continue;
+      const barsSince = after.length - 1 - bIdx;
+      if (barsSince > freshDays) continue;                            // 只要新鲜突破
+
+      // 3. 评分(0~100) —— 容错靠这里
+      const brk = after[bIdx];
+      const pre = rows.slice(Math.max(0, C.i + 1 + bIdx - 5), C.i + 1 + bIdx);
+      const avg5 = pre.length ? pre.reduce((s, x) => s + (x.volume || 0), 0) / pre.length : 0;
+      const vr = avg5 > 0 ? (brk.volume || 0) / avg5 : 0;             // 突破放量倍数
+      const brkPct = (today_close_last(rows) - B.high) / B.high * 100; // 现价超出颈线 %
+
+      let score = 0;
+      score += 30 * Math.max(0, 1 - diffPct / tolPct);                // 两底越接近越好 (30)
+      score += 20 * Math.min(1, neckUp / 15);                         // 颈线越高越好 (20)
+      score += 15 * (gap >= 20 && gap <= 60 ? 1 : Math.max(0, 1 - Math.abs(gap - 40) / 40)); // 间隔合理 (15)
+      score += 25 * Math.min(1, vr / 1.5);                            // 突破放量 (25)
+      score += 10 * Math.min(1, Math.max(0, brkPct) / 3);             // 突破幅度 (10)
+      score = Math.round(score);
+
+      const stop = base * 0.98;                                       // 止损: 低点下方 2%
+      const target1 = B.high + (B.high - base);                       // 量度目标(颈线 + 形态高度)
+      return {
+        A, B, C, breakDate: brk.date, breakClose: brk.close,
+        price: rows[last].close, neck: B.high, score,
+        diffPct, gap, neckUp, vr, brkPct, stop, target1,
+        barsSince,
+      };
+    }
+  }
+  return null;
+}
+function today_close_last(rows) { return rows[rows.length - 1].close; }
+
+// 双底突破通知: 只在开市时段, 每只股票每个颈线只报一次
+async function evaluateDoubleBottom(cfg) {
+  if (!isMarketOpen()) return;
+  if (!(cfg.telegram_bot_token && cfg.telegram_chat_id)) return;
+  const minScore = Number(cfg.db_min_score ?? 70);
+  const date = mytDate(Date.now() / 1000);
+  const nowS = Math.floor(Date.now() / 1000);
+  const list = db.prepare('SELECT stock FROM universe WHERE code IS NOT NULL').all();
+  const fired = [];
+  for (const r of list) {
+    let pat;
+    try { pat = findDoubleBottom(r.stock, cfg); } catch { pat = null; }
+    if (!pat || pat.score < minScore) continue;
+    const key = `${r.stock}|${pat.neck.toFixed(3)}|${pat.breakDate}`;
+    if (db.prepare('SELECT 1 FROM db_bottom_alert WHERE key=?').get(key)) continue;
+    db.prepare('INSERT INTO db_bottom_alert(key, stock, date, ts) VALUES(?,?,?,?) ON CONFLICT(key) DO NOTHING')
+      .run(key, r.stock, date, nowS);
+    const nm = db.prepare('SELECT name FROM live WHERE stock=?').get(r.stock)?.name
+      || db.prepare('SELECT name FROM universe WHERE stock=?').get(r.stock)?.name;
+    fired.push({ ...pat, code: r.stock, name: nm || r.stock });
+  }
+  if (fired.length) {
+    fired.sort((a, b) => b.score - a.score);
+    const blocks = fired.slice(0, 15).map((x) => [
+      `• ${x.name} (${x.code})  评分 ${x.score}/100`,
+      `  两底 ${x.A.p.toFixed(3)} (${x.A.d}) / ${x.C.p.toFixed(3)} (${x.C.d}) · 相差 ${x.diffPct.toFixed(1)}%`,
+      `  颈线 ${x.neck.toFixed(3)} · 现价 ${x.price} 突破 ${x.brkPct.toFixed(2)}%`,
+      `  止损 ${x.stop.toFixed(3)} · 目标 ${x.target1.toFixed(3)}`,
+      `  突破量 ${fmtNum(x.vr)}x 5日均量 · 形态跨度 ${x.gap} 日`,
+    ].join('\n'));
+    const more = fired.length > 15 ? `\n\n…等共 ${fired.length} 只` : '';
+    const text = `🎯 双底突破 · 买入信号 ${fired.length} 只\n\n${blocks.join('\n\n')}${more}\n\n👉 https://www.synthe-fantasia.site`;
+    sendTelegramText(text, cfg);
+  }
+}
+
 // 股价暴跌提醒: 当日跌幅 top 30 里, 现价较昨收跌幅 >= 阈值% → Telegram 群 (开市时段, 每天每只最多一次)
 async function evaluatePriceDrop(cfg) {
   if (!isMarketOpen()) return;
@@ -652,6 +786,7 @@ function poll(backfill = false) {
       await evaluateAlerts(cfg);
       await evaluatePriceDrop(cfg);
       await evaluateGapUp(cfg);
+      await evaluateDoubleBottom(cfg);   // 双底突破买入信号
       prune();
       lastPoll = Date.now() / 1000;
       log(`全市场抓取完成 (${cnt} 只)`);
@@ -719,6 +854,9 @@ function buildState() {
       price_drop_threshold_high: cfg.price_drop_threshold_high ?? 50,
       gap_up_threshold: cfg.gap_up_threshold ?? 5,
       gap_up_threshold_high: cfg.gap_up_threshold_high ?? 7,
+      db_min_score: cfg.db_min_score ?? 70,
+      db_tol: cfg.db_tol ?? 5,
+      db_fresh: cfg.db_fresh ?? 5,
     },
     watchlist: cfg.watchlist,
     whatsapp_recipients: cfg.whatsapp_recipients || [],
