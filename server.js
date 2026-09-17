@@ -30,7 +30,9 @@ const DEFAULTS = {
   twilio_content_sid: '',
   price_thresholds: [],   // 按股价范围设提醒阈值: [{max, threshold}], max=null=无限; 空=不通知
   price_drop_threshold: 40,  // 股价较昨收跌幅 >= 此% 时提醒
-  gap_up_threshold: 7,       // 股价较开盘涨幅 >= 此% 时提醒 (只限当日成交量 top 30)
+  gap_up_threshold: 5,       // 急涨区间下限% (相对开盘)
+  gap_up_threshold_high: 7,  // 急涨区间上限% (只推这个区间内的)
+  price_drop_threshold_high: 50,  // 暴跌区间上限%(相对开盘)
   oanor_api_key: '',          // oanor 备份数据源 key(可选)
 };
 
@@ -258,6 +260,26 @@ function recordDailyVolume(code, volume) {
   if (volume == null) return;
   const date = mytDate(Date.now() / 1000);
   db.prepare('INSERT INTO daily_vol(stock, date, volume) VALUES(?,?,?) ON CONFLICT(stock, date) DO UPDATE SET volume=excluded.volume').run(code, date, volume);
+}
+
+// pickastock 榜单(候选池): type=0 成交量榜 / type=5 跌幅%榜
+// 失败时返回 null, 调用方回退到用我们自己的数据算 top30
+async function fetchPickTop(type) {
+  try {
+    const res = await fetch(`https://app.pickastock.info/api/Top10?type=${type}&top=30&isSyariah=false&excludeWarrant=true&period=0`, {
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.pickastock.info/top10' },
+    });
+    if (!res.ok) return null;
+    const d = await res.json();
+    const n = Object.keys(d).filter((k) => /^s\d+$/.test(k)).length;
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const code = d[`s${i}`], price = d[`c${i}`], ref = d[`r${i}`], vol = d[`v${i}`];
+      if (!code || ref == null || ref <= 0) continue;
+      out.push({ code, price, ref, volume: vol, pct: (price - ref) / ref * 100 });  // pct = 相对开盘涨跌%
+    }
+    return out.length ? out : null;
+  } catch { return null; }
 }
 
 // 字母 ticker → 数字代码 (Yahoo search, 用于日线历史)
@@ -529,52 +551,67 @@ async function evaluateAlerts(cfg) {
 async function evaluatePriceDrop(cfg) {
   if (!isMarketOpen()) return;
   if (!(cfg.telegram_bot_token && cfg.telegram_chat_id)) return;
-  const threshold = Number(cfg.price_drop_threshold ?? 40);
+  const lo = Number(cfg.price_drop_threshold ?? 40);           // 区间下限
+  const hi = Number(cfg.price_drop_threshold_high ?? 50);      // 区间上限
   const date = mytDate(Date.now() / 1000);
   const nowS = Math.floor(Date.now() / 1000);
-  // 只限「当日跌幅 top 30 losers」(口径同 pickastock 的 Loss% 榜: 按跌幅%降序)
-  const universe = db.prepare(`SELECT stock, name, price, prevClose, (prevClose - price) * 100.0 / prevClose AS drop_pct
-    FROM live WHERE price IS NOT NULL AND prevClose IS NOT NULL AND prevClose > 0
-    ORDER BY drop_pct DESC LIMIT 30`).all();
+  // 候选池 = pickastock 的 Loss% 榜 top30 (拿不到就退回用自己数据按跌幅排序)
+  let pool = await fetchPickTop(5);
+  if (!pool) {
+    pool = db.prepare(`SELECT stock AS code, price, open AS ref, volume,
+        (price - open) * 100.0 / open AS pct
+      FROM live WHERE price IS NOT NULL AND open IS NOT NULL AND open > 0
+      ORDER BY pct ASC LIMIT 30`).all();
+  }
   const fired = [];
-  for (const l of universe) {
-    const drop = l.drop_pct;
-    if (drop < threshold) continue;
-    const sent = db.prepare('SELECT 1 FROM price_drop_alert WHERE stock=? AND date=?').get(l.stock, date);
+  for (const l of pool) {
+    const drop = -(l.pct);                    // 取正数跌幅
+    if (drop < lo || drop > hi) continue;     // 只推 [下限, 上限] 区间内
+    const nm = db.prepare('SELECT name FROM live WHERE stock=?').get(l.code)?.name
+      || db.prepare('SELECT name FROM universe WHERE stock=?').get(l.code)?.name;
+    const sent = db.prepare('SELECT 1 FROM price_drop_alert WHERE stock=? AND date=?').get(l.code, date);
     if (sent) continue;
     db.prepare('INSERT INTO price_drop_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
-      .run(l.stock, date, nowS);
-    const av = getAvgVolumes(l.stock);
-    fired.push({ name: l.name || l.stock, stock: l.stock, price: l.price, prevClose: l.prevClose, drop, avg4w: av.avg4w, avg5d: av.avg5d });
+      .run(l.code, date, nowS);
+    const av = getAvgVolumes(l.code);
+    fired.push({ name: nm || l.code, stock: l.code, price: l.price, ref: l.ref, drop, avg4w: av.avg4w, avg5d: av.avg5d });
   }
   if (fired.length) {
-    const lines = fired.slice(0, 30).map((x) => `• ${x.name} (${x.stock}) 现价 ${x.price} · 跌 ${x.drop.toFixed(1)}%\n  昨收 ${x.prevClose} · 4W ${fmtNum(x.avg4w)} / 5D ${fmtNum(x.avg5d)}`);
+    const lines = fired.slice(0, 30).map((x) => `• ${x.name} (${x.stock}) 现价 ${x.price} · 跌 ${x.drop.toFixed(1)}%\n  开盘 ${x.ref} · 4W ${fmtNum(x.avg4w)} / 5D ${fmtNum(x.avg5d)}`);
     const more = fired.length > 30 ? `\n…等共 ${fired.length} 只` : '';
     const text = `🔴 暴跌提醒 ${fired.length} 只\n\n${lines.join('\n\n')}${more}\n\n👉 https://www.synthe-fantasia.site`;
     sendTelegramText(text, cfg);
   }
 }
 
-// 开盘急涨提醒: 现价较开盘涨幅 >= 阈值% → Telegram 群 (开市时段, 每天每只最多一次)
+// 开盘急涨提醒: pickastock 成交量榜 top30 里, 相对开盘涨幅落在 [下限, 上限] 区间 → Telegram 群
 async function evaluateGapUp(cfg) {
   if (!isMarketOpen()) return;
   if (!(cfg.telegram_bot_token && cfg.telegram_chat_id)) return;
-  const threshold = Number(cfg.gap_up_threshold ?? 7);
+  const lo = Number(cfg.gap_up_threshold ?? 5);           // 区间下限%
+  const hi = Number(cfg.gap_up_threshold_high ?? 7);      // 区间上限%
   const date = mytDate(Date.now() / 1000);
   const nowS = Math.floor(Date.now() / 1000);
-  // 只限「当日成交量 top 30」(口径同 pickastock 榜单: 今日成交量降序)
-  const universe = db.prepare('SELECT stock, name, price, open FROM live WHERE volume IS NOT NULL ORDER BY volume DESC LIMIT 30').all();
+  // 候选池 = pickastock 的 Volume 榜 top30 (拿不到就退回用自己数据按成交量排序)
+  let pool = await fetchPickTop(0);
+  if (!pool) {
+    pool = db.prepare(`SELECT stock AS code, price, open AS ref, volume,
+        CASE WHEN open > 0 THEN (price - open) * 100.0 / open ELSE NULL END AS pct
+      FROM live WHERE volume IS NOT NULL ORDER BY volume DESC LIMIT 30`).all();
+  }
   const fired = [];
-  for (const l of universe) {
-    if (l.price == null || l.open == null || l.open <= 0) continue;
-    const gain = (l.price - l.open) / l.open * 100;
-    if (gain < threshold) continue;
-    const sent = db.prepare('SELECT 1 FROM gap_up_alert WHERE stock=? AND date=?').get(l.stock, date);
+  for (const l of pool) {
+    if (l.pct == null) continue;
+    const gain = l.pct;
+    if (gain < lo || gain > hi) continue;     // 只推 [下限, 上限] 区间内
+    const nm = db.prepare('SELECT name FROM live WHERE stock=?').get(l.code)?.name
+      || db.prepare('SELECT name FROM universe WHERE stock=?').get(l.code)?.name;
+    const sent = db.prepare('SELECT 1 FROM gap_up_alert WHERE stock=? AND date=?').get(l.code, date);
     if (sent) continue;
     db.prepare('INSERT INTO gap_up_alert(stock, date, ts) VALUES(?,?,?) ON CONFLICT(stock, date) DO NOTHING')
-      .run(l.stock, date, nowS);
-    const av = getAvgVolumes(l.stock);
-    fired.push({ name: l.name || l.stock, stock: l.stock, price: l.price, open: l.open, gain, avg4w: av.avg4w, avg5d: av.avg5d });
+      .run(l.code, date, nowS);
+    const av = getAvgVolumes(l.code);
+    fired.push({ name: nm || l.code, stock: l.code, price: l.price, open: l.ref, gain, avg4w: av.avg4w, avg5d: av.avg5d });
   }
   if (fired.length) {
     const lines = fired.slice(0, 30).map((x) => `• ${x.name} (${x.stock}) 现价 ${x.price} · 涨 ${x.gain.toFixed(1)}%\n  开盘 ${x.open} · 4W ${fmtNum(x.avg4w)} / 5D ${fmtNum(x.avg5d)}`);
@@ -679,7 +716,9 @@ function buildState() {
       poll_interval_minutes: cfg.poll_interval_minutes,
       window: cfg.window,
       price_drop_threshold: cfg.price_drop_threshold,
-      gap_up_threshold: cfg.gap_up_threshold ?? 7,
+      price_drop_threshold_high: cfg.price_drop_threshold_high ?? 50,
+      gap_up_threshold: cfg.gap_up_threshold ?? 5,
+      gap_up_threshold_high: cfg.gap_up_threshold_high ?? 7,
     },
     watchlist: cfg.watchlist,
     whatsapp_recipients: cfg.whatsapp_recipients || [],
