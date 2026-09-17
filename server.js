@@ -39,7 +39,7 @@ const DEFAULTS = {
   db_min_gap: 15,     // 两底最少间隔(交易日)
   db_max_gap: 80,     // 两底最多间隔
   db_min_neck: 5,     // 颈线相对低点至少高 %
-  db_fresh: 5,        // 突破必须发生在最近 N 个交易日内
+  db_fresh: 2,        // 突破必须发生在最近 N 个交易日内(越小越新鲜、越接近买点)
   oanor_api_key: '',          // oanor 备份数据源 key(可选)
 };
 
@@ -671,13 +671,21 @@ async function evaluateDoubleBottom(cfg) {
   }
   if (fired.length) {
     fired.sort((a, b) => b.score - a.score);
-    const blocks = fired.slice(0, 15).map((x) => [
-      `• ${x.name} (${x.code})  评分 ${x.score}/100`,
-      `  两底 ${x.A.p.toFixed(3)} (${x.A.d}) / ${x.C.p.toFixed(3)} (${x.C.d}) · 相差 ${x.diffPct.toFixed(1)}%`,
-      `  颈线 ${x.neck.toFixed(3)} · 现价 ${x.price} 突破 ${x.brkPct.toFixed(2)}%`,
-      `  止损 ${x.stop.toFixed(3)} · 目标 ${x.target1.toFixed(3)}`,
-      `  突破量 ${fmtNum(x.vr)}x 5日均量 · 形态跨度 ${x.gap} 日`,
-    ].join('\n'));
+    const blocks = fired.slice(0, 15).map((x) => {
+      const risk = (x.price - x.stop) / x.price * 100;                 // 到止损的空间
+      const rew = (x.target1 - x.price) / x.price * 100;               // 到目标的空门
+      const rr = risk > 0 ? (rew / risk) : 0;                          // 盈亏比
+      const when = x.barsSince === 0 ? '今天刚突破' : `${x.barsSince} 天前突破`;
+      return [
+        `• ${x.name} (${x.code})  评分 ${x.score}/100   [${when}]`,
+        `  两底    ${x.A.p.toFixed(3)} (${x.A.d}) / ${x.C.p.toFixed(3)} (${x.C.d})   相差 ${x.diffPct.toFixed(1)}%`,
+        `  颈线    ${x.neck.toFixed(3)}  →  现价 ${x.price}  (已突破 +${x.brkPct.toFixed(1)}%)`,
+        `  买入区  ${x.neck.toFixed(3)} ~ ${(x.neck * 1.03).toFixed(3)}`,
+        `  止损    ${x.stop.toFixed(3)}   (-${risk.toFixed(1)}%)`,
+        `  目标    ${x.target1.toFixed(3)}   (+${rew.toFixed(1)}%)   盈亏比 ${rr.toFixed(2)}`,
+        `  突破量  ${fmtNum(x.vr)}x 5日均量 · 形态跨度 ${x.gap} 个交易日`,
+      ].join('\n');
+    });
     const more = fired.length > 15 ? `\n\n…等共 ${fired.length} 只` : '';
     const text = `🎯 双底突破 · 买入信号 ${fired.length} 只\n\n${blocks.join('\n\n')}${more}\n\n👉 https://www.synthe-fantasia.site`;
     sendTelegramText(text, cfg);
