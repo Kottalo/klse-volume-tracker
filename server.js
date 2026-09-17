@@ -690,7 +690,7 @@ async function evaluateDoubleBottom(cfg) {
         `  买入区  ${x.neck.toFixed(3)} ~ ${(x.neck * 1.03).toFixed(3)}`,
         `  止损    ${x.stop.toFixed(3)}   (-${risk.toFixed(1)}%)`,
         `  目标    ${x.target1.toFixed(3)}   (+${rew.toFixed(1)}%)   盈亏比 ${rr.toFixed(2)}`,
-        `  突破量  ${fmtNum(x.vr)}x 5日均量 · 形态跨度 ${x.gap} 个交易日`,
+        `  突破量  ${x.vr.toFixed(1)}x 5日均量 · 形态跨度 ${x.gap} 个交易日`,
       ].join('\n');
     });
     const more = fired.length > 15 ? `\n\n…等共 ${fired.length} 只` : '';
