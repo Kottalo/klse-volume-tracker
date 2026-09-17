@@ -40,6 +40,7 @@ const DEFAULTS = {
   db_max_gap: 80,     // 两底最多间隔
   db_min_neck: 5,     // 颈线相对低点至少高 %
   db_fresh: 2,        // 突破必须发生在最近 N 个交易日内(越小越新鲜、越接近买点)
+  db_min_rr: 1.0,     // 最小盈亏比(低于此值不通知, 1.0 = 赚的空间至少是亏的1倍)
   oanor_api_key: '',          // oanor 备份数据源 key(可选)
 };
 
@@ -634,8 +635,12 @@ function findDoubleBottom(code, cfg) {
       score += 10 * Math.min(1, Math.max(0, brkPct) / 3);             // 突破幅度 (10)
       score = Math.round(score);
 
-      const stop = base * 0.98;                                       // 止损: 低点下方 2%
-      const target1 = B.high + (B.high - base);                       // 量度目标(颈线 + 形态高度)
+      const hgt = B.high - base;                                      // 形态高度
+      // 止损: 形态低点下方2% 与 颈线下方3% 取更近者(实盘用颈部破位止损更好执行)
+      const stop = Math.max(base * 0.98, B.high * 0.97);
+      // 量度目标: 颈线 + 形态高度; 若已被越过则从现价再延伸一个形态高度
+      let target1 = B.high + hgt;
+      if (target1 <= rows[last].close) target1 = rows[last].close + hgt;
       return {
         A, B, C, breakDate: brk.date, breakClose: brk.close,
         price: rows[last].close, neck: B.high, score,
@@ -661,6 +666,8 @@ async function evaluateDoubleBottom(cfg) {
     let pat;
     try { pat = findDoubleBottom(r.stock, cfg); } catch { pat = null; }
     if (!pat || pat.score < minScore) continue;
+    const rr = pat.price > pat.stop ? ((pat.target1 - pat.price) / (pat.price - pat.stop)) : 0;
+    if (rr < Number(cfg.db_min_rr ?? 1.0)) continue;      // 盈亏比不达标不推
     const key = `${r.stock}|${pat.neck.toFixed(3)}|${pat.breakDate}`;
     if (db.prepare('SELECT 1 FROM db_bottom_alert WHERE key=?').get(key)) continue;
     db.prepare('INSERT INTO db_bottom_alert(key, stock, date, ts) VALUES(?,?,?,?) ON CONFLICT(key) DO NOTHING')
@@ -867,7 +874,8 @@ function buildState() {
       gap_up_threshold_high: cfg.gap_up_threshold_high ?? 7,
       db_min_score: cfg.db_min_score ?? 70,
       db_tol: cfg.db_tol ?? 5,
-      db_fresh: cfg.db_fresh ?? 5,
+      db_fresh: cfg.db_fresh ?? 2,
+      db_min_rr: cfg.db_min_rr ?? 1.0,
     },
     watchlist: cfg.watchlist,
     whatsapp_recipients: cfg.whatsapp_recipients || [],
