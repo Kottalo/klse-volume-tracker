@@ -460,7 +460,8 @@ function computeMetrics(cfg) {
     const av = getAvgVolumes(code);
     out.push({ code, name: live.name || w.name || code, price: live.price, open: live.open, prevClose: live.prevClose,
       volume: live.volume, avg4w: av.avg4w, avg5d: av.avg5d, mtime: live.mtime,
-      current, previous, ratio, status });
+      current, previous, ratio, status,
+      curLabel: vol ? vol.curLabel : null, prevLabel: vol ? vol.prevLabel : null });
   }
   // 按增长倍率从大到小排列
   out.sort((a, b) => {
