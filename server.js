@@ -399,14 +399,18 @@ function computeVolumes(code, window) {
     const todayStr = mytDate(Date.now() / 1000);
     const live = db.prepare('SELECT volume FROM live WHERE stock=?').get(code);
     if (!live || !live.volume) return null;
-    const rows = db.prepare('SELECT volume FROM daily_vol WHERE stock=? AND date < ? ORDER BY date DESC LIMIT ?')
+    const rows = db.prepare('SELECT date, volume FROM daily_vol WHERE stock=? AND date < ? ORDER BY date DESC LIMIT ?')
       .all(code, todayStr, 2 * N - 1);
     if (rows.length < 2 * N - 1) return null;  // 历史不够(冷启动)
     const sum = (a) => a.reduce((s, r) => s + (r.volume || 0), 0);
     const current = live.volume + sum(rows.slice(0, N - 1));   // 今天 + 前 N-1 天
     const previous = sum(rows.slice(N - 1, 2 * N - 1));        // 再往前 N 天
     if (current <= 0 || previous <= 0) return null;
-    return { current, previous };
+    // 日期标签: 单日就写日期, 多日写「起 ~ 止」
+    const rng = (arr) => (arr.length <= 1 ? (arr[0] || '') : `${arr[0]} ~ ${arr[arr.length - 1]}`);
+    const curDates = [todayStr, ...rows.slice(0, N - 1).map((r) => r.date)].sort();
+    const prevDates = rows.slice(N - 1, 2 * N - 1).map((r) => r.date).sort();
+    return { current, previous, curLabel: rng(curDates), prevLabel: rng(prevDates) };
   }
   // 天内时段对比: volume_ts 累计量差值(同一天内累计单调递增)
   const minutes = pw.unit === 'h' ? pw.value * 60 : pw.value;
@@ -419,7 +423,12 @@ function computeVolumes(code, window) {
   const current = cNow - cPrev;
   const previous = cPrev - cPrev2;
   if (current <= 0 || previous <= 0) return null;
-  return { current, previous };
+  const hm = (ts) => { const d = new Date((ts + 8 * 3600) * 1000); return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`; };
+  return {
+    current, previous,
+    curLabel: `${hm(now - wSec)}~${hm(now)}`,
+    prevLabel: `${hm(now - 2 * wSec)}~${hm(now - wSec)}`,
+  };
 }
 
 // 今日成交量 vs 昨日成交量(日线数据)
@@ -557,9 +566,9 @@ async function evaluateAlerts(cfg) {
     if (should) fired.push(m);
   }
   if (fired.length) {
-    const lines = fired.slice(0, 30).map((m) => `• ${m.name} (${m.code}) 价 ${m.price ?? '-'} · 放量 ${m.ratio.toFixed(1)}%\n  今日 ${fmtNum(m.current)} vs 昨日 ${fmtNum(m.previous)} · 4W ${fmtNum(m.avg4w)} / 5D ${fmtNum(m.avg5d)}`);
+    const lines = fired.slice(0, 30).map((m) => `• ${m.name} (${m.code}) 价 ${m.price ?? '-'} · 放量 ${m.ratio.toFixed(1)}%\n  ${m.curLabel} ${fmtNum(m.current)} vs ${m.prevLabel} ${fmtNum(m.previous)} · 4W ${fmtNum(m.avg4w)} / 5D ${fmtNum(m.avg5d)}`);
     const more = fired.length > 30 ? `\n…等共 ${fired.length} 只` : '';
-    const text = `📊 放量提醒 ${fired.length} 只\n\n${lines.join('\n\n')}${more}\n\n👉 https://www.synthe-fantasia.site`;
+    const text = `📊 放量提醒 · ${date} · ${fired.length} 只\n\n${lines.join('\n\n')}${more}\n\n👉 https://www.synthe-fantasia.site`;
     sendTelegramText(text, cfg);
   }
 }
@@ -694,7 +703,7 @@ async function evaluateDoubleBottom(cfg) {
       ].join('\n');
     });
     const more = fired.length > 15 ? `\n\n…等共 ${fired.length} 只` : '';
-    const text = `🎯 双底突破 · 买入信号 ${fired.length} 只\n\n${blocks.join('\n\n')}${more}\n\n👉 https://www.synthe-fantasia.site`;
+    const text = `🎯 双底突破 · ${date} · 买入信号 ${fired.length} 只\n\n${blocks.join('\n\n')}${more}\n\n👉 https://www.synthe-fantasia.site`;
     sendTelegramText(text, cfg);
   }
 }
@@ -731,7 +740,7 @@ async function evaluatePriceDrop(cfg) {
   if (fired.length) {
     const lines = fired.slice(0, 30).map((x) => `• ${x.name} (${x.stock}) 现价 ${x.price} · 跌 ${x.drop.toFixed(1)}%\n  开盘 ${x.ref} · 4W ${fmtNum(x.avg4w)} / 5D ${fmtNum(x.avg5d)}`);
     const more = fired.length > 30 ? `\n…等共 ${fired.length} 只` : '';
-    const text = `🔴 暴跌提醒 ${fired.length} 只\n\n${lines.join('\n\n')}${more}\n\n👉 https://www.synthe-fantasia.site`;
+    const text = `🔴 暴跌提醒 · ${date} · ${fired.length} 只\n\n${lines.join('\n\n')}${more}\n\n👉 https://www.synthe-fantasia.site`;
     sendTelegramText(text, cfg);
   }
 }
@@ -768,7 +777,7 @@ async function evaluateGapUp(cfg) {
   if (fired.length) {
     const lines = fired.slice(0, 30).map((x) => `• ${x.name} (${x.stock}) 现价 ${x.price} · 涨 ${x.gain.toFixed(1)}%\n  开盘 ${x.open} · 4W ${fmtNum(x.avg4w)} / 5D ${fmtNum(x.avg5d)}`);
     const more = fired.length > 30 ? `\n…等共 ${fired.length} 只` : '';
-    const text = `🟢 急涨提醒 ${fired.length} 只\n\n${lines.join('\n\n')}${more}\n\n👉 https://www.synthe-fantasia.site`;
+    const text = `🟢 急涨提醒 · ${date} · ${fired.length} 只\n\n${lines.join('\n\n')}${more}\n\n👉 https://www.synthe-fantasia.site`;
     sendTelegramText(text, cfg);
   }
 }
