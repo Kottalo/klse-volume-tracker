@@ -41,6 +41,10 @@ const DEFAULTS = {
   db_min_neck: 5,     // 颈线相对低点至少高 %
   db_fresh: 2,        // 突破必须发生在最近 N 个交易日内(越小越新鲜、越接近买点)
   db_min_rr: 1.0,     // 最小盈亏比(低于此值不通知, 1.0 = 赚的空间至少是亏的1倍)
+  pick_count: 3,      // 每日精选几只(宁少勿多, 别让用户被一堆票淹没)
+  win_pct: 8,         // 观察名单里涨到这个幅度算「应证」
+  loss_pct: 5,        // 跌到这个幅度算「证伪」
+  watch_days: 15,     // 观察多少天后没动静就归档
   oanor_api_key: '',          // oanor 备份数据源 key(可选)
 };
 
@@ -134,6 +138,12 @@ try { db.exec('ALTER TABLE universe ADD COLUMN code TEXT'); } catch (e) {}
 try { db.exec('ALTER TABLE live ADD COLUMN avg4w REAL'); } catch (e) {}
 try { db.exec('ALTER TABLE live ADD COLUMN avg5d REAL'); } catch (e) {}
 // 迁移: daily_vol 补 OHLC 列(双底/N字底形态识别需要)
+// 观察名单: 精选出来的股票持续跟踪, 用实际表现应证系统判断
+try { db.exec(`CREATE TABLE IF NOT EXISTS watchlist (
+  stock TEXT PRIMARY KEY, name TEXT, added_date TEXT, entry_price REAL,
+  signal TEXT, score REAL, best_pct REAL, days INTEGER,
+  outcome TEXT, note TEXT, resolved_date TEXT
+)`); } catch (e) {}
 try { db.exec('ALTER TABLE daily_vol ADD COLUMN open REAL'); } catch (e) {}
 try { db.exec('ALTER TABLE daily_vol ADD COLUMN high REAL'); } catch (e) {}
 try { db.exec('ALTER TABLE daily_vol ADD COLUMN low REAL'); } catch (e) {}
@@ -490,18 +500,115 @@ function pushBroadcast(icon, title, body, count) {
   bcastQueue.push({ icon, title, body, count });
 }
 
+
+// ---------------- 每日精选 + 观察名单 ----------------
+// 精选: 只挑出评分最高、盈亏比达标的极少数(默认3只), 不让用户被一堆股票淹没
+function pickDailyPicks(cfg, limit = 3) {
+  const rows = db.prepare('SELECT stock, name FROM universe WHERE code IS NOT NULL').all();
+  const cands = [];
+  for (const r of rows) {
+    try {
+      const p = findDoubleBottom(r.stock, cfg);
+      if (!p) continue;
+      if (p.score < Number(cfg.db_min_score ?? 70)) continue;
+      const rr = p.price > p.stop ? (p.target1 - p.price) / (p.price - p.stop) : 0;
+      if (rr < Number(cfg.db_min_rr ?? 1.0)) continue;
+      cands.push({ ...p, code: r.stock, name: r.name || r.stock, rr });
+    } catch (e) { /* 单只算不动就跳过, 不影响整体 */ }
+  }
+  cands.sort((a, b) => b.score - a.score || b.rr - a.rr);
+  return cands.slice(0, limit);
+}
+
+// 观察名单: 精选出来的票持续跟踪, 用真实涨跌给系统的判断打分
+// win = 达到目标区 / loss = 跌破止损 / expired = 观察太久没动静
+function updateWatchlist(cfg) {
+  const today = mytDate(Date.now() / 1000);
+  const picks = pickDailyPicks(cfg, Number(cfg.pick_count ?? 3));
+  for (const p of picks) {
+    const ex = db.prepare('SELECT stock FROM watchlist WHERE stock=?').get(p.code);
+    if (!ex) {
+      db.prepare(`INSERT INTO watchlist(stock, name, added_date, entry_price, signal, score, best_pct, days, outcome)
+        VALUES(?,?,?,?,?,?,?,?,?)`)
+        .run(p.code, p.name, today, p.price, '双底突破', p.score, 0, 0, 'observing');
+    }
+  }
+  const list = db.prepare("SELECT * FROM watchlist WHERE outcome='observing'").all();
+  const updates = [];
+  for (const w of list) {
+    const lv = db.prepare('SELECT name, price FROM live WHERE stock=?').get(w.stock);
+    if (!lv || !lv.price) continue;
+    const pct = (lv.price - w.entry_price) / w.entry_price * 100;
+    const best = Math.max(Number(w.best_pct) || 0, pct);
+    const days = (Number(w.days) || 0) + 1;
+    let outcome = 'observing';
+    if (pct >= (Number(cfg.win_pct ?? 8))) outcome = 'win';
+    else if (pct <= -(Number(cfg.loss_pct ?? 5))) outcome = 'loss';
+    else if (days >= (Number(cfg.watch_days ?? 15))) outcome = 'expired';
+    db.prepare('UPDATE watchlist SET best_pct=?, days=?, outcome=?, resolved_date=? WHERE stock=?')
+      .run(best, days, outcome, outcome === 'observing' ? null : today, w.stock);
+    updates.push({ code: w.stock, name: lv.name || w.name || w.stock, entry: w.entry_price, price: lv.price, pct, best, days, outcome, added: w.added_date });
+  }
+  updates.sort((a, b) => b.pct - a.pct);
+  const tally = db.prepare("SELECT outcome, COUNT(*) c FROM watchlist GROUP BY outcome").all();
+  return { picks, updates, tally };
+}
+
 async function flushBroadcast(cfg) {
-  if (!bcastQueue.length) return;                    // 没有任何信号 -> 静默, 不推空消息
   const date = mytDate(Date.now() / 1000);
-  const total = bcastQueue.reduce((s, x) => s + x.count, 0);
-  // 买入信号优先展示 (先排序, 再拼装)
-  const order = { '🎯': 0, '🟢': 1, '🔴': 2, '📊': 3 };
-  bcastQueue.sort((a, b) => (order[a.icon] ?? 9) - (order[b.icon] ?? 9));
-  const parts = bcastQueue.map((s) => `${s.icon} ${s.title} · ${s.count} 只\n${s.body}`);
-  const text = `📡 KLSE 盘面广播 · ${date}\n共 ${total} 条信号\n\n${parts.join('\n\n')}\n\n👉 https://www.synthe-fantasia.site`;
+  const parts = [];
+
+  // ---- 1) 今日精选: 最重要的放最前, 只几只, 写得透 ----
+  let wl = { picks: [], updates: [], tally: [] };
+  try { wl = updateWatchlist(cfg); } catch (e) { log('watchlist 异常: ' + e); }
+  if (wl.picks.length) {
+    const blocks = wl.picks.map((p, i) => {
+      const risk = (p.price - p.stop) / p.price * 100;
+      const rew = (p.target1 - p.price) / p.price * 100;
+      const when = p.barsSince === 0 ? '今天刚突破' : `${p.barsSince} 天前突破`;
+      return [
+        `${i + 1}. ${p.name} (${p.code})   评分 ${p.score}/100`,
+        `   现价 ${p.price} · 双底突破颈线 ${p.neck.toFixed(3)}   (${when})`,
+        `   止损 ${p.stop.toFixed(3)} (-${risk.toFixed(1)}%) · 目标 ${p.target1.toFixed(3)} (+${rew.toFixed(1)}%) · 盈亏比 ${p.rr.toFixed(2)}`,
+        `   放量 ${p.vr.toFixed(1)}x 5日均量 · 两底 ${p.A.p.toFixed(3)} / ${p.C.p.toFixed(3)} (相差 ${p.diffPct.toFixed(1)}%)`,
+      ].join('\n');
+    });
+    parts.push(`🎯 今日精选 · ${wl.picks.length} 只\n\n${blocks.join('\n\n')}`);
+  }
+
+  // ---- 2) 观察名单复盘: 让用户看到"系统之前说的票现在怎么样了" ----
+  if (wl.updates.length) {
+    const lines = wl.updates.map((u) => {
+      const mark = u.outcome === 'win' ? '✅ 应证' : u.outcome === 'loss' ? '❌ 证伪' : u.outcome === 'expired' ? '⏱ 到期' : '👀 跟踪中';
+      const sign = u.pct >= 0 ? '+' : '';
+      return `${mark}  ${u.name} (${u.code})  ${sign}${u.pct.toFixed(1)}%   最高 +${u.best.toFixed(1)}%   自 ${u.added} 第${u.days}天`;
+    });
+    const nameMap = { observing: '跟踪中', win: '应证', loss: '证伪', expired: '到期' };
+    const t = wl.tally.map((x) => `${nameMap[x.outcome] || x.outcome} ${x.c}`).join(' · ');
+    parts.push(`📈 观察名单跟踪\n${lines.join('\n')}\n\n累计战绩: ${t}`);
+  }
+
+  // ---- 3) 异动速览: 精简到 3 条, 只当参考 ----
+  if (bcastQueue.length) {
+    const order = { '🎯': 0, '🟢': 1, '🔴': 2, '📊': 3 };
+    bcastQueue.sort((a, b) => (order[a.icon] ?? 9) - (order[b.icon] ?? 9));
+    const mini = bcastQueue.map((s) => `${s.icon} ${s.title} ${s.count} 只`).join('  ·  ');
+    parts.push(`📋 盘面速览\n${mini}`);
+  }
+
   bcastQueue = [];
+  if (!parts.length) return;                         // 什么都没 -> 静默, 不推空消息
+  const text = `📡 KLSE 精选 · ${date}\n\n${parts.join('\n\n')}\n\n👉 https://www.synthe-fantasia.site`;
   await sendTelegramText(text, cfg);
 }
+
+// 全局异常捕获: 防止单个未捕获异常把服务打挂, 同时留下原因
+process.on('uncaughtException', (e) => {
+  try { log('!! UNCAUGHT EXCEPTION: ' + (e && e.stack ? e.stack : e)); } catch (_) {}
+});
+process.on('unhandledRejection', (e) => {
+  try { log('!! UNHANDLED REJECTION: ' + (e && e.stack ? e.stack : e)); } catch (_) {}
+});
 
 async function sendTelegramText(text, cfg) {
   const token = (cfg.telegram_bot_token || '').trim();
@@ -903,6 +1010,10 @@ function buildState() {
       db_tol: cfg.db_tol ?? 5,
       db_fresh: cfg.db_fresh ?? 2,
       db_min_rr: cfg.db_min_rr ?? 1.0,
+      pick_count: cfg.pick_count ?? 3,
+      win_pct: cfg.win_pct ?? 8,
+      loss_pct: cfg.loss_pct ?? 5,
+      watch_days: cfg.watch_days ?? 15,
     },
     watchlist: cfg.watchlist,
     whatsapp_recipients: cfg.whatsapp_recipients || [],
@@ -928,6 +1039,13 @@ app.get('/healthz', (req, res) => res.json({ ok: true }));
 app.get('/api/state', async (req, res) => {
   await maybePoll();  // 数据陈旧则即时抓取, 否则用缓存
   res.json(buildState());
+});
+
+// 观察名单全量(含战绩统计): /api/watchlist
+app.get('/api/watchlist', (req, res) => {
+  const all = db.prepare('SELECT * FROM watchlist ORDER BY outcome, added_date DESC').all();
+  const tally = db.prepare('SELECT outcome, COUNT(*) c FROM watchlist GROUP BY outcome').all();
+  res.json({ count: all.length, tally, list: all });
 });
 
 // 手动触发一轮完整广播(验证用): /api/broadcast-test
