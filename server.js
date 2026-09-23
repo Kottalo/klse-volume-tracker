@@ -505,8 +505,13 @@ function pushBroadcast(icon, title, body, count) {
 // 精选: 只挑出评分最高、盈亏比达标的极少数(默认3只), 不让用户被一堆股票淹没
 function pickDailyPicks(cfg, limit = 3) {
   const rows = db.prepare('SELECT stock, name FROM universe WHERE code IS NOT NULL').all();
+  // 观察名单里正在跟踪的票不再重复推荐; 名单满了就腾不出新名额
+  const watching = new Set(db.prepare("SELECT stock FROM watchlist WHERE outcome='observing'").all().map((x) => x.stock));
+  const slots = Math.max(0, limit - watching.size);
+  if (slots === 0) return [];
   const cands = [];
   for (const r of rows) {
+    if (watching.has(r.stock)) continue;      // 已经在跟踪的跳过
     try {
       const p = findDoubleBottom(r.stock, cfg);
       if (!p) continue;
@@ -517,7 +522,7 @@ function pickDailyPicks(cfg, limit = 3) {
     } catch (e) { /* 单只算不动就跳过, 不影响整体 */ }
   }
   cands.sort((a, b) => b.score - a.score || b.rr - a.rr);
-  return cands.slice(0, limit);
+  return cands.slice(0, slots);
 }
 
 // 观察名单: 精选出来的票持续跟踪, 用真实涨跌给系统的判断打分
@@ -526,11 +531,15 @@ function updateWatchlist(cfg) {
   const today = mytDate(Date.now() / 1000);
   const picks = pickDailyPicks(cfg, Number(cfg.pick_count ?? 3));
   for (const p of picks) {
-    const ex = db.prepare('SELECT stock FROM watchlist WHERE stock=?').get(p.code);
+    const ex = db.prepare('SELECT stock, outcome FROM watchlist WHERE stock=?').get(p.code);
     if (!ex) {
       db.prepare(`INSERT INTO watchlist(stock, name, added_date, entry_price, signal, score, best_pct, days, outcome)
         VALUES(?,?,?,?,?,?,?,?,?)`)
-        .run(p.code, p.name, today, p.price, '双底突破', p.score, 0, 0, 'observing');
+        .run(p.code, p.name, today, Number(p.price.toFixed(4)), '双底突破', p.score, 0, 0, 'observing');
+    } else if (ex.outcome === 'expired') {
+      // 归档过的票又出现信号 -> 重新激活跟踪(名额循环利用)
+      db.prepare(`UPDATE watchlist SET added_date=?, entry_price=?, score=?, best_pct=0, days=0, outcome='observing', resolved_date=NULL WHERE stock=?`)
+        .run(today, Number(p.price.toFixed(4)), p.score, p.code);
     }
   }
   const list = db.prepare("SELECT * FROM watchlist WHERE outcome='observing'").all();
@@ -568,7 +577,7 @@ async function flushBroadcast(cfg) {
       const when = p.barsSince === 0 ? '今天刚突破' : `${p.barsSince} 天前突破`;
       return [
         `${i + 1}. ${p.name} (${p.code})   评分 ${p.score}/100`,
-        `   现价 ${p.price} · 双底突破颈线 ${p.neck.toFixed(3)}   (${when})`,
+        `   现价 ${p.price.toFixed(3)} · 双底突破颈线 ${p.neck.toFixed(3)}   (${when})`,
         `   止损 ${p.stop.toFixed(3)} (-${risk.toFixed(1)}%) · 目标 ${p.target1.toFixed(3)} (+${rew.toFixed(1)}%) · 盈亏比 ${p.rr.toFixed(2)}`,
         `   放量 ${p.vr.toFixed(1)}x 5日均量 · 两底 ${p.A.p.toFixed(3)} / ${p.C.p.toFixed(3)} (相差 ${p.diffPct.toFixed(1)}%)`,
       ].join('\n');
@@ -1046,6 +1055,13 @@ app.get('/api/watchlist', (req, res) => {
   const all = db.prepare('SELECT * FROM watchlist ORDER BY outcome, added_date DESC').all();
   const tally = db.prepare('SELECT outcome, COUNT(*) c FROM watchlist GROUP BY outcome').all();
   res.json({ count: all.length, tally, list: all });
+});
+
+// 清空观察名单重新开始: /api/watchlist/reset
+app.get('/api/watchlist/reset', (req, res) => {
+  const before = db.prepare('SELECT COUNT(*) c FROM watchlist').get().c;
+  db.prepare('DELETE FROM watchlist').run();
+  res.json({ ok: true, cleared: before });
 });
 
 // 手动触发一轮完整广播(验证用): /api/broadcast-test
