@@ -483,6 +483,26 @@ function fmtNum(n) {
   return String(n);
 }
 
+// ---------------- 广播队列: 一轮轮询内收集所有信号, 合并成一条发出 ----------------
+let bcastQueue = [];
+
+function pushBroadcast(icon, title, body, count) {
+  bcastQueue.push({ icon, title, body, count });
+}
+
+async function flushBroadcast(cfg) {
+  if (!bcastQueue.length) return;                    // 没有任何信号 -> 静默, 不推空消息
+  const date = mytDate(Date.now() / 1000);
+  const total = bcastQueue.reduce((s, x) => s + x.count, 0);
+  // 买入信号优先展示 (先排序, 再拼装)
+  const order = { '🎯': 0, '🟢': 1, '🔴': 2, '📊': 3 };
+  bcastQueue.sort((a, b) => (order[a.icon] ?? 9) - (order[b.icon] ?? 9));
+  const parts = bcastQueue.map((s) => `${s.icon} ${s.title} · ${s.count} 只\n${s.body}`);
+  const text = `📡 KLSE 盘面广播 · ${date}\n共 ${total} 条信号\n\n${parts.join('\n\n')}\n\n👉 https://www.synthe-fantasia.site`;
+  bcastQueue = [];
+  await sendTelegramText(text, cfg);
+}
+
 async function sendTelegramText(text, cfg) {
   const token = (cfg.telegram_bot_token || '').trim();
   const chat = (cfg.telegram_chat_id || '').trim();
@@ -569,8 +589,7 @@ async function evaluateAlerts(cfg) {
   if (fired.length) {
     const lines = fired.slice(0, 30).map((m) => `• ${m.name} (${m.code}) 价 ${m.price ?? '-'} · 放量 ${m.ratio.toFixed(1)}%\n  ${m.curLabel} ${fmtNum(m.current)} vs ${m.prevLabel} ${fmtNum(m.previous)} · 4W ${fmtNum(m.avg4w)} / 5D ${fmtNum(m.avg5d)}`);
     const more = fired.length > 30 ? `\n…等共 ${fired.length} 只` : '';
-    const text = `📊 放量提醒 · ${date} · ${fired.length} 只\n\n${lines.join('\n\n')}${more}\n\n👉 https://www.synthe-fantasia.site`;
-    sendTelegramText(text, cfg);
+    pushBroadcast('📊', '放量异动', lines.slice(0, 12).join('\n\n'), fired.length);
   }
 }
 
@@ -704,8 +723,7 @@ async function evaluateDoubleBottom(cfg) {
       ].join('\n');
     });
     const more = fired.length > 15 ? `\n\n…等共 ${fired.length} 只` : '';
-    const text = `🎯 双底突破 · ${date} · 买入信号 ${fired.length} 只\n\n${blocks.join('\n\n')}${more}\n\n👉 https://www.synthe-fantasia.site`;
-    sendTelegramText(text, cfg);
+    pushBroadcast('🎯', '双底突破 · 买入信号', blocks.slice(0, 6).join('\n\n'), fired.length);
   }
 }
 
@@ -741,8 +759,7 @@ async function evaluatePriceDrop(cfg) {
   if (fired.length) {
     const lines = fired.slice(0, 30).map((x) => `• ${x.name} (${x.stock}) 现价 ${x.price} · 跌 ${x.drop.toFixed(1)}%\n  开盘 ${x.ref} · 4W ${fmtNum(x.avg4w)} / 5D ${fmtNum(x.avg5d)}`);
     const more = fired.length > 30 ? `\n…等共 ${fired.length} 只` : '';
-    const text = `🔴 暴跌提醒 · ${date} · ${fired.length} 只\n\n${lines.join('\n\n')}${more}\n\n👉 https://www.synthe-fantasia.site`;
-    sendTelegramText(text, cfg);
+    pushBroadcast('🔴', '暴跌异动', lines.slice(0, 10).join('\n'), fired.length);
   }
 }
 
@@ -778,8 +795,7 @@ async function evaluateGapUp(cfg) {
   if (fired.length) {
     const lines = fired.slice(0, 30).map((x) => `• ${x.name} (${x.stock}) 现价 ${x.price} · 涨 ${x.gain.toFixed(1)}%\n  开盘 ${x.open} · 4W ${fmtNum(x.avg4w)} / 5D ${fmtNum(x.avg5d)}`);
     const more = fired.length > 30 ? `\n…等共 ${fired.length} 只` : '';
-    const text = `🟢 急涨提醒 · ${date} · ${fired.length} 只\n\n${lines.join('\n\n')}${more}\n\n👉 https://www.synthe-fantasia.site`;
-    sendTelegramText(text, cfg);
+    pushBroadcast('🟢', '急涨异动', lines.slice(0, 10).join('\n'), fired.length);
   }
 }
 
@@ -815,6 +831,7 @@ function poll(backfill = false) {
       await evaluatePriceDrop(cfg);
       await evaluateGapUp(cfg);
       await evaluateDoubleBottom(cfg);   // 双底突破买入信号
+      await flushBroadcast(cfg);         // 把本轮所有信号合并成一条发出
       prune();
       lastPoll = Date.now() / 1000;
       log(`全市场抓取完成 (${cnt} 只)`);
