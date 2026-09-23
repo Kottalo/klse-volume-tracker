@@ -930,6 +930,24 @@ app.get('/api/state', async (req, res) => {
   res.json(buildState());
 });
 
+// 手动触发一轮完整广播(验证用): /api/broadcast-test
+app.get('/api/broadcast-test', async (req, res) => {
+  const cfg = loadConfig();
+  try {
+    await evaluateAlerts(cfg);
+    await evaluatePriceDrop(cfg);
+    await evaluateGapUp(cfg);
+    await evaluateDoubleBottom(cfg);
+    const summary = bcastQueue.map((x) => `${x.icon} ${x.title}: ${x.count} 只`);
+    const queued = bcastQueue.length;
+    if (queued === 0) return res.json({ ok: true, queued: 0, note: '本轮无新信号(可能已推送过, 被去重)' });
+    await flushBroadcast(cfg);
+    res.json({ ok: true, queued, summary });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 // 双底形态扫描(验证/调试用): /api/db-scan?min=70
 app.get('/api/db-scan', (req, res) => {
   const cfg = loadConfig();
