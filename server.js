@@ -933,6 +933,13 @@ app.get('/api/state', async (req, res) => {
 // 手动触发一轮完整广播(验证用): /api/broadcast-test
 app.get('/api/broadcast-test', async (req, res) => {
   const cfg = loadConfig();
+  // ?force=1 时清掉今日去重记录, 好让信号重新入选(仅用于验证通知样式)
+  if (req.query.force === '1') {
+    const d0 = mytDate(Date.now() / 1000);
+    for (const t of ['daily_alert', 'price_drop_alert', 'gap_up_alert', 'db_bottom_alert']) {
+      try { db.prepare(`DELETE FROM ${t} WHERE date=?`).run(d0); } catch (e) {}
+    }
+  }
   try {
     await evaluateAlerts(cfg);
     await evaluatePriceDrop(cfg);
