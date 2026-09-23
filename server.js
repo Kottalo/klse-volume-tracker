@@ -505,13 +505,15 @@ function pushBroadcast(icon, title, body, count) {
 // 精选: 只挑出评分最高、盈亏比达标的极少数(默认3只), 不让用户被一堆股票淹没
 function pickDailyPicks(cfg, limit = 3) {
   const rows = db.prepare('SELECT stock, name FROM universe WHERE code IS NOT NULL').all();
-  // 观察名单里正在跟踪的票不再重复推荐; 名单满了就腾不出新名额
-  const watching = new Set(db.prepare("SELECT stock FROM watchlist WHERE outcome='observing'").all().map((x) => x.stock));
-  const slots = Math.max(0, limit - watching.size);
+  // ① 推荐过的票(不论结果)都不再重复推
+  const seen = new Set(db.prepare('SELECT stock FROM watchlist').all().map((x) => x.stock));
+  // ② 名额只被「跟踪中」的占着; 应证/证伪/归档的会腾出名额, 补给新票
+  const busy = db.prepare("SELECT COUNT(*) c FROM watchlist WHERE outcome='observing'").get().c;
+  const slots = Math.max(0, limit - busy);
   if (slots === 0) return [];
   const cands = [];
   for (const r of rows) {
-    if (watching.has(r.stock)) continue;      // 已经在跟踪的跳过
+    if (seen.has(r.stock)) continue;          // 推荐过的跳过
     try {
       const p = findDoubleBottom(r.stock, cfg);
       if (!p) continue;
@@ -547,8 +549,8 @@ function updateWatchlist(cfg) {
   for (const w of list) {
     const lv = db.prepare('SELECT name, price FROM live WHERE stock=?').get(w.stock);
     if (!lv || !lv.price) continue;
-    const pct = (lv.price - w.entry_price) / w.entry_price * 100;
-    const best = Math.max(Number(w.best_pct) || 0, pct);
+    const pct = Number(((lv.price - w.entry_price) / w.entry_price * 100).toFixed(2));
+    const best = Number(Math.max(Number(w.best_pct) || 0, pct).toFixed(2));
     const days = (Number(w.days) || 0) + 1;
     let outcome = 'observing';
     if (pct >= (Number(cfg.win_pct ?? 8))) outcome = 'win';
