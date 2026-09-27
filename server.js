@@ -539,9 +539,12 @@ function cmdStock(arg) {
   const u = db.prepare('SELECT stock, name, code FROM universe WHERE UPPER(stock)=? OR code=? LIMIT 1')
     .get(q.toUpperCase(), q);
   if (!u) return `找不到「${q}」。可以用股票代码(如 MAYBANK)或数字代码(如 1155)。`;
-  const l = db.prepare('SELECT name, price, open, prevClose, volume, avg4w, avg5d FROM live WHERE stock=?').get(u.stock) || {};
-  const m = computeMetrics({ window: '1d' }).find((x) => x.code === u.stock) || {};
+  const l = db.prepare('SELECT name, price, open, prevClose, volume FROM live WHERE stock=?').get(u.stock) || {};
+  const av = getAvgVolumes(u.stock);              // 动态算, 别读那个从没写入过的缓存字段
   const vol0 = computeVolumes(u.stock, '1d');
+  const ratio = vol0 && vol0.previous > 0 ? vol0.current / vol0.previous * 100 : null;
+  const thr = getThresholdForPrice(l.price, loadConfig().price_thresholds);
+  const alerting = ratio != null && thr != null && ratio >= thr;
   const lines = [
     `📌 ${u.name} (${u.stock})`,
     ``,
@@ -550,11 +553,11 @@ function cmdStock(arg) {
   ];
   if (vol0) {
     lines.push(`放量对比  ${vol0.curLabel} ${vol(vol0.current)}  vs  ${vol0.prevLabel} ${vol(vol0.previous)}`);
-    if (m.ratio) lines.push(`倍率      ${m.ratio.toFixed(1)}%  ${m.status === 'alert' ? '⚠️ 达到放量阈值' : ''}`);
+    if (ratio != null) lines.push(`倍率      ${ratio.toFixed(1)}%${thr != null ? `  (阈值 ${thr}%)` : ''}  ${alerting ? '⚠️ 达到放量' : ''}`);
   } else {
     lines.push(`放量对比  数据不足(需要更多日线历史)`);
   }
-  lines.push(`均量      4W ${vol(l.avg4w)}  /  5D ${vol(l.avg5d)}`);
+  lines.push(`均量      4W ${vol(av.avg4w)}  /  5D ${vol(av.avg5d)}`);
   // 形态
   try {
     const p = findDoubleBottom(u.stock, loadConfig());
