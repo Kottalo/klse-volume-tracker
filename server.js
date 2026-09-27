@@ -758,13 +758,32 @@ async function handleTelegramMessage(msg, cfg) {
   const text = (msg.text || '').trim();
   if (!text) return null;
   const chatId = String(msg.chat && msg.chat.id);
-  // 只响应配置的那个群
-  if (String(cfg.telegram_chat_id || '') !== chatId) return null;
-  // 群里必须 @ 机器人 才响应(裸 / 命令也不触发, 免得群里聊天被误伤); 私聊直接响应
-  const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
+  const chatType = (msg.chat && msg.chat.type) || '';
+  const isGroup = chatType === 'group' || chatType === 'supergroup';
   const botName = kvGet('bot_username', '');
   const mentioned = !!botName && text.includes('@' + botName);
-  if (isGroup && !mentioned) return null;
+
+  if (isGroup) {
+    // 群里: 只认配置的那个群, 并且必须 @ 机器人才回应(裸 / 命令也不触发)
+    if (String(cfg.telegram_chat_id || '') !== chatId) return null;
+    if (!mentioned) return null;
+  } else {
+    // 私聊: Telegram 不受 privacy mode 限制, 说什么都收得到, 可以随便聊。
+    // 但只放行群主/管理员 —— 否则任何知道 bot 用户名的人都能私聊它刷你的 API 额度。
+    const uid = msg.from && msg.from.id;
+    if (!uid) return null;
+    if (String(kvGet('tg_owner_id', '')) !== String(uid)) {
+      const m2 = await tgCall(cfg, 'getChatMember', { chat_id: Number(cfg.telegram_chat_id), user_id: uid });
+      const st = m2 && m2.ok && m2.result ? m2.result.status : '';
+      if (!['creator', 'administrator'].includes(st)) {
+        kvSet('tg_denied_id', String(uid));
+        log('私聊被拒(非群管理员): ' + uid);
+        return null;
+      }
+      kvSet('tg_owner_id', String(uid));
+      log('私聊白名单已记录 owner id = ' + uid);
+    }
+  }
   const clean = text.replace(new RegExp('@' + (botName || '') + '\\b', 'g'), '').trim();
   const [cmdRaw, ...rest] = clean.split(/\s+/);
   const cmd = (cmdRaw || '').toLowerCase().replace(/^\//, '');
@@ -1486,6 +1505,8 @@ app.get('/api/tg-diag', async (req, res) => {
     last_error: kvGet('tg_last_error', ''),
     last_msg_at: kvGet('tg_last_msg_at', ''),
     last_msg: kvGet('tg_last_msg_chat', ''),
+    owner_id: kvGet('tg_owner_id', '(未记录, 私聊一次即可绑定)'),
+    denied_id: kvGet('tg_denied_id', ''),
     our_chat_id: cfg.telegram_chat_id,
     error: err,
   });
