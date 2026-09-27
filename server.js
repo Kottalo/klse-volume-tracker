@@ -655,12 +655,11 @@ async function handleTelegramMessage(msg, cfg) {
   const chatId = String(msg.chat && msg.chat.id);
   // 只响应配置的那个群
   if (String(cfg.telegram_chat_id || '') !== chatId) return null;
-  // 群里必须 @ 机器人, 私聊则直接响应
+  // 群里必须 @ 机器人 才响应(裸 / 命令也不触发, 免得群里聊天被误伤); 私聊直接响应
   const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
   const botName = kvGet('bot_username', '');
-  const mentioned = botName && text.includes('@' + botName);
-  const isCmd = text.startsWith('/');
-  if (isGroup && !mentioned && !isCmd) return null;   // 群里闲聊不理会
+  const mentioned = !!botName && text.includes('@' + botName);
+  if (isGroup && !mentioned) return null;
   const clean = text.replace(new RegExp('@' + (botName || '') + '\\b', 'g'), '').trim();
   const [cmdRaw, ...rest] = clean.split(/\s+/);
   const cmd = (cmdRaw || '').toLowerCase().replace(/^\//, '');
@@ -703,6 +702,24 @@ async function pollTelegram() {
     if (!kvGet('bot_username', '')) {
       const me = await tgCall(cfg0, 'getMe', {});
       if (me && me.ok && me.result) kvSet('bot_username', me.result.username || '');
+    }
+    // 注册命令菜单(让群里输入 / 时有提示; Telegram 会自动补成 /cmd@botname)
+    if (!kvGet('cmds_registered', '')) {
+      const cmds = [
+        { command: 'stock', description: '查单只股票(例 /stock MAYBANK)' },
+        { command: 'top', description: '今日达标精选' },
+        { command: 'watch', description: '观察名单及成绩' },
+        { command: 'stats', description: '系统累计战绩' },
+        { command: 'params', description: '查看当前所有参数' },
+        { command: 'set', description: '改参数(例 /set pick_count 2)' },
+        { command: 'scan', description: '手动重新扫描一轮' },
+        { command: 'help', description: '显示帮助' },
+      ];
+      const r0 = await tgCall(cfg0, 'setMyCommands', {
+        commands: cmds,
+        scope: { type: 'chat', chat_id: Number(cfg0.telegram_chat_id) },
+      });
+      if (r0 && r0.ok) kvSet('cmds_registered', '1');
     }
     const cfg = loadConfig();
     let offset = Number(kvGet('tg_offset', 0)) || 0;
