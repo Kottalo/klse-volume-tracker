@@ -1437,12 +1437,27 @@ app.get('/api/tg-diag', async (req, res) => {
     const w = await tgCall(cfg, 'getWebhookInfo', {});
     webhook = w && w.ok ? { url: w.result.url || '(未设置)', pending: w.result.pending_update_count, last_error: w.result.last_error_message || null } : { raw: JSON.stringify(w).slice(0, 200) };
   } catch (e) { err = 'webhook: ' + e; }
+  let chat = null, member = null;
   try {
     const mm = await tgCall(cfg, 'getMe', {});
-    me = mm && mm.ok ? mm.result.username : JSON.stringify(mm).slice(0, 150);
+    me = mm && mm.ok ? mm.result : null;
   } catch (e) { err = (err || '') + ' me: ' + e; }
+  try {
+    const c = await tgCall(cfg, 'getChat', { chat_id: Number(cfg.telegram_chat_id) });
+    chat = c && c.ok ? { id: c.result.id, type: c.result.type, title: c.result.title } : JSON.stringify(c).slice(0, 200);
+  } catch (e) { err = (err || '') + ' chat: ' + e; }
+  try {
+    if (me && me.id) {
+      const m2 = await tgCall(cfg, 'getChatMember', { chat_id: Number(cfg.telegram_chat_id), user_id: me.id });
+      member = m2 && m2.ok ? { status: m2.result.status, can_read_all: me.can_read_all_group_messages } : JSON.stringify(m2).slice(0, 200);
+    }
+  } catch (e) { err = (err || '') + ' member: ' + e; }
   res.json({
-    bot: me,
+    bot: me && me.username ? me.username : me,
+    bot_id: me && me.id ? me.id : null,
+    privacy_mode_off: me ? !me.can_read_all_group_messages : null,
+    chat,
+    member,
     webhook,
     bot_username_saved: kvGet('bot_username', ''),
     offset: kvGet('tg_offset', 0),
