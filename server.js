@@ -634,6 +634,7 @@ function cmdStats() {
 function cmdHelp() {
   return [
     '🤖 KLSE Tracker 指令', '',
+    '/bot <任何话>   直接跟 AI 对话, 例: /bot 你好 或 /bot MAYBANK 值得买吗',
     '/stock <代码>   查单只股票现在的完整情况',
     '/top            今日达标精选',
     '/watch [all]    观察名单及成绩',
@@ -764,9 +765,11 @@ async function handleTelegramMessage(msg, cfg) {
   const mentioned = !!botName && text.includes('@' + botName);
 
   if (isGroup) {
-    // 群里: 只认配置的那个群, 并且必须 @ 机器人才回应(裸 / 命令也不触发)
+    // 群里: 只认配置的那个群。
+    // 响应条件放宽为「以 / 开头的命令」或「@ 了机器人」—— privacy mode 下 Telegram
+    // 本来就只会把这两类消息送过来, 所以直接打 /stats 或 /bot 你好 就行, 不必先 @。
     if (String(cfg.telegram_chat_id || '') !== chatId) return null;
-    if (!mentioned) return null;
+    if (!text.startsWith('/') && !mentioned) return null;
   } else {
     // 私聊: Telegram 不受 privacy mode 限制, 说什么都收得到, 可以随便聊。
     // 但只放行群主/管理员 —— 否则任何知道 bot 用户名的人都能私聊它刷你的 API 额度。
@@ -789,6 +792,12 @@ async function handleTelegramMessage(msg, cfg) {
   const cmd = (cmdRaw || '').toLowerCase().replace(/^\//, '');
   const arg = rest.join(' ');
   try {
+    // /bot 你好吗  → 直接跟 AI 对话(不用记具体命令)
+    if (cmd === 'bot' || cmd === 'ai' || cmd === 'ask') {
+      const q = (arg || '').trim() || '你好';
+      const ai = await handleWithLLM(q, cfg);
+      return ai || '（AI 没有回应——可能是没配 key，或者请求失败了）';
+    }
     if (cmd === 'stock' || cmd === 's') return await cmdStock(arg);
     if (cmd === 'top' || cmd === 'picks') return cmdTop();
     if (cmd === 'watch' || cmd === 'w') return cmdWatch(arg);
