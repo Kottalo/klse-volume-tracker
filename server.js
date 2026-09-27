@@ -1494,6 +1494,72 @@ app.get('/api/tg-raw', async (req, res) => {
   });
 });
 
+// 选股筛选器: 20日涨幅 / 放量倍数 / 站上MA5 / 5-10-15-20均线多头排列
+// 用法: /api/screen?min_gain=15&max_gain=25&vol=2&ma5=1&bull=1
+app.get('/api/screen', (req, res) => {
+  const q = req.query;
+  const minGain = q.min_gain != null && q.min_gain !== '' ? Number(q.min_gain) : 15;
+  const maxGain = q.max_gain != null && q.max_gain !== '' ? Number(q.max_gain) : 25;
+  const volMult = q.vol != null && q.vol !== '' ? Number(q.vol) : 2;
+  const needAboveMa5 = q.ma5 !== '0';
+  const needBull = q.bull !== '0';
+
+  const rows = db.prepare('SELECT stock, date, volume, close FROM daily_vol WHERE close IS NOT NULL AND close > 0 ORDER BY stock, date').all();
+  const by = new Map();
+  for (const r of rows) {
+    let a = by.get(r.stock);
+    if (!a) { a = []; by.set(r.stock, a); }
+    a.push(r);
+  }
+  const liveRows = db.prepare('SELECT stock, price, name, volume FROM live').all();
+  const liveMap = new Map(liveRows.map((x) => [x.stock, x]));
+  const today = mytDate(Date.now() / 1000);
+
+  const hits = [];
+  const stat = { no_hist: 0, no_price: 0, not_gain: 0, not_vol: 0, not_ma5: 0, not_bull: 0, pass: 0 };
+  for (const [stock, arr] of by) {
+    const hist = arr.filter((x) => x.date < today);
+    if (hist.length < 20) { stat.no_hist++; continue; }
+    const L = liveMap.get(stock);
+    const px = L && L.price != null && L.price > 0 ? L.price : null;
+    const tv = L && L.volume != null && L.volume > 0 ? L.volume : null;
+    if (px == null) { stat.no_price++; continue; }
+
+    const closes = hist.map((x) => x.close);
+    const vols = hist.map((x) => x.volume);
+    const seq = closes.concat([px]);              // 含今日现价
+    const n = seq.length;
+    const ma = (k) => seq.slice(n - k).reduce((a, b) => a + b, 0) / k;
+    const ma5 = ma(5), ma10 = ma(10), ma15 = ma(15), ma20 = ma(20);
+
+    const base = seq[n - 21];                      // 20 个交易日前
+    if (!(base > 0)) { stat.no_hist++; continue; }
+    const gain = (px / base - 1) * 100;
+    if (gain < minGain || gain > maxGain) { stat.not_gain++; continue; }
+
+    const prevVol = vols[vols.length - 1];         // 昨日量
+    if (!(prevVol > 0) || tv == null) { stat.not_vol++; continue; }
+    const vr = tv / prevVol;
+    if (vr < volMult) { stat.not_vol++; continue; }
+
+    if (needAboveMa5 && !(px > ma5)) { stat.not_ma5++; continue; }
+    const bull = ma5 > ma10 && ma10 > ma15 && ma15 > ma20;
+    if (needBull && !bull) { stat.not_bull++; continue; }
+
+    stat.pass++;
+    hits.push({
+      stock, name: (L && L.name) || '', close: +px.toFixed(3),
+      gain20: +gain.toFixed(2), vr: +vr.toFixed(2),
+      ma5: +ma5.toFixed(3), ma10: +ma10.toFixed(3), ma15: +ma15.toFixed(3), ma20: +ma20.toFixed(3),
+      above_ma5: px > ma5, bull,
+    });
+  }
+  hits.sort((a, b) => b.gain20 - a.gain20);
+  res.json({ ok: true, date: today, screened: by.size, count: hits.length, funnel: stat,
+    params: { min_gain: minGain, max_gain: maxGain, vol_mult: volMult, above_ma5: needAboveMa5, bullish_stack: needBull },
+    hits });
+});
+
 // Telegram 接收链路诊断: /api/tg-diag
 app.get('/api/tg-diag', async (req, res) => {
   const cfg = loadConfig();
