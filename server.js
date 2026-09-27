@@ -780,7 +780,8 @@ async function handleTelegramMessage(msg, cfg) {
       const st = m2 && m2.ok && m2.result ? m2.result.status : '';
       if (!['creator', 'administrator'].includes(st)) {
         kvSet('tg_denied_id', String(uid));
-        log('私聊被拒(非群管理员): ' + uid);
+        kvSet('tg_denied_reason', 'getChatMember -> status=' + JSON.stringify(st) + ' raw=' + JSON.stringify(m2).slice(0, 200));
+        log('私聊被拒(非群管理员): ' + uid + ' status=' + st);
         return null;
       }
       kvSet('tg_owner_id', String(uid));
@@ -1457,6 +1458,20 @@ app.get('/api/watchlist', (req, res) => {
   res.json({ count: all.length, tally, list: all });
 });
 
+// 查某个用户在群里的身份: /api/tg-member-check?user_id=7014820861
+app.get('/api/tg-member-check', async (req, res) => {
+  const cfg = loadConfig();
+  const uid = Number(req.query.user_id || 0);
+  if (!uid) return res.json({ error: '需要 user_id' });
+  const m2 = await tgCall(cfg, 'getChatMember', { chat_id: Number(cfg.telegram_chat_id), user_id: uid });
+  const admins = await tgCall(cfg, 'getChatAdministrators', { chat_id: Number(cfg.telegram_chat_id) });
+  res.json({
+    user_id: uid,
+    member_raw: m2,
+    admins: admins && admins.ok ? admins.result.map((a) => ({ id: a.user.id, name: a.user.username || a.user.first_name, status: a.status })) : admins,
+  });
+});
+
 // 原始 getUpdates(诊断用): /api/tg-raw?offset=0
 app.get('/api/tg-raw', async (req, res) => {
   const cfg = loadConfig();
@@ -1516,6 +1531,7 @@ app.get('/api/tg-diag', async (req, res) => {
     last_msg: kvGet('tg_last_msg_chat', ''),
     owner_id: kvGet('tg_owner_id', '(未记录, 私聊一次即可绑定)'),
     denied_id: kvGet('tg_denied_id', ''),
+    denied_reason: kvGet('tg_denied_reason', ''),
     our_chat_id: cfg.telegram_chat_id,
     error: err,
   });
