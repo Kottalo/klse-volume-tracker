@@ -138,6 +138,9 @@ try { db.exec('ALTER TABLE universe ADD COLUMN code TEXT'); } catch (e) {}
 try { db.exec('ALTER TABLE live ADD COLUMN avg4w REAL'); } catch (e) {}
 try { db.exec('ALTER TABLE live ADD COLUMN avg5d REAL'); } catch (e) {}
 // 迁移: daily_vol 补 OHLC 列(双底/N字底形态识别需要)
+// 通用键值表(存 telegram offset / bot 用户名等)
+try { db.exec('CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)'); } catch (e) {}
+
 // 观察名单: 精选出来的股票持续跟踪, 用实际表现应证系统判断
 try { db.exec(`CREATE TABLE IF NOT EXISTS watchlist (
   stock TEXT PRIMARY KEY, name TEXT, added_date TEXT, entry_price REAL,
@@ -491,6 +494,234 @@ function fmtNum(n) {
   if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
   return String(n);
+}
+
+
+// ---------------- Telegram 对话层 ----------------
+// 同一个 bot 既推送又收消息: 因为收(getUpdates)和发(sendMessage)都在本进程内, 不会互相抢
+// offset 持久化在 kv 表, 避免重启后重复处理旧消息
+function tgCall(cfg, method, params, timeoutMs = 35000) {
+  const token = (cfg.telegram_bot_token || '').trim();
+  if (!token) return Promise.resolve(null);
+  const url = `https://api.telegram.org/bot${token}/${method}`;
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeoutMs);
+  return fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params || {}),
+    signal: ctl.signal,
+  }).then((r) => r.json()).catch(() => null).finally(() => clearTimeout(t));
+}
+
+function kvGet(k, dflt) {
+  try { const r = db.prepare('SELECT v FROM kv WHERE k=?').get(k); return r ? r.v : dflt; }
+  catch (e) { return dflt; }
+}
+function kvSet(k, v) {
+  try { db.prepare('INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v').run(k, String(v)); }
+  catch (e) {}
+}
+
+function num(n, dp = 3) { return n == null ? '—' : Number(n).toFixed(dp); }
+function vol(n) {
+  if (n == null) return '—';
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(n);
+}
+
+// 单只股票详情
+function cmdStock(arg) {
+  const q = String(arg || '').trim();
+  if (!q) return '用法: /stock MAYBANK   或   /stock 1155';
+  const u = db.prepare('SELECT stock, name, code FROM universe WHERE UPPER(stock)=? OR code=? LIMIT 1')
+    .get(q.toUpperCase(), q);
+  if (!u) return `找不到「${q}」。可以用股票代码(如 MAYBANK)或数字代码(如 1155)。`;
+  const l = db.prepare('SELECT name, price, open, prevClose, volume, avg4w, avg5d FROM live WHERE stock=?').get(u.stock) || {};
+  const m = computeMetrics({ window: '1d' }).find((x) => x.code === u.stock) || {};
+  const vol0 = computeVolumes(u.stock, '1d');
+  const lines = [
+    `📌 ${u.name} (${u.stock})`,
+    ``,
+    `现价      ${num(l.price)}   ${l.open ? `(开盘 ${num(l.open)}, 昨收 ${num(l.prevClose)})` : ''}`,
+    `今日量    ${vol(l.volume)}`,
+  ];
+  if (vol0) {
+    lines.push(`放量对比  ${vol0.curLabel} ${vol(vol0.current)}  vs  ${vol0.prevLabel} ${vol(vol0.previous)}`);
+    if (m.ratio) lines.push(`倍率      ${m.ratio.toFixed(1)}%  ${m.status === 'alert' ? '⚠️ 达到放量阈值' : ''}`);
+  } else {
+    lines.push(`放量对比  数据不足(需要更多日线历史)`);
+  }
+  lines.push(`均量      4W ${vol(l.avg4w)}  /  5D ${vol(l.avg5d)}`);
+  // 形态
+  try {
+    const p = findDoubleBottom(u.stock, loadConfig());
+    if (p) {
+      lines.push(``);
+      lines.push(`🎯 双底形态  评分 ${p.score}/100`);
+      lines.push(`   两底 ${num(p.A.p)} (${p.A.d}) / ${num(p.C.p)} (${p.C.d})`);
+      lines.push(`   颈线 ${num(p.neck)} · 止损 ${num(p.stop)} · 目标 ${num(p.target1)}`);
+    }
+  } catch (e) {}
+  const w = db.prepare('SELECT * FROM watchlist WHERE stock=?').get(u.stock);
+  if (w) lines.push(``, `👀 观察名单: 自 ${w.added_date} 第${w.days}天  状态 ${w.outcome}`);
+  return lines.join('\n');
+}
+
+// 今日精选
+function cmdTop() {
+  const cfg = loadConfig();
+  const picks = pickDailyPicks(cfg, 10);
+  if (!picks.length) return '今天没有新的精选标的（要么已全部在观察名单里，要么没有达标的形态）。';
+  const out = [`🎯 当前达标精选 · ${picks.length} 只`, ''];
+  picks.forEach((p, i) => {
+    const risk = (p.price - p.stop) / p.price * 100;
+    const rew = (p.target1 - p.price) / p.price * 100;
+    out.push(`${i + 1}. ${p.name} (${p.code})  评分 ${p.score}`);
+    out.push(`   现价 ${num(p.price)} · 颈线 ${num(p.neck)} · 止损 ${num(p.stop)} (-${risk.toFixed(1)}%) · 目标 ${num(p.target1)} (+${rew.toFixed(1)}%)`);
+    out.push('');
+  });
+  return out.join('\n');
+}
+
+// 观察名单
+function cmdWatch(arg) {
+  const all = String(arg || '').toLowerCase() === 'all';
+  const rows = all
+    ? db.prepare('SELECT * FROM watchlist ORDER BY outcome, added_date DESC').all()
+    : db.prepare("SELECT * FROM watchlist WHERE outcome='observing' ORDER BY added_date DESC").all();
+  const tally = db.prepare('SELECT outcome, COUNT(*) c FROM watchlist GROUP BY outcome').all();
+  if (!rows.length) return '观察名单是空的。';
+  const mark = { observing: '👀', win: '✅', loss: '❌', expired: '⏱' };
+  const out = [`📈 观察名单${all ? '(全部)' : '(跟踪中)'} · ${rows.length} 只`, ''];
+  for (const w of rows) {
+    const l = db.prepare('SELECT price FROM live WHERE stock=?').get(w.stock) || {};
+    const pct = l.price && w.entry_price ? (l.price - w.entry_price) / w.entry_price * 100 : null;
+    out.push(`${mark[w.outcome] || '•'} ${w.name || w.stock} (${w.stock})  ${pct == null ? '—' : (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%'}  入场 ${num(w.entry_price)}  第${w.days}天`);
+  }
+  const nm = { observing: '跟踪中', win: '应证', loss: '证伪', expired: '到期' };
+  out.push('', '累计: ' + tally.map((x) => `${nm[x.outcome] || x.outcome} ${x.c}`).join(' · '));
+  return out.join('\n');
+}
+
+// 系统战绩
+function cmdStats() {
+  const tally = db.prepare('SELECT outcome, COUNT(*) c FROM watchlist GROUP BY outcome').all();
+  const nm = { observing: '跟踪中', win: '应证', loss: '证伪', expired: '到期' };
+  const t = {};
+  tally.forEach((x) => { t[x.outcome] = x.c; });
+  const decided = (t.win || 0) + (t.loss || 0);
+  const rate = decided ? ((t.win || 0) / decided * 100).toFixed(0) : '—';
+  const u = db.prepare('SELECT COUNT(*) c FROM universe').get().c;
+  const withCode = db.prepare('SELECT COUNT(*) c FROM universe WHERE code IS NOT NULL').get().c;
+  const hist = db.prepare('SELECT COUNT(DISTINCT stock) c FROM daily_vol').get().c;
+  return [
+    `📊 系统战绩`, ``,
+    `应证 ${t.win || 0}  ·  证伪 ${t.loss || 0}  ·  跟踪中 ${t.observing || 0}  ·  到期 ${t.expired || 0}`,
+    `已出结果的胜率: ${rate}${rate === '—' ? '' : '%'}`,
+    ``,
+    `股票池 ${u} 只(已映射 ${withCode})`,
+    `有日线历史 ${hist} 只`,
+  ].join('\n');
+}
+
+function cmdHelp() {
+  return [
+    '🤖 KLSE Tracker 指令', '',
+    '/stock <代码>   查单只股票现在的完整情况',
+    '/top            今日达标精选',
+    '/watch [all]    观察名单及成绩',
+    '/stats          系统累计战绩',
+    '/set <项> <值>  改参数, 例: /set pick_count 2',
+    '/params         查看当前所有参数',
+    '/scan           手动重新扫描一轮',
+    '/help           显示这条帮助',
+  ].join('\n');
+}
+
+function cmdParams() {
+  const cfg = loadConfig();
+  const keys = ['poll_interval_minutes', 'window', 'price_drop_threshold', 'gap_up_threshold',
+    'db_min_score', 'db_min_rr', 'db_fresh', 'pick_count', 'win_pct', 'loss_pct', 'watch_days'];
+  return '⚙️ 当前参数\n\n' + keys.map((k) => `${k} = ${cfg[k] ?? '(默认)'}`).join('\n');
+}
+
+// 处理一条收到的消息
+async function handleTelegramMessage(msg, cfg) {
+  const text = (msg.text || '').trim();
+  if (!text) return null;
+  const chatId = String(msg.chat && msg.chat.id);
+  // 只响应配置的那个群
+  if (String(cfg.telegram_chat_id || '') !== chatId) return null;
+  // 群里必须 @ 机器人, 私聊则直接响应
+  const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
+  const botName = kvGet('bot_username', '');
+  const mentioned = botName && text.includes('@' + botName);
+  const isCmd = text.startsWith('/');
+  if (isGroup && !mentioned && !isCmd) return null;   // 群里闲聊不理会
+  const clean = text.replace(new RegExp('@' + (botName || '') + '\\b', 'g'), '').trim();
+  const [cmdRaw, ...rest] = clean.split(/\s+/);
+  const cmd = (cmdRaw || '').toLowerCase().replace(/^\//, '');
+  const arg = rest.join(' ');
+  try {
+    if (cmd === 'stock' || cmd === 's') return await cmdStock(arg);
+    if (cmd === 'top' || cmd === 'picks') return cmdTop();
+    if (cmd === 'watch' || cmd === 'w') return cmdWatch(arg);
+    if (cmd === 'stats') return cmdStats();
+    if (cmd === 'params') return cmdParams();
+    if (cmd === 'help' || cmd === 'start') return cmdHelp();
+    if (cmd === 'scan') { maybePoll(); return '已触发一轮重新扫描，结果稍后到。'; }
+    if (cmd === 'set') {
+      const [k, v] = arg.split(/\s+/);
+      if (!k || v == null) return '用法: /set <参数名> <值>   例: /set pick_count 2\n用 /params 查看可用参数';
+      const cfg2 = loadConfig();
+      const allowed = Object.keys(cfg2);
+      if (!allowed.includes(k)) return `没有「${k}」这个参数。用 /params 查看可用项。`;
+      const numv = Number(v);
+      cfg2[k] = Number.isFinite(numv) && String(numv) === v ? numv : v;
+      cfg2._loaded = true;
+      saveConfig(cfg2);
+      return `✅ ${k} = ${cfg2[k]}`;
+    }
+    return null;   // 不认识的消息就不回应, 避免群里刷屏
+  } catch (e) {
+    return '处理出错: ' + String(e.message || e).slice(0, 200);
+  }
+}
+
+// getUpdates 长轮询
+let tgPolling = false;
+async function pollTelegram() {
+  if (tgPolling) return;
+  tgPolling = true;
+  try {
+    const cfg0 = loadConfig();
+    if (!(cfg0.telegram_bot_token && cfg0.telegram_chat_id)) return;
+    // 取一次 bot 用户名(用于判断群里是否 @ 了它)
+    if (!kvGet('bot_username', '')) {
+      const me = await tgCall(cfg0, 'getMe', {});
+      if (me && me.ok && me.result) kvSet('bot_username', me.result.username || '');
+    }
+    const cfg = loadConfig();
+    let offset = Number(kvGet('tg_offset', 0)) || 0;
+    const r = await tgCall(cfg, 'getUpdates', { offset, timeout: 25, allowed_updates: ['message'] }, 35000);
+    if (r && r.ok && Array.isArray(r.result)) {
+      for (const upd of r.result) {
+        offset = upd.update_id + 1;
+        if (upd.message) {
+          const reply = await handleTelegramMessage(upd.message, cfg);
+          if (reply) await sendTelegramText(reply, cfg);
+        }
+      }
+      if (r.result.length) kvSet('tg_offset', offset);
+    }
+  } catch (e) {
+    try { log('telegram 轮询异常: ' + e); } catch (_) {}
+  } finally {
+    tgPolling = false;
+  }
 }
 
 // ---------------- 广播队列: 一轮轮询内收集所有信号, 合并成一条发出 ----------------
@@ -991,6 +1222,10 @@ function startPolling() {
     if (isMarketOpen()) maybePoll();  // 内部有节流, 数据陈旧才真抓
     maybeBackfill();                  // 收盘后回填昨日量
   }, 60 * 1000);
+  // Telegram 指令轮询: 独立 5 秒 tick, 内部是 25 秒长轮询(有锁防重入), 所以收消息很跟手
+  // 不受开市时间限制 —— 用户随时都能问
+  setInterval(() => { pollTelegram(); }, 5000);
+  pollTelegram();
 }
 
 // ---------------- SSE ----------------
@@ -1057,6 +1292,28 @@ app.get('/api/watchlist', (req, res) => {
   const all = db.prepare('SELECT * FROM watchlist ORDER BY outcome, added_date DESC').all();
   const tally = db.prepare('SELECT outcome, COUNT(*) c FROM watchlist GROUP BY outcome').all();
   res.json({ count: all.length, tally, list: all });
+});
+
+// 模拟一条 Telegram 消息, 验证指令解析: /api/tg-test?text=/stock+MAYBANK&send=1
+app.get('/api/tg-test', async (req, res) => {
+  const cfg = loadConfig();
+  const text = String(req.query.text || '/help');
+  const fake = { text, chat: { id: Number(cfg.telegram_chat_id), type: 'supergroup' } };
+  let reply = null, err = null;
+  try { reply = await handleTelegramMessage(fake, cfg); } catch (e) { err = String(e); }
+  if (reply && req.query.send === '1') { try { await sendTelegramText(reply, cfg); } catch (e) {} }
+  res.json({ input: text, replied: reply != null, sentToGroup: reply != null && req.query.send === '1', reply, error: err });
+});
+
+// getUpdates offset / bot 用户名等状态: /api/tg-status
+app.get('/api/tg-status', (req, res) => {
+  const cfg = loadConfig();
+  res.json({
+    has_token: !!(cfg.telegram_bot_token || '').trim(),
+    chat_id: cfg.telegram_chat_id || null,
+    bot_username: kvGet('bot_username', ''),
+    offset: kvGet('tg_offset', 0),
+  });
 });
 
 // 清空观察名单重新开始: /api/watchlist/reset
