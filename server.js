@@ -46,6 +46,14 @@ const DEFAULTS = {
   win_pct: 8,         // 观察名单里涨到这个幅度算「应证」
   loss_pct: 5,        // 跌到这个幅度算「证伪」
   watch_days: 15,     // 观察多少天后没动静就归档
+  // ---- 强势筛选(20日涨幅 / 放量 / 站上MA5 / 四线多头排列) ----
+  // 口径: 放量=今日量÷昨日量; 站上MA5=收盘>MA5; 四线=只要 MA5>MA10>MA15>MA20 顺序
+  screen_on: true,        // 是否把筛选结果放进每日广播
+  screen_min_gain: 15,    // 20 交易日涨幅下限 %
+  screen_max_gain: 25,    // 20 交易日涨幅上限 %
+  screen_vol_mult: 2,     // 放量倍数(今日量 ÷ 昨日量)
+  screen_above_ma5: true, // 要求收盘站上 5 日均线
+  screen_bullish: true,   // 要求四线多头排列
   oanor_api_key: '',          // oanor 备份数据源 key(可选)
 };
 
@@ -590,6 +598,35 @@ function cmdTop() {
   return out.join('\n');
 }
 
+// 强势筛选: 20日涨幅 + 放量 + 站上MA5 + 四线多头排列
+// 用法: /screen            用当前参数
+//       /screen 10 30 3    临时改 涨幅下限 上限 放量倍数
+function cmdScreen(arg) {
+  const cfg = loadConfig();
+  const nums = String(arg || '').match(/-?\d+(?:\.\d+)?/g) || [];
+  const opts = {};
+  if (nums.length >= 1) opts.min_gain = Number(nums[0]);
+  if (nums.length >= 2) opts.max_gain = Number(nums[1]);
+  if (nums.length >= 3) opts.vol_mult = Number(nums[2]);
+  const r = runScreen(opts);
+  const head = `📐 强势筛选 · ${r.date}`;
+  const cond = `${r.params.min_gain}~${r.params.max_gain}% (20交易日) · 放量 ${r.params.vol_mult}x · 站上MA5 · 四线多头排列`;
+  if (!r.hits.length) {
+    return [head, `条件: ${cond}`, '',
+      '今天没有完全符合的股票。',
+      `（扫了 ${r.screened} 只：涨幅不符 ${r.funnel.not_gain} · 放量不足 ${r.funnel.not_vol} · 未站上MA5 ${r.funnel.not_ma5} · 非多头排列 ${r.funnel.not_bull}）`,
+    ].join('\n');
+  }
+  const out = [head, `条件: ${cond}`, '', `命中 ${r.hits.length} 只`, ''];
+  for (const h of r.hits.slice(0, 10)) {
+    out.push(`${h.name} (${h.stock})   收 ${num(h.close)}`);
+    out.push(`   20日 +${h.gain20}% · 放量 ${h.vr}x · 四线多头排列`);
+    out.push(`   MA5 ${num(h.ma5)} > MA10 ${num(h.ma10)} > MA15 ${num(h.ma15)} > MA20 ${num(h.ma20)}`);
+    out.push('');
+  }
+  return out.join('\n');
+}
+
 // 观察名单
 function cmdWatch(arg) {
   const all = String(arg || '').toLowerCase() === 'all';
@@ -636,7 +673,8 @@ function cmdHelp() {
     '🤖 KLSE Tracker 指令', '',
     '/bot <任何话>   直接跟 AI 对话, 例: /bot 你好 或 /bot MAYBANK 值得买吗',
     '/stock <代码>   查单只股票现在的完整情况',
-    '/top            今日达标精选',
+    '/screen         强势筛选: 20日涨15-25% + 放量2倍 + 站上MA5 + 四线多头排列',
+    '/top            只看今日精选',
     '/watch [all]    观察名单及成绩',
     '/stats          系统累计战绩',
     '/set <项> <值>  改参数, 例: /set pick_count 2',
@@ -649,7 +687,8 @@ function cmdHelp() {
 function cmdParams() {
   const cfg = loadConfig();
   const keys = ['poll_interval_minutes', 'window', 'price_drop_threshold', 'gap_up_threshold',
-    'db_min_score', 'db_min_rr', 'db_fresh', 'pick_count', 'win_pct', 'loss_pct', 'watch_days'];
+    'db_min_score', 'db_min_rr', 'db_fresh', 'pick_count', 'win_pct', 'loss_pct', 'watch_days',
+    'screen_min_gain', 'screen_max_gain', 'screen_vol_mult'];
   return '⚙️ 当前参数\n\n' + keys.map((k) => `${k} = ${cfg[k] ?? '(默认)'}`).join('\n');
 }
 
@@ -803,6 +842,7 @@ async function handleTelegramMessage(msg, cfg) {
     }
     if (cmd === 'stock' || cmd === 's') return await cmdStock(arg);
     if (cmd === 'top' || cmd === 'picks') return cmdTop();
+    if (cmd === 'screen' || cmd === 'scr') return cmdScreen(arg);
     if (cmd === 'watch' || cmd === 'w') return cmdWatch(arg);
     if (cmd === 'stats') return cmdStats();
     if (cmd === 'params') return cmdParams();
@@ -849,6 +889,7 @@ async function pollTelegram() {
         { command: 'watch', description: '观察名单及成绩' },
         { command: 'stats', description: '系统累计战绩' },
         { command: 'params', description: '查看当前所有参数' },
+        { command: 'screen', description: '强势筛选(20日涨幅+放量+站上MA5+四线多头排列)' },
         { command: 'set', description: '改参数(例 /set pick_count 2)' },
         { command: 'scan', description: '手动重新扫描一轮' },
         { command: 'help', description: '显示帮助' },
@@ -994,7 +1035,23 @@ async function flushBroadcast(cfg) {
     parts.push(`📈 观察名单跟踪\n${lines.join('\n')}\n\n累计战绩: ${t}`);
   }
 
-  // ---- 3) 异动速览: 精简到 3 条, 只当参考 ----
+  // ---- 3) 强势筛选: 20日涨幅 + 放量 + 站上MA5 + 四线多头排列 ----
+  try {
+    const scr = cfg.screen_on === false ? { hits: [] } : runScreen({
+      min_gain: cfg.screen_min_gain, max_gain: cfg.screen_max_gain, vol_mult: cfg.screen_vol_mult,
+      above_ma5: cfg.screen_above_ma5 !== false, bullish_stack: cfg.screen_bullish !== false,
+    });
+    if (scr.hits.length) {
+      const lines = scr.hits.slice(0, 5).map((h, i) => [
+        `${i + 1}. ${h.name} (${h.stock})   收 ${h.close}`,
+        `   20日 +${h.gain20}% · 放量 ${h.vr}x · 四线多头排列`,
+        `   MA5 ${h.ma5} > MA10 ${h.ma10} > MA15 ${h.ma15} > MA20 ${h.ma20}`,
+      ].join('\n'));
+      parts.push(`📐 强势筛选 · ${scr.hits.length} 只\n\n${lines.join('\n\n')}`);
+    }
+  } catch (e) { log('screen 异常: ' + e); }
+
+  // ---- 4) 异动速览: 精简到 3 条, 只当参考 ----
   if (bcastQueue.length) {
     const order = { '🎯': 0, '🟢': 1, '🔴': 2, '📊': 3 };
     bcastQueue.sort((a, b) => (order[a.icon] ?? 9) - (order[b.icon] ?? 9));
@@ -1426,6 +1483,10 @@ function buildState() {
       win_pct: cfg.win_pct ?? 8,
       loss_pct: cfg.loss_pct ?? 5,
       watch_days: cfg.watch_days ?? 15,
+      screen_on: cfg.screen_on !== false,
+      screen_min_gain: cfg.screen_min_gain ?? 15,
+      screen_max_gain: cfg.screen_max_gain ?? 25,
+      screen_vol_mult: cfg.screen_vol_mult ?? 2,
     },
     watchlist: cfg.watchlist,
     whatsapp_recipients: cfg.whatsapp_recipients || [],
@@ -1496,16 +1557,16 @@ app.get('/api/tg-raw', async (req, res) => {
 
 // 选股筛选器: 20日涨幅 / 放量倍数 / 站上MA5 / 5-10-15-20均线多头排列
 // 用法: /api/screen?min_gain=15&max_gain=25&vol=2&ma5=1&bull=1
-app.get('/api/screen', (req, res) => {
-  const q = req.query;
-  const minGain = q.min_gain != null && q.min_gain !== '' ? Number(q.min_gain) : 15;
-  const maxGain = q.max_gain != null && q.max_gain !== '' ? Number(q.max_gain) : 25;
-  const volMult = q.vol != null && q.vol !== '' ? Number(q.vol) : 2;
-  const needAboveMa5 = q.ma5 !== '0';
-  const needBull = q.bull !== '0';
+function runScreen(opts) {
+  const o = opts || {};
+  const minGain = o.min_gain != null ? Number(o.min_gain) : 15;
+  const maxGain = o.max_gain != null ? Number(o.max_gain) : 25;
+  const volMult = o.vol_mult != null ? Number(o.vol_mult) : 2;
+  const needAboveMa5 = o.above_ma5 !== false;
+  const needBull = o.bullish_stack !== false;
   // asof=YYYY-MM-DD 指定参考日(默认今日)。休市日 live.volume 拿不到真实成交量,
   // 用历史交易日回看才能验证「放量」这类依赖当日量的条件。
-  const asof = q.asof ? String(q.asof) : null;
+  const asof = o.asof ? String(o.asof) : null;
 
   const rows = db.prepare('SELECT stock, date, volume, close FROM daily_vol WHERE close IS NOT NULL AND close > 0 ORDER BY stock, date').all();
   const by = new Map();
@@ -1565,9 +1626,19 @@ app.get('/api/screen', (req, res) => {
     });
   }
   hits.sort((a, b) => b.gain20 - a.gain20);
-  res.json({ ok: true, date: asof || today, asof: !!asof, screened: by.size, count: hits.length, funnel: stat,
+  return { date: asof || today, asof: !!asof, screened: by.size, count: hits.length, funnel: stat,
     params: { min_gain: minGain, max_gain: maxGain, vol_mult: volMult, above_ma5: needAboveMa5, bullish_stack: needBull },
-    hits });
+    hits };
+}
+
+// HTTP 入口(薄壳): /api/screen?min_gain=15&max_gain=25&vol=2&ma5=1&bull=1&asof=YYYY-MM-DD
+app.get('/api/screen', (req, res) => {
+  const q = req.query;
+  const num = (v) => (v != null && v !== '' ? Number(v) : undefined);
+  res.json({ ok: true, ...runScreen({
+    min_gain: num(q.min_gain), max_gain: num(q.max_gain), vol_mult: num(q.vol),
+    above_ma5: q.ma5 !== '0', bullish_stack: q.bull !== '0', asof: q.asof || null,
+  }) });
 });
 
 // Telegram 接收链路诊断: /api/tg-diag
