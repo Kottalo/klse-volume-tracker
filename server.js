@@ -778,9 +778,11 @@ async function handleTelegramMessage(msg, cfg) {
     if (String(kvGet('tg_owner_id', '')) !== String(uid)) {
       const m2 = await tgCall(cfg, 'getChatMember', { chat_id: Number(cfg.telegram_chat_id), user_id: uid });
       const st = m2 && m2.ok && m2.result ? m2.result.status : '';
-      if (!['creator', 'administrator'].includes(st)) {
+      // 放行: 群主/管理员/普通成员 —— 只有「知道这个群」的人才可能私聊到 bot,
+      // 仍会挡住完全的外人(不在群里 => 通常 Telegram 查不到身份)
+      if (!['creator', 'administrator', 'member', 'restricted'].includes(st)) {
         kvSet('tg_denied_id', String(uid));
-        kvSet('tg_denied_reason', 'getChatMember -> status=' + JSON.stringify(st) + ' raw=' + JSON.stringify(m2).slice(0, 200));
+        kvSet('tg_denied_reason', '不在群里或身份异常 status=' + JSON.stringify(st));
         log('私聊被拒(非群管理员): ' + uid + ' status=' + st);
         return null;
       }
