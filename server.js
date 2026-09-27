@@ -41,6 +41,7 @@ const DEFAULTS = {
   db_min_neck: 5,     // 颈线相对低点至少高 %
   db_fresh: 2,        // 突破必须发生在最近 N 个交易日内(越小越新鲜、越接近买点)
   db_min_rr: 1.0,     // 最小盈亏比(低于此值不通知, 1.0 = 赚的空间至少是亏的1倍)
+  llm_api_key: '',    // DeepSeek API key(留空则只支持斜杠命令, 不支持自然语言)
   pick_count: 3,      // 每日精选几只(宁少勿多, 别让用户被一堆票淹没)
   win_pct: 8,         // 观察名单里涨到这个幅度算「应证」
   loss_pct: 5,        // 跌到这个幅度算「证伪」
@@ -651,6 +652,107 @@ function cmdParams() {
   return '⚙️ 当前参数\n\n' + keys.map((k) => `${k} = ${cfg[k] ?? '(默认)'}`).join('\n');
 }
 
+
+// ---------------- 自然语言层 (DeepSeek function calling) ----------------
+// 分工: LLM 只负责"听懂人话 + 决定调哪个接口 + 把结果说成人话"
+//       所有数字都由本地计算给出, 不让模型自己编
+const LLM_TOOLS = [
+  { type: 'function', function: { name: 'get_stock', description: '查某只股票当前完整情况(现价/成交量/放量对比/均量/双底形态/观察状态)', parameters: { type: 'object', properties: { query: { type: 'string', description: '股票代码, 字母如 MAYBANK 或数字如 1155' } }, required: ['query'] } } },
+  { type: 'function', function: { name: 'list_picks', description: '今日达标的精选股票列表', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'list_watchlist', description: '观察名单——系统推荐过、正在跟踪的股票及它们的表现', parameters: { type: 'object', properties: { include_archived: { type: 'boolean', description: 'true 时包含已归档(应证/证伪/到期)的记录' } } } } },
+  { type: 'function', function: { name: 'get_stats', description: '系统累计战绩统计(应证/证伪/胜率)', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'get_params', description: '查看当前所有可调参数', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'set_param', description: '修改一个系统参数', parameters: { type: 'object', properties: { name: { type: 'string', description: '参数名, 如 pick_count / db_min_score / poll_interval_minutes' }, value: { type: 'string', description: '新值' } }, required: ['name', 'value'] } } },
+  { type: 'function', function: { name: 'search_stock', description: '不知道代码时, 用公司名/关键词搜索股票', parameters: { type: 'object', properties: { keyword: { type: 'string' } }, required: ['keyword'] } } },
+];
+
+const LLM_SYSTEM = [
+  '你是 KLSE Tracker 助手, 服务对象是马来西亚散户, 数据源是本地股票数据库。',
+  '',
+  '规则:',
+  '1. 需要数据时必须调用工具, 绝对不要凭记忆编造任何数字或价格。',
+  '2. 用简洁中文回答, 适当换行, 不要长篇大论, 不要客套话。',
+  '3. 你只陈述数据与事实, 不做"必涨/稳赚"这类承诺, 也不给仓位建议。',
+  '4. 工具返回的数据就是全部事实, 不要自行推测补充(例如不要编造新闻)。',
+  '5. 如果没有任何工具能回答用户的问题, 就直接说这个系统目前查不了, 不要硬答。',
+  '6. 用户是市场参与者, 直接给结论和数据, 不要说"建议咨询专业人士"这类废话。',
+].join('\n');
+
+function llmKey(cfg) { return (cfg.llm_api_key || '').trim(); }
+
+async function llmChat(key, messages) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 90000);
+  try {
+    const r = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
+      body: JSON.stringify({ model: 'deepseek-flash', messages, tools: LLM_TOOLS, temperature: 0, max_tokens: 800 }),
+      signal: ctl.signal,
+    });
+    const j = await r.json();
+    if (!r.ok) { log('LLM 错误: ' + JSON.stringify(j).slice(0, 300)); return null; }
+    return j;
+  } catch (e) {
+    log('LLM 请求失败: ' + e);
+    return null;
+  } finally { clearTimeout(t); }
+}
+
+function searchStock(keyword) {
+  const k = '%' + String(keyword || '').trim() + '%';
+  const rows = db.prepare('SELECT stock, name FROM universe WHERE name LIKE ? OR UPPER(stock) LIKE ? LIMIT 8').all(k, k.toUpperCase());
+  if (!rows.length) return `没有找到匹配「${keyword}」的股票。`;
+  return '匹配到:\n' + rows.map((r) => `  ${r.stock}  ${r.name}`).join('\n');
+}
+
+function runTool(name, args, cfg) {
+  try {
+    if (name === 'get_stock') return cmdStock(args.query);
+    if (name === 'list_picks') return cmdTop();
+    if (name === 'list_watchlist') return cmdWatch(args.include_archived ? 'all' : '');
+    if (name === 'get_stats') return cmdStats();
+    if (name === 'get_params') return cmdParams();
+    if (name === 'search_stock') return searchStock(args.keyword);
+    if (name === 'set_param') {
+      const c = loadConfig();
+      if (!Object.prototype.hasOwnProperty.call(c, args.name)) {
+        return `没有「${args.name}」这个参数。可用: ${Object.keys(c).filter((x) => !x.startsWith('_') && !x.startsWith('telegram')).join(', ')}`;
+      }
+      const nv = Number(args.value);
+      c[args.name] = Number.isFinite(nv) && String(nv) === String(args.value) ? nv : args.value;
+      c._loaded = true;
+      saveConfig(c);
+      return `已设置 ${args.name} = ${c[args.name]}`;
+    }
+  } catch (e) { return '执行出错: ' + String(e.message || e); }
+  return '未知工具: ' + name;
+}
+
+async function handleWithLLM(text, cfg) {
+  const key = llmKey(cfg);
+  if (!key) return null;
+  const msgs = [{ role: 'system', content: LLM_SYSTEM }, { role: 'user', content: text }];
+  for (let round = 0; round < 4; round++) {
+    const r = await llmChat(key, msgs);
+    if (!r || !r.choices || !r.choices[0]) return null;
+    const msg = r.choices[0].message;
+    msgs.push(msg);
+    const calls = msg.tool_calls || [];
+    if (calls.length) {
+      for (const tc of calls) {
+        let args = {};
+        try { args = JSON.parse(tc.function.arguments || '{}'); } catch (e) {}
+        const out = runTool(tc.function.name, args, cfg);
+        msgs.push({ role: 'tool', tool_call_id: tc.id, content: String(out) });
+      }
+      continue;
+    }
+    return (msg.content || '').trim() || null;
+  }
+  return '这个问题要查的东西太多轮了，换个说法再问一次吧。';
+}
+
 // 处理一条收到的消息
 async function handleTelegramMessage(msg, cfg) {
   const text = (msg.text || '').trim();
@@ -687,7 +789,9 @@ async function handleTelegramMessage(msg, cfg) {
       saveConfig(cfg2);
       return `✅ ${k} = ${cfg2[k]}`;
     }
-    return null;   // 不认识的消息就不回应, 避免群里刷屏
+    // 不是已知命令 -> 交给 LLM 理解人话(前提是配了 key)
+    const ai = await handleWithLLM(clean, cfg);
+    return ai || null;
   } catch (e) {
     return '处理出错: ' + String(e.message || e).slice(0, 200);
   }
@@ -1260,6 +1364,7 @@ function broadcast() {
 
 // ---------------- State ----------------
 function buildState() {
+  // 安全: settings 里永远不含 api key
   const cfg = loadConfig();
   const universeCount = db.prepare('SELECT COUNT(*) c FROM universe').get().c;
   return {
@@ -1276,6 +1381,7 @@ function buildState() {
       db_tol: cfg.db_tol ?? 5,
       db_fresh: cfg.db_fresh ?? 2,
       db_min_rr: cfg.db_min_rr ?? 1.0,
+      llm_ready: !!(cfg.llm_api_key || '').trim(),
       pick_count: cfg.pick_count ?? 3,
       win_pct: cfg.win_pct ?? 8,
       loss_pct: cfg.loss_pct ?? 5,
@@ -1312,6 +1418,30 @@ app.get('/api/watchlist', (req, res) => {
   const all = db.prepare('SELECT * FROM watchlist ORDER BY outcome, added_date DESC').all();
   const tally = db.prepare('SELECT outcome, COUNT(*) c FROM watchlist GROUP BY outcome').all();
   res.json({ count: all.length, tally, list: all });
+});
+
+// 设置/查询 LLM key(只回传是否已配置, 绝不回显 key 本身)
+app.get('/api/llm-key', (req, res) => {
+  const cfg = loadConfig();
+  if (req.query.set) {
+    const c = loadConfig();
+    c.llm_api_key = String(req.query.set).trim();
+    c._loaded = true;
+    saveConfig(c);
+  }
+  const c2 = loadConfig();
+  const k = (c2.llm_api_key || '').trim();
+  res.json({ configured: !!k, hint: k ? k.slice(0, 6) + '...' + k.slice(-4) : null });
+});
+
+// 直接测试自然语言(不经过 telegram): /api/llm-test?q=帮我看看MAYBANK
+app.get('/api/llm-test', async (req, res) => {
+  const cfg = loadConfig();
+  const q = String(req.query.q || '');
+  const t0 = Date.now();
+  let out = null, err = null;
+  try { out = await handleWithLLM(q, cfg); } catch (e) { err = String(e); }
+  res.json({ q, ms: Date.now() - t0, reply: out, error: err });
 });
 
 // 模拟一条 Telegram 消息, 验证指令解析: /api/tg-test?text=/stock+MAYBANK&send=1
