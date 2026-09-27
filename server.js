@@ -1429,6 +1429,26 @@ app.get('/api/watchlist', (req, res) => {
   res.json({ count: all.length, tally, list: all });
 });
 
+// 原始 getUpdates(诊断用): /api/tg-raw?offset=0
+app.get('/api/tg-raw', async (req, res) => {
+  const cfg = loadConfig();
+  const off = Number(req.query.offset || 0);
+  const r0 = await tgCall(cfg, 'getUpdates', { offset: off, timeout: 0, limit: 20 }, 40000);
+  const list = (r0 && r0.result) || [];
+  res.json({
+    ok: r0 && r0.ok,
+    raw_error: r0 && !r0.ok ? r0 : null,
+    count: list.length,
+    updates: list.slice(0, 8).map((u) => ({
+      id: u.update_id,
+      kind: Object.keys(u).filter((k) => k !== 'update_id').join(','),
+      chat: u.message && u.message.chat ? { id: u.message.chat.id, type: u.message.chat.type, title: u.message.chat.title } : null,
+      from: u.message && u.message.from ? u.message.from.username || u.message.from.id : null,
+      text: u.message ? (u.message.text || '').slice(0, 100) : null,
+    })),
+  });
+});
+
 // Telegram 接收链路诊断: /api/tg-diag
 app.get('/api/tg-diag', async (req, res) => {
   const cfg = loadConfig();
