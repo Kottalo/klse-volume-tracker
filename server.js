@@ -830,11 +830,20 @@ async function pollTelegram() {
     }
     const cfg = loadConfig();
     let offset = Number(kvGet('tg_offset', 0)) || 0;
+    kvSet('tg_poll_count', (Number(kvGet('tg_poll_count', 0)) || 0) + 1);
+    kvSet('tg_last_poll_at', mytDate(Date.now() / 1000) + ' ' + new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(11, 19));
     const r = await tgCall(cfg, 'getUpdates', { offset, timeout: 25, allowed_updates: ['message'] }, 35000);
+    if (!r || !r.ok) {
+      kvSet('tg_last_error', JSON.stringify(r).slice(0, 300));
+    } else {
+      kvSet('tg_last_error', '');
+    }
     if (r && r.ok && Array.isArray(r.result)) {
       for (const upd of r.result) {
         offset = upd.update_id + 1;
         if (upd.message) {
+          kvSet('tg_last_msg_at', new Date().toISOString().slice(11, 19));
+          kvSet('tg_last_msg_chat', JSON.stringify({ id: upd.message.chat && upd.message.chat.id, type: upd.message.chat && upd.message.chat.type, text: (upd.message.text || '').slice(0, 120) }));
           const reply = await handleTelegramMessage(upd.message, cfg);
           if (reply) await sendTelegramText(reply, cfg);
         }
@@ -1418,6 +1427,40 @@ app.get('/api/watchlist', (req, res) => {
   const all = db.prepare('SELECT * FROM watchlist ORDER BY outcome, added_date DESC').all();
   const tally = db.prepare('SELECT outcome, COUNT(*) c FROM watchlist GROUP BY outcome').all();
   res.json({ count: all.length, tally, list: all });
+});
+
+// Telegram 接收链路诊断: /api/tg-diag
+app.get('/api/tg-diag', async (req, res) => {
+  const cfg = loadConfig();
+  let webhook = null, me = null, err = null;
+  try {
+    const w = await tgCall(cfg, 'getWebhookInfo', {});
+    webhook = w && w.ok ? { url: w.result.url || '(未设置)', pending: w.result.pending_update_count, last_error: w.result.last_error_message || null } : { raw: JSON.stringify(w).slice(0, 200) };
+  } catch (e) { err = 'webhook: ' + e; }
+  try {
+    const mm = await tgCall(cfg, 'getMe', {});
+    me = mm && mm.ok ? mm.result.username : JSON.stringify(mm).slice(0, 150);
+  } catch (e) { err = (err || '') + ' me: ' + e; }
+  res.json({
+    bot: me,
+    webhook,
+    bot_username_saved: kvGet('bot_username', ''),
+    offset: kvGet('tg_offset', 0),
+    poll_count: kvGet('tg_poll_count', 0),
+    last_poll_at: kvGet('tg_last_poll_at', ''),
+    last_error: kvGet('tg_last_error', ''),
+    last_msg_at: kvGet('tg_last_msg_at', ''),
+    last_msg: kvGet('tg_last_msg_chat', ''),
+    our_chat_id: cfg.telegram_chat_id,
+    error: err,
+  });
+});
+
+// 删掉 webhook(如果之前设过, 它会挡住 getUpdates): /api/tg-del-webhook
+app.get('/api/tg-del-webhook', async (req, res) => {
+  const cfg = loadConfig();
+  const r = await tgCall(cfg, 'deleteWebhook', { drop_pending_updates: false });
+  res.json({ ok: !!(r && r.ok), raw: JSON.stringify(r).slice(0, 200) });
 });
 
 // 设置/查询 LLM key(只回传是否已配置, 绝不回显 key 本身)
