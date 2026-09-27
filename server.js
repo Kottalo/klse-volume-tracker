@@ -1601,7 +1601,8 @@ app.get('/api/watchlist/reset', (req, res) => {
 app.get('/api/broadcast-test', async (req, res) => {
   const cfg = loadConfig();
   // ?force=1 时清掉今日去重记录, 好让信号重新入选(仅用于验证通知样式)
-  if (req.query.force === '1') {
+  // 注意: 只有真发(&send=1)时才允许清, 否则干跑会破坏真实去重记录
+  if (req.query.force === '1' && req.query.send === '1') {
     const d0 = mytDate(Date.now() / 1000);
     for (const t of ['daily_alert', 'price_drop_alert', 'gap_up_alert', 'db_bottom_alert']) {
       try { db.prepare(`DELETE FROM ${t} WHERE date=?`).run(d0); } catch (e) {}
@@ -1614,9 +1615,14 @@ app.get('/api/broadcast-test', async (req, res) => {
     await evaluateDoubleBottom(cfg);
     const summary = bcastQueue.map((x) => `${x.icon} ${x.title}: ${x.count} 只`);
     const queued = bcastQueue.length;
+    // 默认只干跑: 算出会发什么, 但绝不出网。要真发必须显式 &send=1
+    if (req.query.send !== '1') {
+      bcastQueue = [];
+      return res.json({ ok: true, dry_run: true, queued, summary, note: '干跑模式, 什么都没发到群里。真的要发请加 &send=1' });
+    }
     if (queued === 0) return res.json({ ok: true, queued: 0, note: '本轮无新信号(可能已推送过, 被去重)' });
     await flushBroadcast(cfg);
-    res.json({ ok: true, queued, summary });
+    res.json({ ok: true, sent: true, queued, summary });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
