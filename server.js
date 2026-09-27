@@ -1503,6 +1503,9 @@ app.get('/api/screen', (req, res) => {
   const volMult = q.vol != null && q.vol !== '' ? Number(q.vol) : 2;
   const needAboveMa5 = q.ma5 !== '0';
   const needBull = q.bull !== '0';
+  // asof=YYYY-MM-DD 指定参考日(默认今日)。休市日 live.volume 拿不到真实成交量,
+  // 用历史交易日回看才能验证「放量」这类依赖当日量的条件。
+  const asof = q.asof ? String(q.asof) : null;
 
   const rows = db.prepare('SELECT stock, date, volume, close FROM daily_vol WHERE close IS NOT NULL AND close > 0 ORDER BY stock, date').all();
   const by = new Map();
@@ -1521,8 +1524,15 @@ app.get('/api/screen', (req, res) => {
     const hist = arr.filter((x) => x.date < today);
     if (hist.length < 20) { stat.no_hist++; continue; }
     const L = liveMap.get(stock);
-    const px = L && L.price != null && L.price > 0 ? L.price : null;
-    const tv = L && L.volume != null && L.volume > 0 ? L.volume : null;
+    let px, tv;
+    if (asof) {
+      const row = arr.find((x) => x.date === asof);   // 历史参考日: 用当天收盘/成交量
+      if (!row) { stat.no_price++; continue; }
+      px = row.close; tv = row.volume;
+    } else {
+      px = L && L.price != null && L.price > 0 ? L.price : null;
+      tv = L && L.volume != null && L.volume > 0 ? L.volume : null;
+    }
     if (px == null) { stat.no_price++; continue; }
 
     const closes = hist.map((x) => x.close);
@@ -1555,7 +1565,7 @@ app.get('/api/screen', (req, res) => {
     });
   }
   hits.sort((a, b) => b.gain20 - a.gain20);
-  res.json({ ok: true, date: today, screened: by.size, count: hits.length, funnel: stat,
+  res.json({ ok: true, date: asof || today, asof: !!asof, screened: by.size, count: hits.length, funnel: stat,
     params: { min_gain: minGain, max_gain: maxGain, vol_mult: volMult, above_ma5: needAboveMa5, bullish_stack: needBull },
     hits });
 });
