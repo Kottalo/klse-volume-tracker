@@ -1,16 +1,20 @@
 {
   "name": "klse-volume-tracker",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "description": "马来西亚股票(KLSE)成交量异动追踪 — React + Express + SSE",
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=24.0.0"
   },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test",
+    "preview:fixture": "node scripts/preview-fixture.js",
+    "format": "prettier --write server.js lib src tests scripts README.md package.json index.html .prettierrc.json .github/workflows/check.yml render.yaml",
+    "format:check": "prettier --check server.js lib src tests scripts README.md package.json index.html .prettierrc.json .github/workflows/check.yml render.yaml"
   },
   "dependencies": {
     "dotenv": "^17.4.2",
@@ -20,6 +24,7 @@
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.4.1",
+    "prettier": "^3.9.9",
     "vite": "^6.3.5"
   }
 }

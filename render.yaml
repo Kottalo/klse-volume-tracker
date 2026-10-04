@@ -2,17 +2,19 @@ services:
   - type: web
     name: klse-volume-tracker
     runtime: node
-    buildCommand: npm install && npm run build
+    buildCommand: npm ci && npm test && npm run build
     startCommand: node server.js
     healthCheckPath: /healthz
     envVars:
       - key: NODE_VERSION
-        value: "24"
+        value: '24'
       - key: DATA_DIR
         value: /var/data
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: ADMIN_TOKEN
         sync: false
     disk:
       name: data
