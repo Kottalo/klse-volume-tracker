@@ -351,7 +351,7 @@ export default function App() {
                         label="放量蓄势候选"
                         value={number(insights?.confirmed || 0, 0)}
                         unit="只"
-                        note={`${insights?.coiled || 0} 只尚未突破 · ${insights?.breakout || 0} 只初步突破`}
+                        note={`全市场：${insights?.coiled || 0} 只尚未突破 · ${insights?.breakout || 0} 只初步突破`}
                         accent
                       />
                       <Stat
@@ -735,8 +735,12 @@ function SetupPanel({ report, compact = false }) {
       )}
       {!compact && (
         <p>
-          当前离整理上沿 {percent(setup.distance_to_breakout_pct)}。跌破 {price(setup.support)}{' '}
-          时，蓄势依据失效。放量本身不能确定买卖方向。
+          {setup.distance_to_breakout_pct > 0
+            ? `距离整理上沿还需上涨约 ${number(setup.distance_to_breakout_pct)}%。`
+            : setup.distance_to_breakout_pct < 0
+              ? `现价已高于整理上沿，回到该位置需回落约 ${number(Math.abs(setup.distance_to_breakout_pct))}%。`
+              : '现价位于整理上沿，继续关注能否突破并守住。'}
+          跌破 {price(setup.support)} 时，蓄势依据失效。放量本身不能确定买卖方向。
         </p>
       )}
     </section>
