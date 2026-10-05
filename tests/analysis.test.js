@@ -7,6 +7,7 @@ import {
   explainStock,
   formatReport,
   sessionStart,
+  volumeSignal,
 } from '../lib/analysis.js';
 import { validateSettings, ValidationError } from '../lib/settings.js';
 
@@ -23,18 +24,18 @@ const cfg = {
 const history = Array.from({ length: 25 }, (_, i) => ({
   date: new Date(Date.parse('2026-09-07') + i * 86400000).toISOString().slice(0, 10),
   close: 10 + i / 10,
-  volume: 100,
+  volume: 500000,
   high: 11 + i / 10,
   low: 9 + i / 10,
 }));
 
 test('historical calculations use only bars before the reference day', () => {
   const reference = history[22].date;
-  const before = trendMetrics(history, history[22].close, 200, reference);
+  const before = trendMetrics(history, history[22].close, 1000000, reference);
   const laterChanged = history.map((row) =>
     row.date >= reference ? { ...row, close: row.close * 10, volume: 30000 } : row,
   );
-  assert.deepEqual(trendMetrics(laterChanged, history[22].close, 200, reference), before);
+  assert.deepEqual(trendMetrics(laterChanged, history[22].close, 1000000, reference), before);
   assert.equal(before.vr, 2);
   assert.equal(before.previous_date, history[21].date);
   assert.equal(before.gain20, (history[22].close / history[2].close - 1) * 100);
@@ -101,7 +102,7 @@ test('reports explain measured evidence without converting it into a winning pro
       name: 'Test',
       price: 13,
       prevClose: 12,
-      volume: 200,
+      volume: 1000000,
       session_date: '2026-10-05',
       mtime: now,
     },
@@ -175,6 +176,8 @@ test('settings reject nonfinite values, malformed ranges and member credential c
     { llm_api_key: 'secret' },
     { market_holidays: ['2026-02-30'] },
     { price_thresholds: [{ max: 2, threshold: 200 }] },
+    { screen_min_volume: 999999 },
+    { screen_vol_mult: 1.9 },
   ])
     assert.throws(() => validateSettings(patch, defaults), ValidationError);
   assert.equal(validateSettings({ screen_on: false }, defaults).screen_on, false);
@@ -186,7 +189,7 @@ test('settings reject nonfinite values, malformed ranges and member credential c
 
 test('a recent closed-session report uses the completed daily bar rather than an old intraday quote', () => {
   const closedNow = Date.parse('2026-10-03T12:00:00+08:00') / 1000;
-  const rows = [...history, { date: '2026-10-02', close: 13, volume: 200 }];
+  const rows = [...history, { date: '2026-10-02', close: 13, volume: 1000000 }];
   const report = explainStock({
     stock: {
       stock: 'TEST',
@@ -203,18 +206,94 @@ test('a recent closed-session report uses the completed daily bar rather than an
   assert.equal(report.snapshot, true);
   assert.equal(report.price, 13);
   assert.equal(report.metrics.vr, 2);
+  assert.equal(report.volume_signal.current, 1000000);
+  assert.equal(report.volume_signal.previous, 500000);
   assert.match(report.sources.quotes, /完成交易日快照/);
 });
 
-test('low turnover or no current trades cannot be promoted into the shortlist', () => {
-  const stock = { stock: 'TEST', price: 13, volume: 200, session_date: '2026-10-05', mtime: now };
+test('low turnover cannot be promoted even with million-share double volume', () => {
+  const stock = {
+    stock: 'TEST',
+    price: 0.065,
+    volume: 1000000,
+    session_date: '2026-10-05',
+    mtime: now,
+  };
   const report = explainStock({
     stock,
-    rows: history,
+    rows: history.map((r) => ({ ...r, close: r.close / 200 })),
     pattern: null,
     cfg: { ...cfg, min_average_daily_value: 200000 },
     now,
   });
   assert.equal(report.stage, 'watch');
   assert.match(report.label, /成交/);
+});
+
+test('million-share and double-volume gates both apply inclusively, even with a valid pattern', () => {
+  const pattern = {
+    neck: 12.9,
+    stop: 12.5,
+    target1: 15,
+    score: 95,
+    breakDate: '2026-10-01',
+    vr: 3,
+    gap: 20,
+  };
+  for (const [current, previous, pass] of [
+    [1000000, 500000, true],
+    [999999, 400000, false],
+    [1000000, 500001, false],
+    [2000000, 0, false],
+  ]) {
+    const rows = history.map((r) => ({ ...r, volume: previous }));
+    const report = explainStock({
+      stock: {
+        stock: 'TEST',
+        price: 13,
+        prevClose: 12,
+        volume: current,
+        session_date: '2026-10-05',
+        mtime: now,
+      },
+      rows,
+      pattern,
+      cfg,
+      now,
+    });
+    assert.equal(report.volume_signal.pass, pass);
+    assert.equal(report.stage === 'confirmed', pass);
+    assert.equal(report.volume_signal.current, current);
+  }
+  assert.equal(volumeSignal(999999, 400000, { minVolume: 0, minMultiple: 0 }).pass, false);
+  assert.equal(volumeSignal(1000000, 500001).pass, false);
+  assert.equal(volumeSignal(0, 500000).shortfall, 1000000);
+  assert.equal(volumeSignal(2000000, 0).multiple, null);
+});
+
+test('early volume expansion can qualify before 15 percent gain, while falling prices do not', () => {
+  const rows = history.map((r, i) => ({ ...r, close: 12 + i * 0.01 }));
+  const stock = {
+    stock: 'EARLY',
+    price: 12.3,
+    prevClose: 12.24,
+    volume: 1200000,
+    session_date: '2026-10-05',
+    mtime: now,
+  };
+  const report = explainStock({ stock, rows, pattern: null, cfg, now });
+  assert.ok(report.metrics.gain20 < 15);
+  assert.equal(report.screen_pass, false);
+  assert.equal(report.stage, 'confirmed');
+  assert.match(report.conclusion, /1,200,000 股/);
+  const down = explainStock({
+    stock: { ...stock, price: 12, prevClose: 12.24 },
+    rows,
+    pattern: null,
+    cfg,
+    now,
+  });
+  assert.equal(down.volume_signal.pass, true);
+  assert.equal(down.stage, 'watch');
+  assert.match(down.label, /量价/);
 });

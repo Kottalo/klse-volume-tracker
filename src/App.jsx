@@ -7,13 +7,11 @@ const price = (v) => (v == null ? '—' : `RM ${number(v, 3)}`);
 const volume = (v) =>
   v == null
     ? '—'
-    : v >= 1e9
-      ? `${number(v / 1e9)}B`
-      : v >= 1e6
-        ? `${number(v / 1e6)}M`
-        : v >= 1e3
-          ? `${number(v / 1e3)}K`
-          : number(v, 0);
+    : v >= 1e8
+      ? `${number(v / 1e8)} 亿股`
+      : v >= 1e4
+        ? `${number(v / 1e4)} 万股`
+        : `${number(v, 0)} 股`;
 const percent = (v) => (v == null ? '—' : `${v > 0 ? '+' : ''}${number(v)}%`);
 const time = (v) =>
   v
@@ -212,14 +210,14 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
   const titles = {
-    overview: '全市场里，优先考虑这几只。',
+    overview: '成交量明显放大，优先看这几只。',
     market: '从全市场找到你的关注。',
     watch: '关注之后，继续核对。',
     alerts: '市场有变化，依据要更新。',
     method: '每个信号，都有它的边界。',
   };
   const subtitles = {
-    overview: '系统已经完成解读：先看当前结论，再看参与价位、支持依据与失效条件。',
+    overview: '扫描全市场，精选百万股以上、至少昨日两倍成交量，并有价格转强支持的少数股票。',
     market: '搜索公司或代码，点开股票查看分析依据。',
     watch: '你的关注保存在当前浏览器；系统观察记录用于跟踪规则表现。',
     alerts: '异动是研究的起点。价格变化本身不等于买入理由。',
@@ -344,10 +342,10 @@ export default function App() {
                         note="当前已取得的股票池"
                       />
                       <Stat
-                        label="分析资料齐全"
-                        value={number(insights?.covered || 0, 0)}
+                        label="明显放量"
+                        value={number(insights?.volume_qualified || 0, 0)}
                         unit="只"
-                        note="至少20个交易日历史"
+                        note="百万股以上，且至少昨日两倍"
                       />
                       <Stat
                         label="可重点考虑"
@@ -366,8 +364,8 @@ export default function App() {
                     <section className="opportunities">
                       <div className="section-heading">
                         <div>
-                          <h2>潜力精选</h2>
-                          <p>{`扫描全市场后，只给出最值得考虑的 ${insights?.limit || 3} 只。入选不足时不凑数。`}</p>
+                          <h2>放量潜力精选</h2>
+                          <p>{`按放量倍数优先排序，最多 ${insights?.limit || 3} 只。量价不配合的股票不入选，入选不足不凑数。`}</p>
                         </div>
                         <div className="tabs" aria-label="候选筛选">
                           {[['all', '优先考虑']].map(([id, label]) => (
@@ -380,6 +378,16 @@ export default function App() {
                             </button>
                           ))}
                         </div>
+                      </div>
+                      <div className="volume-criteria" aria-label="成交量入选条件">
+                        <span>每只精选必须同时满足</span>
+                        <strong>
+                          本次成交量 ≥ {volume(state.settings.screen_min_volume ?? 1000000)}
+                        </strong>
+                        <strong>
+                          至少上一交易日全天的 {number(state.settings.screen_vol_mult ?? 2)} 倍
+                        </strong>
+                        <span>成交量以股数计；盘中使用累计成交量</span>
                       </div>
                       {candidates.length ? (
                         <div className="card-grid">
@@ -399,7 +407,7 @@ export default function App() {
                           text={
                             state.status.backfilling
                               ? '正在补齐历史资料，完成后会自动重新分析。'
-                              : '市场不需要每天都有机会。可以切换筛选，或查看全市场。'
+                              : '尚无股票同时满足百万股、两倍放量及价格转强条件。继续扫描，不用较弱信号凑数。'
                           }
                           action={() => navigate('market')}
                           actionLabel="查看全市场"
@@ -553,6 +561,7 @@ function Opportunity({ report: r, favorite, toggle, open }) {
           {percent(r.change_pct)} <small>较昨收</small>
         </span>
       </div>
+      <VolumePanel report={r} compact />
       <p className="conclusion">{r.conclusion}</p>
       <div className="entry-summary">
         <span>参与参考</span>
@@ -584,6 +593,82 @@ function Opportunity({ report: r, favorite, toggle, open }) {
         </button>
       </div>
     </article>
+  );
+}
+
+function VolumePanel({ report, compact = false }) {
+  const signal = report.volume_signal;
+  if (!signal) return <div className="volume-panel">正在等待成交量对比资料。</div>;
+  const barMaximum = Math.max(signal.current || 0, signal.previous || 0, 1);
+  const bars = [
+    [signal.current_label, signal.current, 'current'],
+    ['上一交易日全天', signal.previous, 'previous'],
+  ];
+  return (
+    <section className={`volume-panel ${compact ? 'compact' : ''}`} aria-label="成交量解读">
+      <div className="volume-panel-heading">
+        <h3>成交量重点</h3>
+        <span className={signal.pass ? 'volume-pass' : 'volume-wait'}>
+          {signal.pass ? '放量已达标' : '放量待确认'}
+        </span>
+      </div>
+      <div className="volume-numbers">
+        <div>
+          <span>{signal.current_label}</span>
+          <strong>{volume(signal.current)}</strong>
+          <small>{signal.current_date || '资料待补齐'}</small>
+        </div>
+        <div>
+          <span>上一交易日全天</span>
+          <strong>{volume(signal.previous)}</strong>
+          <small>{signal.previous_date || '资料待补齐'}</small>
+        </div>
+        <div className="volume-multiple">
+          <span>达到昨日的</span>
+          <strong>
+            {signal.multiple == null ? '—' : number(signal.multiple, 4)}
+            <small>倍</small>
+          </strong>
+          <small>
+            {signal.increase_pct == null
+              ? '无法比较'
+              : `较昨日${signal.increase_pct >= 0 ? '增加' : '减少'} ${number(Math.abs(signal.increase_pct))}%`}
+          </small>
+        </div>
+      </div>
+      {!compact && (
+        <div className="volume-comparison" aria-label="本次与昨日成交量对比">
+          {bars.map(([label, value, type]) => (
+            <div className="volume-bar-row" key={type}>
+              <span>{label}</span>
+              <div className="volume-bar-track">
+                <i className={type} style={{ width: `${((value || 0) / barMaximum) * 100}%` }} />
+              </div>
+              <strong>{value == null ? '—' : `${number(value, 0)} 股`}</strong>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="volume-gates">
+        <span className={signal.amount_pass ? 'passed' : ''}>
+          {signal.amount_pass ? '✓' : '○'} 至少 {volume(signal.minimum_volume)}
+        </span>
+        <span className={signal.multiple_pass ? 'passed' : ''}>
+          {signal.multiple_pass ? '✓' : '○'} 至少昨日 {number(signal.minimum_multiple)} 倍
+        </span>
+      </div>
+      <p className="volume-reading">{signal.interpretation}</p>
+      {signal.shortfall > 0 && (
+        <p className="volume-shortfall">
+          距两个门槛同时达标，还差至少 {volume(signal.shortfall)}。
+        </p>
+      )}
+      <p className="volume-timing">
+        {signal.unfinished
+          ? '盘中累计量，对比上一交易日全天；今日尚未收盘。'
+          : `按 ${signal.current_date || '所示日期'} 成交量对比；不代表当前盘中成交。`}
+      </p>
+    </section>
   );
 }
 
@@ -858,15 +943,22 @@ function StockDetail({ code, close, favorite, toggle }) {
     let active = true;
     setReport(null);
     setError('');
-    request(`/api/stocks/${encodeURIComponent(code)}`)
-      .then((v) => {
-        if (active) setReport(v);
-      })
-      .catch((e) => {
-        if (active) setError(e.message);
-      });
+    const load = () =>
+      request(`/api/stocks/${encodeURIComponent(code)}`)
+        .then((v) => {
+          if (active) {
+            setReport(v);
+            setError('');
+          }
+        })
+        .catch((e) => {
+          if (active) setError(e.message);
+        });
+    load();
+    const timer = setInterval(load, 60000);
     return () => {
       active = false;
+      clearInterval(timer);
     };
   }, [code, attempt]);
   const r = report;
@@ -898,6 +990,7 @@ function StockDetail({ code, close, favorite, toggle }) {
               {favorite ? '已关注' : '加入关注'}
             </button>
           </div>
+          <VolumePanel report={r} />
           <div className={`verdict ${r.stage}`}>
             <Status report={r} />
             {r.snapshot && (
@@ -1119,8 +1212,8 @@ function Method() {
     ],
     [
       '02',
-      '成交量：这次上涨有多少成交支持',
-      '用本次累计成交量除以上一交易日全天量。2倍表示成交更活跃。盘中与全天长度不同，不能把盘中不足2倍直接理解为弱势；大成交量也可能伴随卖出。',
+      '成交量：百万股与两倍放量',
+      '所有精选都需本次成交量至少100万股，且至少上一交易日全天的2倍，并有价格高于昨收和5日均价的支持。盘中以累计量对比昨日全天，不做全天成交量外推。放量而价格走弱时等待量价配合。',
     ],
     [
       '03',
@@ -1156,11 +1249,13 @@ function Method() {
         <dl className="glossary">
           <div>
             <dt>可重点考虑</dt>
-            <dd>满足设置的趋势与量能筛选，或近期形态条件。仍需核对价格、财报和公告。</dd>
+            <dd>
+              百万股与两倍放量同时达标，价格也转强，资料与成交活跃度符合要求。仍需核对价格、财报和公告。
+            </dd>
           </div>
           <div>
-            <dt>等待确认</dt>
-            <dd>部分依据满足，其他依据尚未确认。适合跟踪变化。</dd>
+            <dt>等待放量 / 等待量价配合</dt>
+            <dd>成交量尚未同时达标，或成交量放大但价格没有转强。暂不列入精选。</dd>
           </div>
           <div>
             <dt>等待回踩</dt>
@@ -1199,10 +1294,11 @@ function AdminSettings({ state, close, updated }) {
   const fields = [
     ['pick_count', '最多精选几只', 1, 5],
     ['min_average_daily_value', '20日平均成交额下限（RM，估算）', 0, 1000000000],
+    ['screen_min_volume', '精选成交量下限（股，至少100万）', 1000000, 1000000000000],
     ['poll_interval_minutes', '更新间隔（分钟）', 1, 60],
     ['screen_min_gain', '20日涨幅下限（%）', -100, 1000],
     ['screen_max_gain', '20日涨幅上限（%）', -100, 1000],
-    ['screen_vol_mult', '累计量 / 昨日量倍数', 0.1, 100],
+    ['screen_vol_mult', '本次 / 上一交易日全天量（至少2倍）', 2, 100],
     ['db_min_score', '形态评分门槛', 0, 100],
     ['db_min_rr', '最小目标 / 风险空间比', 0.1, 20],
   ];

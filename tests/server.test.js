@@ -100,7 +100,7 @@ test('screen asof is invariant to changes in later bars', () => {
     insert.run(
       'TEST',
       new Date(Date.parse('2026-08-01') + i * 86400000).toISOString().slice(0, 10),
-      100,
+      i === 22 ? 1200000 : 500000,
       10 + i,
     );
   const opts = {
@@ -218,8 +218,8 @@ function seedTrendMarket(count = 5) {
   const insert = db.prepare('INSERT INTO daily_vol(stock,date,volume,close) VALUES(?,?,?,?)');
   for (let i = 0; i < count; i++) {
     const code = 'STRONG' + i;
-    quote(code, 10 * Math.pow(1.01, 25), 100000 * (i + 2));
-    dates.forEach((date, index) => insert.run(code, date, 100000, 10 * Math.pow(1.01, index)));
+    quote(code, 10 * Math.pow(1.01, 25), 500000 * (i + 2));
+    dates.forEach((date, index) => insert.run(code, date, 500000, 10 * Math.pow(1.01, index)));
   }
 }
 
@@ -235,6 +235,11 @@ test('the whole universe is analyzed but only the strongest few are returned, wi
   assert.equal(state.insights.candidates.length, 3);
   assert.ok(state.insights.candidates.every((report) => report.stage === 'confirmed'));
   assert.equal(state.insights.candidates[0].code, 'STRONG4');
+  assert.ok(
+    state.insights.candidates.every(
+      (r) => r.volume_signal.current >= 1000000 && r.volume_signal.multiple >= 2,
+    ),
+  );
   updateWatchlist(DEFAULTS);
   assert.deepEqual(
     db

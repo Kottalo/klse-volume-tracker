@@ -1,6 +1,6 @@
 {
   "name": "klse-volume-tracker",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "description": "马来西亚股票(KLSE)成交量异动追踪 — React + Express + SSE",

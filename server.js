@@ -30,7 +30,7 @@ const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 const DB_PATH = path.join(DATA_DIR, 'data.db');
 const DIST = path.join(__dirname, 'dist');
 const PORT = process.env.PORT || 8080;
-const VERSION = 'v2.0-analysis';
+const VERSION = 'v2.1-volume';
 let analysisCache = null;
 
 const DEFAULTS = {
@@ -70,6 +70,7 @@ const DEFAULTS = {
   screen_min_gain: 15, // 20 交易日涨幅下限 %
   screen_max_gain: 25, // 20 交易日涨幅上限 %
   screen_vol_mult: 2, // 放量倍数(今日量 ÷ 昨日量)
+  screen_min_volume: 1000000, // 精选成交量至少100万股
   screen_above_ma5: true, // 要求收盘站上 5 日均线
   screen_bullish: true, // 要求四线多头排列
   oanor_api_key: '', // oanor 备份数据源 key(可选)
@@ -849,6 +850,7 @@ function cmdScreen(arg) {
     min_gain: cfg.screen_min_gain,
     max_gain: cfg.screen_max_gain,
     vol_mult: cfg.screen_vol_mult,
+    min_volume: cfg.screen_min_volume,
     above_ma5: cfg.screen_above_ma5,
     bullish_stack: cfg.screen_bullish,
   };
@@ -857,7 +859,7 @@ function cmdScreen(arg) {
   if (nums.length >= 3) opts.vol_mult = Number(nums[2]);
   const r = runScreen(opts);
   const head = `📐 强势筛选 · ${r.date}`;
-  const cond = `${r.params.min_gain}~${r.params.max_gain}% (20交易日) · 放量 ${r.params.vol_mult}x · 站上MA5 · 四线多头排列`;
+  const cond = `成交至少 ${r.params.min_volume.toLocaleString('zh-CN')} 股、至少昨日 ${r.params.vol_mult} 倍 · ${r.params.min_gain}~${r.params.max_gain}% (20交易日) · 站上MA5 · 四线多头排列`;
   if (!r.hits.length) {
     return [
       head,
@@ -871,6 +873,9 @@ function cmdScreen(arg) {
   for (const h of r.hits.slice(0, 10)) {
     out.push(`${h.name} (${h.stock})   收 ${num(h.close)}`);
     out.push(`   20日 +${h.gain20}% · 放量 ${h.vr}x · 四线多头排列`);
+    out.push(
+      `   本次 ${h.current_volume.toLocaleString('zh-CN')} 股 / ${h.previous_date} 全天 ${h.previous_volume.toLocaleString('zh-CN')} 股`,
+    );
     out.push(
       `   MA5 ${num(h.ma5)} > MA10 ${num(h.ma10)} > MA15 ${num(h.ma15)} > MA20 ${num(h.ma20)}`,
     );
@@ -958,6 +963,7 @@ function cmdParams() {
     'screen_min_gain',
     'screen_max_gain',
     'screen_vol_mult',
+    'screen_min_volume',
   ];
   return '⚙️ 当前参数\n\n' + keys.map((k) => `${k} = ${cfg[k] ?? '(默认)'}`).join('\n');
 }
@@ -2096,7 +2102,6 @@ function getStockReport(query, cfg = loadConfig()) {
     ...explainStock({ stock: live, rows, pattern, cfg }),
     numeric_code: live.numeric_code,
     history: rows.slice(-90),
-    volume: live.volume,
   };
 }
 
@@ -2129,6 +2134,7 @@ function getAnalysisOverview(cfg) {
     .filter((r) => r.stage === 'confirmed')
     .sort(
       (a, b) =>
+        (b.volume_signal.multiple || 0) - (a.volume_signal.multiple || 0) ||
         b.evidence_count - a.evidence_count ||
         (b.pattern?.score || 0) - (a.pattern?.score || 0) ||
         (b.levels?.rr || 0) - (a.levels?.rr || 0) ||
@@ -2139,6 +2145,9 @@ function getAnalysisOverview(cfg) {
     candidates: candidates.slice(0, limit),
     limit,
     confirmed: candidates.length,
+    volume_qualified: reports.filter(
+      (r) => r.volume_signal.pass && !['stale', 'insufficient'].includes(r.stage),
+    ).length,
     scanned: reports.length,
     snapshot_date:
       reports
@@ -2148,7 +2157,7 @@ function getAnalysisOverview(cfg) {
         .at(-1) || null,
     historical: reports.filter((r) => r.stage === 'stale').length,
     covered: reports.filter((r) => !!r.metrics).length,
-    rule: '趋势、成交量与近期形态分别检查；依据满足数不是上涨概率。',
+    rule: '所有精选必须成交量至少100万股且至少昨日2倍，并有价格转强支持；按放量倍数优先排序。',
   };
   analysisCache = { ts: Date.now(), data };
   return data;
@@ -2198,7 +2207,8 @@ function buildState() {
       screen_on: cfg.screen_on !== false,
       screen_min_gain: cfg.screen_min_gain ?? 15,
       screen_max_gain: cfg.screen_max_gain ?? 25,
-      screen_vol_mult: cfg.screen_vol_mult ?? 2,
+      screen_vol_mult: Math.max(2, cfg.screen_vol_mult ?? 2),
+      screen_min_volume: Math.max(1000000, cfg.screen_min_volume ?? 1000000),
     },
     watchlist: cfg.watchlist,
     price_thresholds: cfg.price_thresholds || [],
@@ -2325,8 +2335,9 @@ app.get('/api/tg-raw', async (req, res) => {
 function runScreen(opts = {}) {
   const minGain = opts.min_gain ?? 15,
     maxGain = opts.max_gain ?? 25,
-    volMult = opts.vol_mult ?? 2;
-  if (![minGain, maxGain, volMult].every(Number.isFinite) || minGain > maxGain || volMult < 0)
+    volMult = Math.max(2, opts.vol_mult ?? 2),
+    minVolume = Math.max(1000000, opts.min_volume ?? 1000000);
+  if (![minGain, maxGain, volMult, minVolume].every(Number.isFinite) || minGain > maxGain)
     throw new ValidationError('筛选参数需要有效数值，涨幅下限不能高于上限。');
   const asof = opts.asof ? String(opts.asof) : null;
   if (
@@ -2372,7 +2383,7 @@ function runScreen(opts = {}) {
       stat.not_gain++;
       continue;
     }
-    if (m.vr == null || m.vr < volMult) {
+    if (volume < minVolume || m.vr == null || m.vr < volMult) {
       stat.not_vol++;
       continue;
     }
@@ -2410,6 +2421,7 @@ function runScreen(opts = {}) {
       min_gain: minGain,
       max_gain: maxGain,
       vol_mult: volMult,
+      min_volume: minVolume,
       above_ma5: opts.above_ma5 !== false,
       bullish_stack: opts.bullish_stack !== false,
     },
@@ -2427,6 +2439,7 @@ app.get('/api/screen', (req, res) => {
       min_gain: num(q.min_gain),
       max_gain: num(q.max_gain),
       vol_mult: num(q.vol),
+      min_volume: num(q.min_volume),
       above_ma5: q.ma5 !== '0',
       bullish_stack: q.bull !== '0',
       asof: q.asof || null,
