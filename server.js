@@ -30,7 +30,7 @@ const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 const DB_PATH = path.join(DATA_DIR, 'data.db');
 const DIST = path.join(__dirname, 'dist');
 const PORT = process.env.PORT || 8080;
-const VERSION = 'v2.1-volume';
+const VERSION = 'v2.2-volume-setup';
 let analysisCache = null;
 
 const DEFAULTS = {
@@ -1368,7 +1368,7 @@ function pickDailyPicks(cfg, limit = 3) {
       name: r.name,
       price: r.price,
       score: r.pattern?.score ?? null,
-      signal: r.pattern_pass ? '双底突破' : '趋势与量能',
+      signal: r.stage === 'coiled' ? '放量蓄势' : '蓄势后初步突破',
     }));
 }
 
@@ -2139,9 +2139,17 @@ function getAnalysisOverview(cfg) {
       .at(-1) || null;
   // The shortlist uses one market date; old or delisted quotes must not fill current slots.
   const candidates = reports
-    .filter((r) => r.stage === 'confirmed' && r.quote_date === snapshotDate)
+    .filter(
+      (r) =>
+        ['coiled', 'confirmed'].includes(r.stage) &&
+        r.volume_setup.qualified &&
+        r.quote_date === snapshotDate,
+    )
     .sort(
       (a, b) =>
+        Number(b.stage === 'coiled') - Number(a.stage === 'coiled') ||
+        b.volume_setup.events.length - a.volume_setup.events.length ||
+        b.volume_setup.average_multiple - a.volume_setup.average_multiple ||
         (b.volume_signal.multiple || 0) - (a.volume_signal.multiple || 0) ||
         b.evidence_count - a.evidence_count ||
         (b.pattern?.score || 0) - (a.pattern?.score || 0) ||
@@ -2153,6 +2161,8 @@ function getAnalysisOverview(cfg) {
     candidates: candidates.slice(0, limit),
     limit,
     confirmed: candidates.length,
+    coiled: candidates.filter((r) => r.stage === 'coiled').length,
+    breakout: candidates.filter((r) => r.stage === 'confirmed').length,
     volume_qualified: reports.filter(
       (r) =>
         r.volume_signal.pass &&
@@ -2163,7 +2173,7 @@ function getAnalysisOverview(cfg) {
     snapshot_date: snapshotDate,
     historical: reports.filter((r) => r.stage === 'stale').length,
     covered: reports.filter((r) => !!r.metrics).length,
-    rule: '所有精选必须成交量至少100万股且至少昨日2倍，并有价格转强支持；按放量倍数优先排序，只比较同一最新市场日期。',
+    rule: '先找放量蓄势、尚未大涨的股票，再看蓄势后的初步突破。精选本次成交量必须至少100万股、至少上一交易日2倍；此前10日价格窄幅整理，出现过量增价稳，或本次量达到此前20日均量1.5倍。只比较同一最新市场日期，已明显拉升不入选。',
   };
   analysisCache = { ts: Date.now(), data };
   return data;

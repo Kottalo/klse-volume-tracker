@@ -439,10 +439,44 @@ h2 {
   flex-shrink: 0;
   display: inline-block;
 }
-.status-pill.confirmed {
+.status-pill.confirmed,
+.status-pill.coiled {
   color: var(--green);
   background: #68ddba10;
   border-color: #3a6559;
+}
+.setup-panel {
+  background: #132e30;
+  border: 1px solid #315450;
+  border-radius: 10px;
+  padding: 14px;
+  margin-top: 14px;
+  font-size: 12px;
+  line-height: 1.8;
+}
+.setup-panel h3 {
+  color: var(--green);
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+.setup-panel p {
+  margin: 6px 0;
+  color: #b1c4c7;
+}
+.setup-panel strong {
+  color: #daeee9;
+}
+.setup-events {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+.setup-events > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  border-top: 1px solid #315450;
+  padding-top: 8px;
 }
 .status-pill.extended {
   color: var(--amber);

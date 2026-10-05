@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import {
   trendMetrics,
   observationDays,
@@ -8,6 +9,7 @@ import {
   formatReport,
   sessionStart,
   volumeSignal,
+  consolidationSetup,
 } from '../lib/analysis.js';
 import { validateSettings, ValidationError } from '../lib/settings.js';
 
@@ -39,6 +41,107 @@ test('historical calculations use only bars before the reference day', () => {
   assert.equal(before.vr, 2);
   assert.equal(before.previous_date, history[21].date);
   assert.equal(before.gain20, (history[22].close / history[2].close - 1) * 100);
+});
+
+const cnergen = JSON.parse(
+  fs.readFileSync(new URL('./fixtures/cnergen-2026.json', import.meta.url), 'utf8'),
+).bars;
+function cnergenReport(date, overrides = {}) {
+  const bar = cnergen.find((r) => r.date === date);
+  const rows = cnergen.filter((r) => r.date <= date);
+  const reviewNow = Date.parse(date + 'T17:30:00+08:00') / 1000;
+  return explainStock({
+    stock: {
+      stock: 'CNERGEN',
+      name: 'Cnergenz',
+      price: bar.close,
+      volume: bar.volume,
+      prevClose: rows.at(-2).close,
+      session_date: date,
+      mtime: reviewNow,
+      ...overrides,
+    },
+    rows,
+    pattern: null,
+    cfg: { ...cfg, min_average_daily_value: 200000 },
+    now: reviewNow,
+  });
+}
+
+test('CNERGEN is a pre-breakout setup on Oct 2 using only then-available data, and extended after its rally', () => {
+  const report = cnergenReport('2026-10-02');
+  assert.equal(report.stage, 'coiled');
+  assert.equal(report.volume_signal.current, 2168900);
+  assert.ok(Math.abs(report.volume_signal.multiple - 2.23713254) < 0.000001);
+  assert.equal(report.volume_setup.resistance, 0.98);
+  assert.equal(report.volume_setup.support, 0.89);
+  assert.equal(report.volume_setup.events[0].date, '2026-09-22');
+  assert.equal(report.volume_setup.events[0].change_pct, 0);
+  assert.equal(report.volume_setup.base_end, '2026-10-01');
+  assert.ok(Math.abs(report.volume_setup.average_multiple - 1.19996127) < 0.000001);
+  assert.match(report.entry_plan, /尚未突破/);
+  assert.match(formatReport(report), /放量蓄势/);
+  const rallied = cnergenReport('2026-10-05');
+  assert.equal(rallied.stage, 'extended');
+  assert.equal(rallied.volume_setup.qualified, false);
+  assert.equal(rallied.change_pct, 31.87);
+  assert.match(rallied.conclusion, /不列入提前布局精选/);
+});
+
+test('later rally bars cannot change the earlier consolidation or its volume baseline', () => {
+  const before = cnergen.filter((r) => r.date < '2026-10-02');
+  const expected = consolidationSetup(before, 0.91, 2168900, '2026-10-02');
+  const altered = cnergen.map((r) =>
+    r.date >= '2026-10-02' ? { ...r, high: 100, low: 0.01, close: 90, volume: 999999999 } : r,
+  );
+  assert.deepEqual(consolidationSetup(altered, 0.91, 2168900, '2026-10-02'), expected);
+});
+
+test('flat-price setups still require both volume gates, current support and usable quotes', () => {
+  const rows = cnergen.filter((r) => r.date < '2026-10-02');
+  for (const [price, volume] of [
+    [0.91, 999999],
+    [0.91, 1938999],
+    [0.88, 3000000],
+    [1.1, 3000000],
+  ])
+    assert.equal(consolidationSetup(rows, price, volume, '2026-10-02').qualified, false);
+  assert.equal(consolidationSetup(rows, 0.91, 1939000, '2026-10-02').qualified, true);
+  const reviewNow = Date.parse('2026-10-02T10:30:00+08:00') / 1000;
+  assert.equal(
+    explainStock({
+      stock: {
+        stock: 'OLD',
+        price: 0.91,
+        volume: 2168900,
+        session_date: '2026-10-02',
+        mtime: reviewNow - 86400,
+      },
+      rows,
+      pattern: null,
+      cfg,
+      now: reviewNow,
+    }).stage,
+    'stale',
+  );
+});
+
+test('a large selloff or wide-range spike is not counted as quiet-volume buildup', () => {
+  const rows = cnergen
+    .filter((r) => r.date < '2026-10-02')
+    .map((r) => (r.date === '2026-09-22' ? { ...r, low: 0.85, high: 1.05, close: 0.87 } : r));
+  const result = consolidationSetup(rows, 0.91, 2168900, '2026-10-02');
+  assert.equal(result.events.length, 0);
+  assert.equal(result.qualified, false);
+  assert.equal(
+    consolidationSetup(
+      rows.map((r) => ({ ...r, high: null })),
+      0.91,
+      2168900,
+      '2026-10-02',
+    ).available,
+    false,
+  );
 });
 
 test('observation days count distinct available trading dates after entry', () => {

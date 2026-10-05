@@ -210,14 +210,14 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
   const titles = {
-    overview: '成交量明显放大，优先看这几只。',
+    overview: '量先放大，价格还在蓄势。',
     market: '从全市场找到你的关注。',
     watch: '关注之后，继续核对。',
     alerts: '市场有变化，依据要更新。',
     method: '每个信号，都有它的边界。',
   };
   const subtitles = {
-    overview: '扫描全市场，精选百万股以上、至少昨日两倍成交量，并有价格转强支持的少数股票。',
+    overview: '扫描全市场，优先找成交量已放大、价格仍在整理的少数股票，提前关注突破机会。',
     market: '搜索公司或代码，点开股票查看分析依据。',
     watch: '你的关注保存在当前浏览器；系统观察记录用于跟踪规则表现。',
     alerts: '异动是研究的起点。价格变化本身不等于买入理由。',
@@ -348,10 +348,10 @@ export default function App() {
                         note="百万股以上，且至少昨日两倍"
                       />
                       <Stat
-                        label="可重点考虑"
+                        label="放量蓄势候选"
                         value={number(insights?.confirmed || 0, 0)}
                         unit="只"
-                        note="全市场符合条件的候选"
+                        note={`${insights?.coiled || 0} 只尚未突破 · ${insights?.breakout || 0} 只初步突破`}
                         accent
                       />
                       <Stat
@@ -364,11 +364,15 @@ export default function App() {
                     <section className="opportunities">
                       <div className="section-heading">
                         <div>
-                          <h2>放量潜力精选</h2>
-                          <p>{`按放量倍数优先排序，最多 ${insights?.limit || 3} 只。量价不配合的股票不入选，入选不足不凑数。`}</p>
+                          <h2>放量蓄势精选</h2>
+                          <p>{`优先尚未拉升、已有量增价稳记录的股票，最多 ${insights?.limit || 3} 只。已明显大涨不入选，入选不足不凑数。`}</p>
                         </div>
                         <div className="tabs" aria-label="候选筛选">
-                          {[['all', '优先考虑']].map(([id, label]) => (
+                          {[
+                            ['all', '全部'],
+                            ['coiled', '尚未突破'],
+                            ['confirmed', '初步突破'],
+                          ].map(([id, label]) => (
                             <button
                               key={id}
                               className={filter === id ? 'selected' : ''}
@@ -407,7 +411,9 @@ export default function App() {
                           text={
                             state.status.backfilling
                               ? '正在补齐历史资料，完成后会自动重新分析。'
-                              : '尚无股票同时满足百万股、两倍放量及价格转强条件。继续扫描，不用较弱信号凑数。'
+                              : filter !== 'all'
+                                ? '当前精选没有这一阶段的候选，可切换其他阶段查看。'
+                                : '尚无股票同时满足百万股、两倍放量及窄幅蓄势条件。继续扫描，不用较弱信号凑数。'
                           }
                           action={() => navigate('market')}
                           actionLabel="查看全市场"
@@ -562,15 +568,18 @@ function Opportunity({ report: r, favorite, toggle, open }) {
         </span>
       </div>
       <VolumePanel report={r} compact />
+      <SetupPanel report={r} compact />
       <p className="conclusion">{r.conclusion}</p>
       <div className="entry-summary">
         <span>参与参考</span>
         <strong>
-          {r.levels
-            ? price(r.levels.zone_low) + '–' + number(r.levels.zone_high, 3)
-            : r.metrics
-              ? '关注 ' + price(r.metrics.ma5) + ' 附近的支撑'
-              : '等待资料更新'}
+          {r.volume_setup?.qualified
+            ? '突破关注 ' + price(r.volume_setup.resistance)
+            : r.levels
+              ? price(r.levels.zone_low) + '–' + number(r.levels.zone_high, 3)
+              : r.metrics
+                ? '关注 ' + price(r.metrics.ma5) + ' 附近的支撑'
+                : '等待资料更新'}
         </strong>
       </div>
       <div className="evidence-chips">
@@ -579,7 +588,13 @@ function Opportunity({ report: r, favorite, toggle, open }) {
           .map((c) => (
             <span key={c.key}>
               <Icon name="check" size={12} />
-              {c.key === 'trend' ? '趋势支持' : c.key === 'volume' ? '量能支持' : '突破支持'}
+              {c.key === 'trend'
+                ? '趋势支持'
+                : c.key === 'volume'
+                  ? '量能支持'
+                  : c.key === 'setup'
+                    ? '蓄势支持'
+                    : '突破支持'}
             </span>
           ))}
       </div>
@@ -658,6 +673,15 @@ function VolumePanel({ report, compact = false }) {
         </span>
       </div>
       <p className="volume-reading">{signal.interpretation}</p>
+      {report.volume_setup?.available && (
+        <p className="volume-timing">
+          此前20日平均 {volume(report.volume_setup.average_volume)}；本次为均量的{' '}
+          {number(report.volume_setup.average_multiple)} 倍。
+          {report.volume_setup.average_multiple < 1.5
+            ? '对比昨日虽已放量，相对长期均量并未明显放大。'
+            : ''}
+        </p>
+      )}
       {signal.shortfall > 0 && (
         <p className="volume-shortfall">
           距两个门槛同时达标，还差至少 {volume(signal.shortfall)}。
@@ -668,6 +692,53 @@ function VolumePanel({ report, compact = false }) {
           ? '盘中累计量，对比上一交易日全天；今日尚未收盘。'
           : `按 ${signal.current_date || '所示日期'} 成交量对比；不代表当前盘中成交。`}
       </p>
+    </section>
+  );
+}
+
+function SetupPanel({ report, compact = false }) {
+  const setup = report.volume_setup;
+  if (!setup?.available) return null;
+  return (
+    <section className="setup-panel" aria-label="放量蓄势解读">
+      <h3>
+        {setup.qualified
+          ? setup.quiet
+            ? '量已经动了，价格还没突破'
+            : '蓄势之后，开始突破'
+          : setup.extended
+            ? '已经拉升，等待回踩'
+            : '暂未形成量增价稳的蓄势条件'}
+      </h3>
+      <p>
+        此前 {setup.base_days} 个有成交交易日（{setup.base_start}–{setup.base_end}
+        ），收盘价区间宽度 {number(setup.close_range_pct)}%。整理下沿{' '}
+        <strong>{price(setup.support)}</strong>，突破关注 <strong>{price(setup.resistance)}</strong>
+        。
+      </p>
+      <p>
+        其中 <strong>{setup.events.length} 天</strong>出现百万股以上、至少昨日两倍成交，而价格变化在
+        −1.5% 至 +3% 之间。
+      </p>
+      {!compact && setup.events.length > 0 && (
+        <div className="setup-events">
+          {setup.events.map((event) => (
+            <div key={event.date}>
+              <strong>{event.date}</strong>
+              <span>
+                {volume(event.volume)} · 前一交易日的 {number(event.multiple, 2)} 倍
+              </span>
+              <span>股价 {percent(event.change_pct)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {!compact && (
+        <p>
+          当前离整理上沿 {percent(setup.distance_to_breakout_pct)}。跌破 {price(setup.support)}{' '}
+          时，蓄势依据失效。放量本身不能确定买卖方向。
+        </p>
+      )}
     </section>
   );
 }
@@ -991,6 +1062,7 @@ function StockDetail({ code, close, favorite, toggle }) {
             </button>
           </div>
           <VolumePanel report={r} />
+          <SetupPanel report={r} />
           <div className={`verdict ${r.stage}`}>
             <Status report={r} />
             {r.snapshot && (
@@ -1012,7 +1084,9 @@ function StockDetail({ code, close, favorite, toggle }) {
           <section className="detail-section">
             <div className="section-heading">
               <h3>支持这个判断的依据</h3>
-              <span className="muted">{r.evidence_count}/3 项依据满足 · 非上涨概率</span>
+              <span className="muted">
+                {r.evidence_count}/{r.checks.length} 项依据满足 · 非上涨概率
+              </span>
             </div>
             <div className="detail-checks">
               {r.checks.map((c) => (
@@ -1213,12 +1287,12 @@ function Method() {
     [
       '02',
       '成交量：百万股与两倍放量',
-      '所有精选都需本次成交量至少100万股，且至少上一交易日全天的2倍，并有价格高于昨收和5日均价的支持。盘中以累计量对比昨日全天，不做全天成交量外推。放量而价格走弱时等待量价配合。',
+      '所有精选都需本次成交量至少100万股，且至少上一交易日全天的2倍。分别显示相对昨日与此前20日均量的变化。盘中以累计量对比昨日全天，不做全天成交量外推。',
     ],
     [
       '03',
-      '双底：两次低点之后，是否越过压力',
-      '系统寻找两个相近低点，检查中间的压力位是否被日线收盘价突破。形态评分是规则匹配程度。评分80分不代表80%的赚钱概率。',
+      '蓄势：量增价稳，尚未明显拉升',
+      '前10个有成交交易日价格窄幅整理，出现过平稳放量，或本次量达到20日均量1.5倍。当前仍需过百万股和两倍量门槛。平稳放量记录排除明显下跌、宽幅波动与收盘偏弱的日期。',
     ],
     [
       '04',
@@ -1248,18 +1322,18 @@ function Method() {
         <h2>如何读首页的结论</h2>
         <dl className="glossary">
           <div>
-            <dt>可重点考虑</dt>
+            <dt>放量蓄势 · 尚未突破</dt>
             <dd>
-              百万股与两倍放量同时达标，价格也转强，资料与成交活跃度符合要求。仍需核对价格、财报和公告。
+              百万股与两倍放量同时达标，价格仍在整理区间，已有量增价稳依据。优先关注放量越过整理上沿；当前未确认突破。
             </dd>
           </div>
           <div>
-            <dt>等待放量 / 等待量价配合</dt>
-            <dd>成交量尚未同时达标，或成交量放大但价格没有转强。暂不列入精选。</dd>
+            <dt>蓄势后初步突破</dt>
+            <dd>在蓄势条件基础上，价格刚越过整理上沿且未明显拉升，需要核对能否守住。</dd>
           </div>
           <div>
             <dt>等待回踩</dt>
-            <dd>现价已离开形态参考区间或越过量度目标，需要重新评估风险与空间。</dd>
+            <dd>现价已明显离开整理上沿或当日涨幅至少8%，不再作为提前布局候选。</dd>
           </div>
           <div>
             <dt>资料待补齐 / 历史快照</dt>

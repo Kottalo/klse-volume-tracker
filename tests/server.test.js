@@ -215,11 +215,15 @@ function seedTrendMarket(count = 5) {
     if (![0, 6].includes(day.getUTCDay())) dates.unshift(day.toISOString().slice(0, 10));
     day.setUTCDate(day.getUTCDate() - 1);
   }
-  const insert = db.prepare('INSERT INTO daily_vol(stock,date,volume,close) VALUES(?,?,?,?)');
+  const insert = db.prepare(
+    'INSERT INTO daily_vol(stock,date,volume,close,high,low) VALUES(?,?,?,?,?,?)',
+  );
   for (let i = 0; i < count; i++) {
     const code = 'STRONG' + i;
-    quote(code, 10 * Math.pow(1.01, 25), 500000 * (i + 2));
-    dates.forEach((date, index) => insert.run(code, date, 500000, 10 * Math.pow(1.01, index)));
+    quote(code, 11.02, 500000 * (i + 2));
+    dates.forEach((date, index) =>
+      insert.run(code, date, index === 19 ? 1500000 : 500000, 11, 11.1, 10.9),
+    );
   }
 }
 
@@ -233,7 +237,8 @@ test('the whole universe is analyzed but only the strongest few are returned, wi
   assert.equal(state.insights.scanned, 7);
   assert.equal(state.insights.confirmed, 5);
   assert.equal(state.insights.candidates.length, 3);
-  assert.ok(state.insights.candidates.every((report) => report.stage === 'confirmed'));
+  assert.ok(state.insights.candidates.every((report) => report.stage === 'coiled'));
+  assert.equal(state.insights.coiled, 5);
   assert.equal(state.insights.candidates[0].code, 'STRONG4');
   assert.ok(
     state.insights.candidates.every(
@@ -252,7 +257,7 @@ test('the whole universe is analyzed but only the strongest few are returned, wi
     db
       .prepare('SELECT signal FROM watchlist')
       .all()
-      .every((r) => r.signal === '趋势与量能'),
+      .every((r) => r.signal === '放量蓄势'),
   );
   for (const code of ['STRONG2', 'STRONG3', 'STRONG4'])
     db.prepare('DELETE FROM live WHERE stock=?').run(code);
@@ -295,6 +300,41 @@ test('lunch-break shortlist does not mix older-session or orphaned high-volume s
   } finally {
     Date.now = () => fixed;
   }
+});
+
+test('setup shortlist prioritizes unbroken bases over early breakouts and excludes already-rallied stocks', async () => {
+  reset();
+  seedTrendMarket(3);
+  db.prepare('UPDATE live SET price=?,prevClose=? WHERE stock=?').run(11.12, 11, 'STRONG1');
+  db.prepare('UPDATE live SET price=?,prevClose=? WHERE stock=?').run(13, 11, 'STRONG2');
+  quote('GENERIC', 13, 3000000);
+  db.prepare(
+    'INSERT INTO daily_vol(stock,date,volume,close) SELECT ?,date,volume,close FROM daily_vol WHERE stock=?',
+  ).run('GENERIC', 'STRONG0');
+  const state = await (await realFetch(base + '/api/state')).json();
+  assert.deepEqual(
+    state.insights.candidates.map((r) => [r.code, r.stage]),
+    [
+      ['STRONG0', 'coiled'],
+      ['STRONG1', 'confirmed'],
+    ],
+  );
+  assert.equal(state.insights.coiled, 1);
+  assert.equal(state.insights.breakout, 1);
+  assert.equal(server.getStockReport('STRONG2').stage, 'extended');
+  assert.equal(server.getStockReport('GENERIC').stage, 'confirmed');
+  assert.equal(server.getStockReport('GENERIC').volume_setup.qualified, false);
+  updateWatchlist(DEFAULTS);
+  assert.deepEqual(
+    db
+      .prepare('SELECT stock,signal FROM watchlist ORDER BY stock')
+      .all()
+      .map((r) => [r.stock, r.signal]),
+    [
+      ['STRONG0', '放量蓄势'],
+      ['STRONG1', '蓄势后初步突破'],
+    ],
+  );
 });
 
 test('market pagination scans beyond the old fixed cap and sorts by a stable symbol', async () => {

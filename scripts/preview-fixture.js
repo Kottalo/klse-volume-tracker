@@ -42,6 +42,7 @@ const insert = db.prepare(
   'INSERT INTO daily_vol(stock,date,volume,open,high,low,close) VALUES(?,?,?,?,?,?,?)',
 );
 for (const [code, name, scale, current] of samples) {
+  const previousPrice = current / (code === 'EXAMPLE3' ? 1.02 : code === 'EXAMPLE4' ? 1.2 : 1.006);
   db.prepare('INSERT INTO universe(stock,name,code) VALUES(?,?,?)').run(
     code,
     name,
@@ -53,9 +54,9 @@ for (const [code, name, scale, current] of samples) {
     code,
     name,
     current,
-    current * 0.976,
+    previousPrice,
     current * 0.98,
-    6400000 * scale,
+    code === 'EXAMPLE5' ? 500000 : code === 'EXAMPLE6' ? 1500000 * scale : 6400000 * scale,
     Date.now() / 1000,
     marketDate(),
   );
@@ -70,14 +71,14 @@ for (const [code, name, scale, current] of samples) {
             : i <= 60
               ? 10.05 + (i - 55) * 0.27
               : 11.9 + (i - 61) * 0.04;
-    const close = base * scale;
+    const close = i >= 50 ? previousPrice : base * scale;
     insert.run(
       code,
       dates[i],
-      (i >= 61 ? 3100000 : 1000000) * scale,
+      (i === 56 ? 2800000 : 1000000) * scale,
       close * 0.99,
-      close + 0.07 * scale,
-      close - 0.06 * scale,
+      close * 1.015,
+      close * 0.985,
       close,
     );
   }
