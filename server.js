@@ -2118,7 +2118,9 @@ function getAnalysisOverview(cfg) {
     by.get(row.stock).push(row);
   }
   const reports = db
-    .prepare('SELECT * FROM live WHERE price>0')
+    .prepare(
+      'SELECT live.* FROM live JOIN universe ON universe.stock=live.stock WHERE live.price>0',
+    )
     .all()
     .map((stock) => {
       const history = by.get(stock.stock) || [];
@@ -2129,9 +2131,15 @@ function getAnalysisOverview(cfg) {
         cfg,
       });
     });
-  // Do not fill the shortlist with weaker signals. The universe is scanned in full.
+  const snapshotDate =
+    reports
+      .map((r) => r.quote_date)
+      .filter(Boolean)
+      .sort()
+      .at(-1) || null;
+  // The shortlist uses one market date; old or delisted quotes must not fill current slots.
   const candidates = reports
-    .filter((r) => r.stage === 'confirmed')
+    .filter((r) => r.stage === 'confirmed' && r.quote_date === snapshotDate)
     .sort(
       (a, b) =>
         (b.volume_signal.multiple || 0) - (a.volume_signal.multiple || 0) ||
@@ -2146,18 +2154,16 @@ function getAnalysisOverview(cfg) {
     limit,
     confirmed: candidates.length,
     volume_qualified: reports.filter(
-      (r) => r.volume_signal.pass && !['stale', 'insufficient'].includes(r.stage),
+      (r) =>
+        r.volume_signal.pass &&
+        r.quote_date === snapshotDate &&
+        !['stale', 'insufficient'].includes(r.stage),
     ).length,
     scanned: reports.length,
-    snapshot_date:
-      reports
-        .map((r) => r.quote_date)
-        .filter(Boolean)
-        .sort()
-        .at(-1) || null,
+    snapshot_date: snapshotDate,
     historical: reports.filter((r) => r.stage === 'stale').length,
     covered: reports.filter((r) => !!r.metrics).length,
-    rule: '所有精选必须成交量至少100万股且至少昨日2倍，并有价格转强支持；按放量倍数优先排序。',
+    rule: '所有精选必须成交量至少100万股且至少昨日2倍，并有价格转强支持；按放量倍数优先排序，只比较同一最新市场日期。',
   };
   analysisCache = { ts: Date.now(), data };
   return data;

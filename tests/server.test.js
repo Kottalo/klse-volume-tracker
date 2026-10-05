@@ -262,6 +262,41 @@ test('the whole universe is analyzed but only the strongest few are returned, wi
   assert.ok(!state.insights.candidates.some((report) => ['WEAK', 'MISSING'].includes(report.code)));
 });
 
+test('lunch-break shortlist does not mix older-session or orphaned high-volume snapshots', async () => {
+  reset();
+  seedTrendMarket(1);
+  quote('OLD', 15, 9000000);
+  quote('ORPHAN', 13, 12000000);
+  db.prepare(
+    'INSERT INTO daily_vol(stock,date,volume,close) SELECT ?,date,volume,close FROM daily_vol WHERE stock=?',
+  ).run('OLD', 'STRONG0');
+  db.prepare(
+    'INSERT INTO daily_vol(stock,date,volume,close) SELECT ?,date,volume,close FROM daily_vol WHERE stock=?',
+  ).run('ORPHAN', 'STRONG0');
+  db.prepare('UPDATE daily_vol SET close=15,volume=9000000 WHERE stock=? AND date=?').run(
+    'OLD',
+    '2026-10-02',
+  );
+  db.prepare('UPDATE live SET session_date=? WHERE stock=?').run('2026-10-02', 'OLD');
+  db.prepare('DELETE FROM universe WHERE stock=?').run('ORPHAN');
+  const lunch = fixed + 145 * 60000;
+  db.prepare('UPDATE live SET mtime=?').run(lunch / 1000);
+  Date.now = () => lunch;
+  try {
+    assert.equal(server.getStockReport('OLD').stage, 'confirmed');
+    const state = await (await realFetch(base + '/api/state')).json();
+    assert.equal(state.insights.scanned, 2);
+    assert.equal(state.insights.volume_qualified, 1);
+    assert.equal(state.insights.snapshot_date, '2026-10-05');
+    assert.deepEqual(
+      state.insights.candidates.map((r) => r.code),
+      ['STRONG0'],
+    );
+  } finally {
+    Date.now = () => fixed;
+  }
+});
+
 test('market pagination scans beyond the old fixed cap and sorts by a stable symbol', async () => {
   const ranges = [];
   globalThis.fetch = async (url, options) => {
