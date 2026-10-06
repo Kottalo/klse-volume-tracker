@@ -1928,7 +1928,7 @@ tr:hover td {
   font-weight: 500;
 }
 .conclusion {
-  min-height: 84px;
+  min-height: 0;
 }
 .risk-box > p {
   line-height: 1.9;
@@ -2158,8 +2158,9 @@ tr:hover td {
   color: #9cbab0;
 }
 .brief-volume strong {
-  font-size: 19px;
+  font-size: 17px;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 .brief-volume small {
   font-size: 11px;
