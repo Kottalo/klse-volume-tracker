@@ -19,10 +19,15 @@ globalThis.fetch = async () => {
   throw new Error('External network disabled in preview fixture');
 };
 const reviewDate = marketDate();
-const fixed = Date.parse(reviewDate + 'T10:30:00+08:00');
-Date.now = () => fixed;
-const { app, db, DEFAULTS, saveConfig } = await import('../server.js');
-saveConfig({ ...DEFAULTS, watchlist: [] });
+const previewTime = process.env.PREVIEW_TIME || '10:30:00';
+if (!/^\d{2}:\d{2}:\d{2}$/.test(previewTime)) throw new Error('PREVIEW_TIME must be HH:mm:ss');
+const fixed = Date.parse(reviewDate + 'T' + previewTime + '+08:00');
+if (!Number.isFinite(fixed)) throw new Error('Invalid PREVIEW_TIME');
+let clock = fixed;
+Date.now = () => clock;
+const { app, db, DEFAULTS, saveConfig, recordFinalBriefing } = await import('../server.js');
+const cfg = { ...DEFAULTS, watchlist: [], final_briefing_telegram: false };
+saveConfig(cfg);
 const dates = [],
   cursor = new Date(marketDate());
 cursor.setUTCDate(cursor.getUTCDate() - 1);
@@ -108,8 +113,40 @@ if (reviewDate === buscap.snapshot.date) {
   for (const b of buscap.bars)
     insert.run('BUSCAP', b.date, b.volume, b.open, b.high, b.low, b.close);
 }
+// Optional late-day acceptance snapshots, only in this isolated, network-disabled fixture.
+if (previewTime >= '16:30:00' && previewTime < '16:40:00') {
+  const count = db.prepare('SELECT COUNT(*) n FROM universe').get().n;
+  for (const slot of ['16:00', '16:30']) {
+    clock = Date.parse(reviewDate + 'T' + slot + ':30+08:00');
+    db.prepare('UPDATE live SET mtime=?').run(clock / 1000);
+    db.prepare('INSERT OR REPLACE INTO kv(k,v) VALUES(?,?)').run(
+      'market_scan_coverage',
+      JSON.stringify({ expected: count, received: count, valid: count, at: clock / 1000 }),
+    );
+    saveConfig(cfg);
+    recordFinalBriefing(slot, cfg);
+  }
+  const items = [
+    { code: 'EXAMPLE1', price: 11.5 },
+    { code: 'EXAMPLE2', price: 8.5 },
+  ];
+  db.prepare(
+    'INSERT INTO closing_briefings(date,slot,created_at,quote_at,status,items,text) VALUES(?,?,?,?,?,?,?)',
+  ).run(
+    dates.at(-1),
+    '16:30',
+    clock / 1000 - 86400,
+    clock / 1000 - 86400,
+    'ready',
+    JSON.stringify(items),
+    'Synthetic acceptance fixture',
+  );
+  clock = fixed;
+  db.prepare('UPDATE live SET mtime=?').run(fixed / 1000);
+  saveConfig(cfg);
+}
 const httpServer = app.listen(port, '127.0.0.1', () =>
-  console.log('Offline fixture: http://localhost:' + port + ' — all stock data is synthetic.'),
+  console.log('Offline fixture: http://localhost:' + port + ' — labelled samples/replays only.'),
 );
 function cleanup() {
   httpServer.closeAllConnections();

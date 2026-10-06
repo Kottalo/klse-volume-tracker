@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import './styles.css';
+import { reportSummary, signalReferences } from '../lib/analysis.js';
 
 const number = (v, d = 2) =>
   v == null || !Number.isFinite(v) ? '—' : v.toLocaleString('en-MY', { maximumFractionDigits: d });
@@ -212,14 +213,14 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
   const titles = {
-    overview: '量先放大，持续追踪潜力信号。',
+    overview: '今日潜力精选。',
     market: '从全市场找到你的关注。',
     watch: '关注之后，继续核对。',
     alerts: '市场有变化，依据要更新。',
     method: '每个信号，都有它的边界。',
   };
   const subtitles = {
-    overview: '扫描全市场，分别寻找放量蓄势、放量转强和突破信号，已有信号持续跟踪。',
+    overview: '看成交量，看关键价位。16:00、16:30 再通报。',
     market: '搜索公司或代码，点开股票查看分析依据。',
     watch: '你的关注保存在当前浏览器；系统观察记录用于跟踪规则表现。',
     alerts: '异动是研究的起点。价格变化本身不等于买入理由。',
@@ -330,9 +331,7 @@ export default function App() {
                   </span>
                 </div>
                 <div className="data-caption">
-                  行情快照 {time(state.status.last_poll)} <span>·</span> 免费行情可能延迟{' '}
-                  <span>·</span> {state.status.backfilling ? '正在补齐日线资料' : '分析随数据更新'}{' '}
-                  <span>·</span> 节假日以交易所安排为准
+                  快照 {time(state.status.last_poll)} · 免费行情可能延迟
                 </div>
                 {page === 'overview' && (
                   <>
@@ -363,11 +362,12 @@ export default function App() {
                         note="保存在当前浏览器"
                       />
                     </section>
+                    <ClosingBriefings data={state.closing_briefings} open={setSelected} />
                     <section className="opportunities">
                       <div className="section-heading">
                         <div>
-                          <h2>当前参与条件精选</h2>
-                          <p>{`比较量能强度、价格位置和信号依据，最多 ${insights?.limit || 3} 只。已明显拉升转入持续追踪，入选不足不凑数。`}</p>
+                          <h2>当前精选</h2>
+                          <p>{`最多 ${insights?.limit || 3} 只，入选不足不凑数。`}</p>
                         </div>
                         <div className="tabs" aria-label="候选筛选">
                           {[
@@ -386,16 +386,10 @@ export default function App() {
                           ))}
                         </div>
                       </div>
-                      <div className="volume-criteria" aria-label="成交量入选条件">
-                        <span>每只精选必须同时满足</span>
-                        <strong>
-                          本次成交量 ≥ {volume(state.settings.screen_min_volume ?? 1000000)}
-                        </strong>
-                        <strong>
-                          至少上一交易日全天的 {number(state.settings.screen_vol_mult ?? 2)} 倍
-                        </strong>
-                        <span>成交量以股数计；盘中使用累计成交量</span>
-                      </div>
+                      <p className="criteria-line">
+                        量 ≥{volume(state.settings.screen_min_volume ?? 1000000)} · 昨日 ≥
+                        {number(state.settings.screen_vol_mult ?? 2)}倍 · 价格未明显拉升
+                      </p>
                       {candidates.length ? (
                         <div className="card-grid">
                           {candidates.map((r) => (
@@ -427,9 +421,7 @@ export default function App() {
                       <div className="section-heading">
                         <div>
                           <h2>已有信号 · 重点追踪</h2>
-                          <p>
-                            最近5个有成交交易日的信号，守住支撑且资料有效就继续追踪；今天量未达标或已明显拉升，会明确说明。首页展示3只，全部记录可查询。
-                          </p>
+                          <p>近期信号仍有效；已拉升或本次量不足，继续观察。</p>
                         </div>
                       </div>
                       {insights?.tracking?.length ? (
@@ -438,7 +430,7 @@ export default function App() {
                             <article className="opportunity-card" key={r.code}>
                               <div className="card-top">
                                 <span className="ticker">{r.code}</span>
-                                <Status report={r} />
+                                <Status report={r} compact />
                               </div>
                               <h3>{r.name}</h3>
                               <div className="card-price">
@@ -447,19 +439,11 @@ export default function App() {
                                   {percent(r.change_pct)}
                                 </span>
                               </div>
-                              <p className="tracking-volume">
-                                本次成交 <strong>{volume(r.volume)}</strong> ·{' '}
-                                {r.volume_signal.previous_date || '上一交易日'} 的{' '}
-                                <strong>{number(r.volume_signal.multiple)} 倍</strong>
-                                <br />
-                                {r.volume_signal.pass
-                                  ? '本次百万股、两倍量均达标'
-                                  : '本次两个成交量门槛尚未同时达标'}
-                              </p>
-                              <SignalPanel report={r} compact />
-                              <p className="conclusion">{r.conclusion}</p>
+                              <VolumePanel report={r} compact />
+                              <p className="conclusion">{reportSummary(r)}</p>
+                              <SignalLevels report={r} />
                               <button className="text-button" onClick={() => setSelected(r.code)}>
-                                查看追踪与未入选原因 <Icon name="arrow" size={16} />
+                                查看详情 <Icon name="arrow" size={16} />
                               </button>
                             </article>
                           ))}
@@ -709,8 +693,152 @@ function Empty({ title, text, action, actionLabel }) {
     </div>
   );
 }
-function Status({ report }) {
-  return <span className={`status-pill ${report.stage}`}>{report.label}</span>;
+function Status({ report, compact = false }) {
+  const labels = {
+    coiled: '放量蓄势',
+    building: '放量转强',
+    confirmed: '初步突破',
+    extended: '已拉升',
+    tracking: '持续追踪',
+    watch: '待确认',
+    stale: '资料较旧',
+    insufficient: '资料不足',
+  };
+  return (
+    <span className={`status-pill ${report.stage}`}>
+      {compact ? labels[report.stage] || report.label : report.label}
+    </span>
+  );
+}
+function SignalLevels({ report }) {
+  const refs = signalReferences(report);
+  if (!refs) return null;
+  return (
+    <dl className="brief-levels">
+      <div>
+        <dt>关注位</dt>
+        <dd>{price(refs.resistance)}</dd>
+      </div>
+      <div>
+        <dt>跌破失效</dt>
+        <dd>{price(refs.support)}</dd>
+      </div>
+    </dl>
+  );
+}
+
+function ClosingBriefings({ data, open }) {
+  const [slot, setSlot] = useState(null);
+  if (!data) return null;
+  const latest = data.today.find((r) => r.slot === slot) || data.today[0] || data.latest;
+  return (
+    <section className="panel closing-panel">
+      <div className="section-heading">
+        <div>
+          <h2>尾盘通报</h2>
+          <p>
+            量 &gt;100万股 · 昨日 ≥{latest?.minimum_multiple || data.minimum_multiple || 3}倍 ·
+            仍符合参与条件
+          </p>
+        </div>
+        <div className="briefing-times">
+          {data.slots.map((t) => (
+            <button
+              key={t}
+              className={latest?.date === data.date && latest.slot === t ? 'selected' : ''}
+              disabled={!data.today.some((r) => r.slot === t)}
+              onClick={() => setSlot(t)}
+            >
+              {t}
+              <small>{data.windows?.[t] || '等待通报'}</small>
+            </button>
+          ))}
+        </div>
+      </div>
+      {latest ? (
+        <>
+          <p className="briefing-caption">
+            {latest.date} {latest.slot} MYT · 行情抓取 {time(latest.quote_at)}
+          </p>
+          {latest.items.length ? (
+            <div className="closing-picks">
+              {latest.items.map((item) => (
+                <article key={item.code}>
+                  <div>
+                    <strong>{item.code}</strong>
+                    <span>{price(item.price)}</span>
+                  </div>
+                  <p>
+                    <b>{volume(item.volume)}</b> · 昨日 <b>{number(item.multiple)}倍</b>
+                  </p>
+                  <p>{item.reason}</p>
+                  <p>
+                    关注 {price(item.resistance)} · 失效 {price(item.support)}
+                  </p>
+                  <button className="text-button" onClick={() => open(item.code)}>
+                    查看详情 <Icon name="arrow" size={14} />
+                  </button>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <p className="muted">本次没有符合完整条件的股票，不凑数。</p>
+          )}
+        </>
+      ) : (
+        <p className="muted">
+          {data.enabled
+            ? '交易日16:00、16:30生成精选；行情未准备好时延迟通报。'
+            : '定时通报已暂停。'}
+        </p>
+      )}
+      <p className="briefing-note">
+        {data.telegram ? 'Telegram＋网页通报' : '网页通报'} · 次日表现继续追踪，信号不保证上涨。
+      </p>
+      {data.follow.length > 0 && (
+        <details className="next-day-follow">
+          <summary>查看次日表现</summary>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>股票 / 通报</th>
+                  <th>通报参考价</th>
+                  <th>次日价</th>
+                  <th>变化</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.follow.map((item) => (
+                  <tr key={item.date + item.code}>
+                    <td>
+                      <button className="stock-link" onClick={() => open(item.code)}>
+                        {item.code}
+                      </button>
+                      <small>
+                        {item.date} {item.slot}
+                      </small>
+                    </td>
+                    <td>{price(item.reference_price)}</td>
+                    <td>
+                      {price(item.price)}
+                      <small>
+                        {item.next_date} · {item.status}
+                      </small>
+                    </td>
+                    <td className={item.change_pct >= 0 ? 'up' : 'down'}>
+                      {percent(item.change_pct)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="data-note">通报价格观察，不代表实际成交或收益。</p>
+        </details>
+      )}
+    </section>
+  );
 }
 function Opportunity({ report: r, favorite, toggle, open }) {
   return (
@@ -728,7 +856,7 @@ function Opportunity({ report: r, favorite, toggle, open }) {
       </div>
       <div className="stock-heading">
         <h3>{r.name}</h3>
-        <Status report={r} />
+        <Status report={r} compact />
       </div>
       <div className="card-price">
         {price(r.price)}
@@ -737,45 +865,11 @@ function Opportunity({ report: r, favorite, toggle, open }) {
         </span>
       </div>
       <VolumePanel report={r} compact />
-      {r.volume_setup?.qualified ? (
-        <SetupPanel report={r} compact />
-      ) : (
-        <SignalPanel report={r} compact />
-      )}
-      <p className="conclusion">{r.conclusion}</p>
-      <div className="entry-summary">
-        <span>参与参考</span>
-        <strong>
-          {r.potential_signal?.eligible
-            ? '突破关注 ' + price(r.potential_signal.resistance)
-            : r.volume_setup?.qualified
-              ? '突破关注 ' + price(r.volume_setup.resistance)
-              : r.levels
-                ? price(r.levels.zone_low) + '–' + number(r.levels.zone_high, 3)
-                : r.metrics
-                  ? '关注 ' + price(r.metrics.ma5) + ' 附近的支撑'
-                  : '等待资料更新'}
-        </strong>
-      </div>
-      <div className="evidence-chips">
-        {r.checks
-          .filter((c) => c.pass)
-          .map((c) => (
-            <span key={c.key}>
-              <Icon name="check" size={12} />
-              {c.key === 'trend'
-                ? '趋势支持'
-                : c.key === 'volume'
-                  ? '量能支持'
-                  : c.key === 'setup'
-                    ? '蓄势支持'
-                    : '突破支持'}
-            </span>
-          ))}
-      </div>
+      <p className="conclusion">{reportSummary(r)}</p>
+      <SignalLevels report={r} />
       <div className="card-bottom">
         <span>
-          {r.snapshot ? '收盘快照 · ' : '行情日期 · '}
+          {r.snapshot ? '收盘 · ' : ''}
           {r.quote_date || '资料待补齐'}
         </span>
         <button className="text-button" onClick={open}>
@@ -789,6 +883,25 @@ function Opportunity({ report: r, favorite, toggle, open }) {
 function VolumePanel({ report, compact = false }) {
   const signal = report.volume_signal;
   if (!signal) return <div className="volume-panel">正在等待成交量对比资料。</div>;
+  if (compact)
+    return (
+      <section className="volume-panel compact brief-volume" aria-label="成交量解读">
+        <div>
+          <span>本次成交</span>
+          <strong>{volume(signal.current)}</strong>
+        </div>
+        <div>
+          <span>昨日 {volume(signal.previous)}</span>
+          <strong>
+            {number(signal.multiple)}
+            <small> 倍</small>
+          </strong>
+        </div>
+        <p className={signal.pass ? 'volume-pass' : 'volume-wait'}>
+          {signal.pass ? '百万股、两倍量达标' : '本次成交量未达标'}
+        </p>
+      </section>
+    );
   const barMaximum = Math.max(signal.current || 0, signal.previous || 0, 1);
   const bars = [
     [signal.current_label, signal.current, 'current'],
@@ -903,32 +1016,36 @@ function CoveragePanel({ coverage, open }) {
   if (!coverage) return null;
   return (
     <section className="panel coverage-panel">
-      <h2>全市场追踪覆盖</h2>
-      <p>
-        上游返回 {coverage.expected} 只，已抓取 {coverage.received} 只，逐股分析 {coverage.analyzed}{' '}
-        只；{coverage.history_ready} 只具备至少20个历史交易日。已移出 {coverage.inactive}{' '}
-        条旧股票池记录。
-      </p>
-      <p>
-        待映射 {coverage.unmapped} 只 · 无日线 {coverage.missing_history} 只 · 历史交易日不足{' '}
-        {coverage.insufficient_history} 只 · 回填失败 {coverage.history_errors}{' '}
-        只。缺失资料自动重试，上市时间短或无成交的股票仍可能不足20日。
-      </p>
-      {coverage.issues.length > 0 && (
-        <details>
-          <summary>查看资料待补齐的股票（{coverage.issues.length} 只）</summary>
-          <div className="coverage-issues">
-            {coverage.issues.map((i) => (
-              <button className="stock-link" key={i.code} onClick={() => open(i.code)}>
-                <strong>{i.code}</strong>
-                <span>
-                  {i.reason} · 完整日线 {i.bars} 日
-                </span>
-              </button>
-            ))}
-          </div>
-        </details>
-      )}
+      <details>
+        <summary>
+          市场覆盖 {coverage.received}/{coverage.expected} · {coverage.issues.length}只资料待补齐
+        </summary>
+        <p>
+          上游返回 {coverage.expected} 只，已抓取 {coverage.received} 只，逐股分析{' '}
+          {coverage.analyzed} 只；{coverage.history_ready} 只具备至少20个历史交易日。已移出{' '}
+          {coverage.inactive} 条旧股票池记录。
+        </p>
+        <p>
+          待映射 {coverage.unmapped} 只 · 无日线 {coverage.missing_history} 只 · 历史交易日不足{' '}
+          {coverage.insufficient_history} 只 · 回填失败 {coverage.history_errors}{' '}
+          只。缺失资料自动重试，上市时间短或无成交的股票仍可能不足20日。
+        </p>
+        {coverage.issues.length > 0 && (
+          <details>
+            <summary>查看资料待补齐的股票（{coverage.issues.length} 只）</summary>
+            <div className="coverage-issues">
+              {coverage.issues.map((i) => (
+                <button className="stock-link" key={i.code} onClick={() => open(i.code)}>
+                  <strong>{i.code}</strong>
+                  <span>
+                    {i.reason} · 完整日线 {i.bars} 日
+                  </span>
+                </button>
+              ))}
+            </div>
+          </details>
+        )}
+      </details>
     </section>
   );
 }
@@ -1312,130 +1429,126 @@ function StockDetail({ code, close, favorite, toggle }) {
               )}
             </section>
           )}
-          <SignalPanel report={r} />
-          {((!r.potential_signal && !r.tracking_signal) || r.volume_setup?.qualified) && (
-            <SetupPanel report={r} />
-          )}
           <div className={`verdict ${r.stage}`}>
             <Status report={r} />
-            {r.snapshot && (
-              <span className="snapshot-label">按 {r.quote_date} 最近交易日快照分析</span>
-            )}
-            <h3>{r.conclusion}</h3>
-            <div className="analyst-plan">
-              <p>
-                <strong>参与参考</strong>
-                {r.entry_plan}
-              </p>
-              <p>
-                <strong>接下来关注</strong>
-                {r.monitor_plan}
-              </p>
-            </div>
+            <h3>{reportSummary(r)}</h3>
+            <SignalLevels report={r} />
           </div>
           <PriceChart history={r.history} levels={r.levels} />
-          <section className="detail-section">
-            <div className="section-heading">
-              <h3>本次筛选条件核对</h3>
-              <span className="muted">
-                {r.evidence_count}/{r.checks.length} 项依据满足 · 非上涨概率
-              </span>
-            </div>
-            <div className="detail-checks">
-              {r.checks.map((c) => (
-                <div key={c.key}>
-                  <span className={`check-icon ${c.pass ? 'passed' : ''}`}>
-                    <Icon name={c.pass ? 'check' : 'search'} size={18} />
-                  </span>
-                  <div>
-                    <h4>
-                      {c.label}
-                      <span>{c.pass ? '已满足' : c.available ? '待确认' : '资料不足'}</span>
-                    </h4>
-                    <p>{c.detail}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </section>
-          {r.levels && (
+          <details className="detail-expanded">
+            <summary>查看完整分析、历史信号与风险</summary>
+            <p className="conclusion">{r.conclusion}</p>
+            <SignalPanel report={r} />
+            {((!r.potential_signal && !r.tracking_signal) || r.volume_setup?.qualified) && (
+              <SetupPanel report={r} />
+            )}
             <section className="detail-section">
-              <h3>形态的关键价位</h3>
-              <div className="levels-grid">
-                <div>
-                  <span>形态参考区间</span>
-                  <strong>
-                    {price(r.levels.zone_low)}–{number(r.levels.zone_high, 3)}
-                  </strong>
-                  <p>从突破位到其上方3%，仅作观察</p>
-                </div>
-                <div className="risk-level">
-                  <span>形态失效参考</span>
-                  <strong>{price(r.levels.invalidation)}</strong>
-                  <p>跌破后需要重新评估原有依据</p>
-                </div>
-                <div>
-                  <span>形态量度目标</span>
-                  <strong>{price(r.levels.target)}</strong>
-                  <p>按形态高度推算，可能无法达到</p>
-                </div>
+              <div className="section-heading">
+                <h3>本次筛选条件核对</h3>
+                <span className="muted">
+                  {r.evidence_count}/{r.checks.length} 项依据满足 · 非上涨概率
+                </span>
               </div>
-              <p className="data-note">
-                按现价估算：到失效参考位 {number(r.levels.risk_pct)}%，到量度目标{' '}
-                {number(r.levels.reward_pct)}%。空间比 {number(r.levels.rr)}
-                ，未计费用与滑点。跳空可能越过参考价。
-              </p>
-              {r.pattern && (
-                <p className="data-note">
-                  形态匹配度 {r.pattern.score}/100 · 日线突破日期 {r.pattern.date} · 不是预测胜率。
-                </p>
-              )}
-            </section>
-          )}
-          <section className="risk-box">
-            <h3>
-              <Icon name="shield" size={18} /> 什么时候放弃原有判断
-            </h3>
-            <p>{r.invalidation_plan}</p>
-            <ul>
-              {r.risks.map((v) => (
-                <li key={v}>{v}</li>
-              ))}
-            </ul>
-          </section>
-          <details className="method-details">
-            <summary>查看具体指标与计算口径</summary>
-            {r.metrics ? (
-              <dl>
-                <div>
-                  <dt>20个交易日价格变化</dt>
-                  <dd>{percent(r.metrics.gain20)}</dd>
-                </div>
-                <div>
-                  <dt>累计量 / 上一交易日全天量</dt>
-                  <dd>{number(r.metrics.vr)}x</dd>
-                </div>
-                {[5, 10, 15, 20].map((n) => (
-                  <div key={n}>
-                    <dt>近{n}日平均价（含本次现价）</dt>
-                    <dd>{price(r.metrics[`ma${n}`])}</dd>
+              <div className="detail-checks">
+                {r.checks.map((c) => (
+                  <div key={c.key}>
+                    <span className={`check-icon ${c.pass ? 'passed' : ''}`}>
+                      <Icon name={c.pass ? 'check' : 'search'} size={18} />
+                    </span>
+                    <div>
+                      <h4>
+                        {c.label}
+                        <span>{c.pass ? '已满足' : c.available ? '待确认' : '资料不足'}</span>
+                      </h4>
+                      <p>{c.detail}</p>
+                    </div>
                   </div>
                 ))}
-              </dl>
-            ) : (
-              <p>指标资料不足。</p>
+              </div>
+            </section>
+            {r.levels && (
+              <section className="detail-section">
+                <h3>形态的关键价位</h3>
+                <div className="levels-grid">
+                  <div>
+                    <span>形态参考区间</span>
+                    <strong>
+                      {price(r.levels.zone_low)}–{number(r.levels.zone_high, 3)}
+                    </strong>
+                    <p>从突破位到其上方3%，仅作观察</p>
+                  </div>
+                  <div className="risk-level">
+                    <span>形态失效参考</span>
+                    <strong>{price(r.levels.invalidation)}</strong>
+                    <p>跌破后需要重新评估原有依据</p>
+                  </div>
+                  <div>
+                    <span>形态量度目标</span>
+                    <strong>{price(r.levels.target)}</strong>
+                    <p>按形态高度推算，可能无法达到</p>
+                  </div>
+                </div>
+                <p className="data-note">
+                  按现价估算：到失效参考位 {number(r.levels.risk_pct)}%，到量度目标{' '}
+                  {number(r.levels.reward_pct)}%。空间比 {number(r.levels.rr)}
+                  ，未计费用与滑点。跳空可能越过参考价。
+                </p>
+                {r.pattern && (
+                  <p className="data-note">
+                    形态匹配度 {r.pattern.score}/100 · 日线突破日期 {r.pattern.date} ·
+                    不是预测胜率。
+                  </p>
+                )}
+              </section>
             )}
+            <section className="risk-box">
+              <h3>
+                <Icon name="shield" size={18} /> 什么时候放弃原有判断
+              </h3>
+              <p>{r.invalidation_plan}</p>
+              <ul>
+                {r.risks.map((v) => (
+                  <li key={v}>{v}</li>
+                ))}
+              </ul>
+            </section>
+            <details className="method-details">
+              <summary>查看具体指标与计算口径</summary>
+              {r.metrics ? (
+                <dl>
+                  <div>
+                    <dt>20个交易日价格变化</dt>
+                    <dd>{percent(r.metrics.gain20)}</dd>
+                  </div>
+                  <div>
+                    <dt>累计量 / 上一交易日全天量</dt>
+                    <dd>{number(r.metrics.vr)}x</dd>
+                  </div>
+                  {[5, 10, 15, 20].map((n) => (
+                    <div key={n}>
+                      <dt>近{n}日平均价（含本次现价）</dt>
+                      <dd>{price(r.metrics[`ma${n}`])}</dd>
+                    </div>
+                  ))}
+                </dl>
+              ) : (
+                <p>指标资料不足。</p>
+              )}
+            </details>
+            <div className="detail-source">
+              <h4>资料来源与时间</h4>
+              <p>
+                {r.sources.quotes} · 数据日期 {r.quote_date || '待核对'} · 抓取 {time(r.fetched_at)}
+              </p>
+              <p>
+                {r.sources.history} · 最新日线 {r.history_date || '待补齐'}
+              </p>
+              <p>{r.sources.timing}</p>
+            </div>
           </details>
-          <div className="detail-source">
-            <h4>资料来源与时间</h4>
-            <p>
-              {r.sources.quotes} · 数据日期 {r.quote_date || '待核对'} · 抓取 {time(r.fetched_at)}
-            </p>
-            <p>
-              {r.sources.history} · 最新日线 {r.history_date || '待补齐'}
-            </p>
-            <p>{r.sources.timing}</p>
-          </div>
+          <p className="data-note">
+            报价 {time(r.fetched_at)} · 日线 {r.history_date || '待更新'} · 信号不保证次日上涨
+          </p>
         </div>
       )}
     </Modal>
@@ -1651,6 +1764,8 @@ function AdminSettings({ state, close, updated }) {
     const patch = Object.fromEntries(fields.map(([key]) => [key, Number(draft[key])]));
     patch.window = draft.window;
     patch.screen_on = draft.screen_on;
+    patch.final_briefing_on = draft.final_briefing_on !== false;
+    patch.final_briefing_telegram = draft.final_briefing_telegram !== false;
     mutate('/api/settings', patch);
   };
   return (
@@ -1705,7 +1820,23 @@ function AdminSettings({ state, close, updated }) {
               checked={draft.screen_on !== false}
               onChange={(e) => setDraft({ ...draft, screen_on: e.target.checked })}
             />{' '}
-            将达标筛选加入每日广播
+            启用趋势筛选
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={draft.final_briefing_on !== false}
+              onChange={(e) => setDraft({ ...draft, final_briefing_on: e.target.checked })}
+            />
+            16:00、16:30尾盘通报
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={draft.final_briefing_telegram !== false}
+              onChange={(e) => setDraft({ ...draft, final_briefing_telegram: e.target.checked })}
+            />
+            尾盘通报发送到Telegram
           </label>
         </div>
         <p className="data-note">

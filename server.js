@@ -18,6 +18,16 @@ import {
 } from './lib/analysis.js';
 import { validateSettings, parameterPatch, ValidationError } from './lib/settings.js';
 import { protectApi } from './lib/security.js';
+import {
+  BRIEFING_SLOTS,
+  dueBriefingSlots,
+  finalCandidates,
+  conciseReason,
+  formatBriefing,
+  nextTradingDate,
+  slotTimestamp,
+  tradingDay,
+} from './lib/briefings.js';
 
 const IS_ENTRY =
   !!process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
@@ -30,7 +40,7 @@ const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 const DB_PATH = path.join(DATA_DIR, 'data.db');
 const DIST = path.join(__dirname, 'dist');
 const PORT = process.env.PORT || 8080;
-const VERSION = 'v2.3.1-market-tracking';
+const VERSION = 'v2.4-closing-briefings';
 let analysisCache = null;
 
 const DEFAULTS = {
@@ -61,6 +71,8 @@ const DEFAULTS = {
   llm_api_key: '', // DeepSeek API key(留空则只支持斜杠命令, 不支持自然语言)
   pick_count: 3, // 每日精选几只(宁少勿多, 别让用户被一堆票淹没)
   min_average_daily_value: 200000, // 最近20个完整交易日平均成交额估算下限(RM)
+  final_briefing_on: true,
+  final_briefing_telegram: true,
   win_pct: 8, // 观察名单里涨到这个幅度算「应证」
   loss_pct: 5, // 跌到这个幅度算「证伪」
   watch_days: 15, // 观察多少天后没动静就归档
@@ -271,6 +283,17 @@ db.exec(`CREATE TABLE IF NOT EXISTS notification_outbox (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, text TEXT, attempts INTEGER DEFAULT 0,
   sent_at INTEGER, last_error TEXT
 );`);
+db.exec(`CREATE TABLE IF NOT EXISTS closing_briefings (
+  date TEXT,slot TEXT,created_at REAL,quote_at REAL,status TEXT,items TEXT,text TEXT,outbox_id INTEGER,
+  minimum_multiple REAL DEFAULT 3,
+  PRIMARY KEY(date,slot));`);
+if (
+  !db
+    .prepare('PRAGMA table_info(closing_briefings)')
+    .all()
+    .some((c) => c.name === 'minimum_multiple')
+)
+  db.exec('ALTER TABLE closing_briefings ADD COLUMN minimum_multiple REAL DEFAULT 3');
 // Earlier versions counted polls as days. Recalculate surviving observations from stored trading dates.
 if (!db.prepare("SELECT 1 FROM kv WHERE k='observation_days_v2'").get()) {
   db.prepare(
@@ -1602,13 +1625,17 @@ function updateWatchlist(cfg) {
   return { picks, updates, tally };
 }
 
-function prepareBroadcast(cfg) {
+function prepareBroadcast(cfg, { includeShortlist = true } = {}) {
   const date = marketDate(),
     parts = [],
     observations = updateWatchlist(cfg);
   const shortlist = getAnalysisOverview(cfg);
   const signature = date + '|' + shortlist.candidates.map((report) => report.code).join(',');
-  if (shortlist.candidates.length && kvGet('shortlist_broadcast_signature', '') !== signature) {
+  if (
+    includeShortlist &&
+    shortlist.candidates.length &&
+    kvGet('shortlist_broadcast_signature', '') !== signature
+  ) {
     parts.push(
       '🔎 全市场筛选 · 优先考虑 ' +
         shortlist.candidates.length +
@@ -1683,7 +1710,7 @@ function runBroadcast(cfg) {
       await evaluatePriceDrop(cfg, dropPool);
       await evaluateGapUp(cfg, gapPool);
       await evaluateDoubleBottom(cfg);
-      const text = prepareBroadcast(cfg);
+      const text = prepareBroadcast(cfg, { includeShortlist: cfg.final_briefing_on === false });
       if (text && cfg.telegram_bot_token && cfg.telegram_chat_id)
         db.prepare('INSERT INTO notification_outbox(ts,text) VALUES(?,?)').run(
           Math.floor(Date.now() / 1000),
@@ -2218,6 +2245,187 @@ function startPolling() {
     pollTelegram();
   }, 5000);
   pollTelegram();
+  setInterval(() => {
+    maybeFinalBriefings().catch((e) => log('尾盘通报失败: ' + e.message));
+  }, 15000);
+  maybeFinalBriefings().catch((e) => log('尾盘通报启动检查失败: ' + e.message));
+}
+
+function recordFinalBriefing(slot, cfg = loadConfig(), now = Date.now() / 1000) {
+  const date = marketDate(now);
+  const completed = db
+    .prepare('SELECT slot FROM closing_briefings WHERE date=?')
+    .all(date)
+    .map((r) => r.slot);
+  if (!dueBriefingSlots(cfg, completed, now).includes(slot)) return null;
+  getAnalysisOverview(cfg);
+  const scan = analysisCache.data.coverage;
+  // A complete scan fetched after this slot is required, even for an empty bulletin.
+  if (
+    !scan.scan_at ||
+    scan.scan_at < slotTimestamp(date, slot) ||
+    scan.scan_at > now ||
+    now - scan.scan_at > 180 ||
+    scan.expected !== scan.received
+  )
+    return null;
+  const items = finalCandidates(analysisCache.ranked, cfg, slot, now).map((r) => ({
+    code: r.code,
+    name: r.name,
+    price: r.price,
+    volume: r.volume,
+    previous_volume: r.volume_signal.previous,
+    previous_date: r.volume_signal.previous_date,
+    multiple: r.volume_signal.multiple,
+    stage: r.stage,
+    reason: conciseReason(r),
+    resistance: r.potential_signal.resistance,
+    support: r.potential_signal.support,
+    quote_at: r.fetched_at,
+  }));
+  const record = {
+    date,
+    slot,
+    created_at: now,
+    quote_at: scan.scan_at,
+    status: items.length ? 'ready' : 'empty',
+    items,
+    minimum_multiple: Math.max(3, cfg.screen_vol_mult || 2),
+  };
+  const text = formatBriefing(record, process.env.PUBLIC_URL || 'https://synthe-fantasia.site/');
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    let outboxId = null;
+    if (cfg.final_briefing_telegram !== false && cfg.telegram_bot_token && cfg.telegram_chat_id) {
+      outboxId = Number(
+        db
+          .prepare('INSERT INTO notification_outbox(ts,text) VALUES(?,?)')
+          .run(Math.floor(now), text).lastInsertRowid,
+      );
+    }
+    db.prepare(
+      'INSERT INTO closing_briefings(date,slot,created_at,quote_at,status,items,text,outbox_id,minimum_multiple) VALUES(?,?,?,?,?,?,?,?,?)',
+    ).run(
+      date,
+      slot,
+      now,
+      scan.scan_at,
+      record.status,
+      JSON.stringify(items),
+      text,
+      outboxId,
+      record.minimum_multiple,
+    );
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  return record;
+}
+
+let finalBriefingPromise = null;
+function maybeFinalBriefings() {
+  if (finalBriefingPromise) return finalBriefingPromise;
+  finalBriefingPromise = (async () => {
+    const cfg = loadConfig(),
+      date = marketDate();
+    const done = db
+      .prepare('SELECT slot FROM closing_briefings WHERE date=?')
+      .all(date)
+      .map((r) => r.slot);
+    const slots = dueBriefingSlots(cfg, done);
+    if (!slots.length) return;
+    await poll(); // force a fresh whole-market scan at the slot, independent of normal polling.
+    let recorded = false;
+    const currentCfg = loadConfig();
+    for (const slot of slots) if (recordFinalBriefing(slot, currentCfg)) recorded = true;
+    if (recorded) broadcast();
+    await deliverOutbox(currentCfg);
+  })().finally(() => {
+    finalBriefingPromise = null;
+  });
+  return finalBriefingPromise;
+}
+
+function closingBriefingState(cfg = loadConfig()) {
+  const date = marketDate(),
+    now = Date.now() / 1000;
+  const records = db
+    .prepare('SELECT * FROM closing_briefings ORDER BY date DESC,slot DESC LIMIT 12')
+    .all()
+    .map((r) => ({ ...r, items: JSON.parse(r.items), text: undefined, outbox_id: undefined }));
+  const today = records.filter((r) => r.date === date);
+  const previous = records.filter((r) => r.date < date);
+  const seen = new Set(),
+    follow = [];
+  for (const record of previous)
+    for (const item of record.items) {
+      const key = record.date + '|' + item.code;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const target = nextTradingDate(record.date, cfg.market_holidays || []);
+      const completed = target < date || (target === date && now >= slotTimestamp(date, '17:00'));
+      const bar = completed
+        ? db
+            .prepare('SELECT close FROM daily_vol WHERE stock=? AND date=? AND close>0')
+            .get(item.code, target)
+        : null;
+      const live = db
+        .prepare('SELECT price,session_date,mtime FROM live WHERE stock=?')
+        .get(item.code);
+      const intraday =
+        !bar &&
+        target === date &&
+        live?.session_date === date &&
+        live.price > 0 &&
+        now - live.mtime <= 900;
+      const observed = bar?.close || (intraday ? live.price : null);
+      follow.push({
+        code: item.code,
+        date: record.date,
+        slot: record.slot,
+        reference_price: item.price,
+        next_date: target,
+        price: observed,
+        change_pct: observed ? +((observed / item.price - 1) * 100).toFixed(2) : null,
+        status: bar
+          ? '次日收盘'
+          : intraday
+            ? '次日盘中'
+            : target > date
+              ? '等待次日'
+              : '资料待更新',
+      });
+    }
+  const windows = Object.fromEntries(
+    BRIEFING_SLOTS.map((slot) => [
+      slot,
+      cfg.final_briefing_on === false
+        ? '已暂停'
+        : !tradingDay(date, cfg.market_holidays || [])
+          ? '休市'
+          : today.some((r) => r.slot === slot)
+            ? '已通报'
+            : now < slotTimestamp(date, slot)
+              ? '待通报'
+              : now < slotTimestamp(date, slot) + 600
+                ? '正在准备'
+                : '已过时点',
+    ]),
+  );
+  return {
+    date,
+    slots: BRIEFING_SLOTS,
+    windows,
+    minimum_multiple: Math.max(3, cfg.screen_vol_mult || 2),
+    enabled: cfg.final_briefing_on !== false,
+    telegram:
+      cfg.final_briefing_telegram !== false && !!(cfg.telegram_bot_token && cfg.telegram_chat_id),
+    today,
+    latest: records[0] || null,
+    follow: follow.slice(0, 12),
+  };
 }
 
 // ---------------- SSE ----------------
@@ -2443,7 +2651,7 @@ function getAnalysisOverview(cfg) {
     covered: reports.filter((r) => !!r.metrics).length,
     rule: '分别识别放量蓄势、回调整理后的放量转强、放量突破三条路径。当前精选须百万股及昨日两倍量同时达标，价格未明显拉升。过去已达标的信号另行持续追踪，不因今天量倍数下降而消失。',
   };
-  analysisCache = { ts: Date.now(), data, reports, decisions, tracking };
+  analysisCache = { ts: Date.now(), data, reports, decisions, tracking, ranked: candidates };
   return data;
 }
 
@@ -2504,6 +2712,8 @@ function buildState() {
       llm_ready: !!(cfg.llm_api_key || '').trim(),
       pick_count: cfg.pick_count ?? 3,
       min_average_daily_value: cfg.min_average_daily_value ?? 200000,
+      final_briefing_on: cfg.final_briefing_on !== false,
+      final_briefing_telegram: cfg.final_briefing_telegram !== false,
       win_pct: cfg.win_pct ?? 8,
       loss_pct: cfg.loss_pct ?? 5,
       watch_days: cfg.watch_days ?? 15,
@@ -2518,6 +2728,7 @@ function buildState() {
     stocks: computeMetrics(cfg),
     insights: getAnalysisOverview(cfg),
     observations: observationState(),
+    closing_briefings: closingBriefingState(cfg),
     alerts: db.prepare('SELECT * FROM alerts ORDER BY id DESC LIMIT 50').all(),
     admin_enabled: !!process.env.ADMIN_TOKEN,
     status: {
@@ -3117,6 +3328,9 @@ export {
   evaluatePriceDrop,
   evaluateDoubleBottom,
   prepareBroadcast,
+  recordFinalBriefing,
+  maybeFinalBriefings,
+  closingBriefingState,
   deliverOutbox,
   runBroadcast,
   findDoubleBottom,

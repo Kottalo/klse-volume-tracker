@@ -302,13 +302,13 @@ h1 {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 14px;
-  margin-bottom: 35px;
+  margin-bottom: 24px;
 }
 .stat {
   border: 1px solid var(--line);
   background: #121b24;
   border-radius: 12px;
-  padding: 21px 23px;
+  padding: 16px 20px;
 }
 .stat > span {
   font-size: 11px;
@@ -318,7 +318,7 @@ h1 {
   font-size: 30px;
   font-weight: 600;
   letter-spacing: -1px;
-  margin: 12px 0 9px;
+  margin: 8px 0 6px;
   font-variant-numeric: tabular-nums;
 }
 .stat-value small {
@@ -1672,15 +1672,15 @@ tr:hover td {
     margin: 0 5px;
   }
   .stats-grid {
-    gap: 10px;
-    margin-bottom: 25px;
+    gap: 8px;
+    margin-bottom: 18px;
   }
   .stat {
-    padding: 16px;
+    padding: 11px 12px;
   }
   .stat-value {
-    font-size: 26px;
-    margin: 9px 0 6px;
+    font-size: 24px;
+    margin: 5px 0 3px;
   }
   .stat-value small {
     font-size: 9px;
@@ -2120,5 +2120,167 @@ tr:hover td {
   .volume-bar-row strong {
     grid-column: 2;
     grid-row: 1;
+  }
+}
+
+.brief-levels {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin: 12px 0 16px;
+}
+.brief-levels dt {
+  font-size: 11px;
+  color: #92a8b8;
+  margin-bottom: 5px;
+}
+.brief-levels dd {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+.brief-volume {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 12px 14px;
+  margin: 14px 0;
+}
+.brief-volume div {
+  display: grid;
+  gap: 5px;
+}
+.brief-volume div:last-of-type {
+  text-align: right;
+}
+.brief-volume span {
+  font-size: 10px;
+  color: #9cbab0;
+}
+.brief-volume strong {
+  font-size: 19px;
+  font-variant-numeric: tabular-nums;
+}
+.brief-volume small {
+  font-size: 11px;
+}
+.brief-volume p {
+  grid-column: 1/-1;
+  font-size: 10px;
+  margin: 3px 0 0;
+}
+.criteria-line,
+.briefing-caption,
+.briefing-note {
+  color: #92a8b8;
+  font-size: 12px;
+  line-height: 1.7;
+}
+.criteria-line {
+  margin: 0 0 16px;
+}
+.closing-panel {
+  margin: 0 0 28px;
+  border-color: #427564;
+}
+.closing-panel .section-heading {
+  margin-bottom: 12px;
+}
+.briefing-times {
+  display: flex;
+  gap: 7px;
+}
+.briefing-times button {
+  border: 1px solid #384956;
+  background: #1b2833;
+  color: #b8cad6;
+  border-radius: 6px;
+  padding: 7px 14px;
+  font-size: 14px;
+}
+.briefing-times button.selected {
+  border-color: #58d9a9;
+  color: #58d9a9;
+}
+.briefing-times small {
+  display: block;
+  font-size: 10px;
+  margin-top: 4px;
+  color: #92a8b8;
+}
+.closing-picks {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+.closing-picks article {
+  padding: 14px;
+  background: #172923;
+  border: 1px solid #335b4c;
+  border-radius: 9px;
+}
+.closing-picks article > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.closing-picks article p {
+  font-size: 12px;
+  line-height: 1.7;
+  color: #b5c9c0;
+  margin: 8px 0;
+}
+.closing-picks article b {
+  color: #70deb3;
+}
+.closing-picks article button {
+  margin-top: 6px;
+}
+.briefing-note {
+  margin-bottom: 0;
+}
+.next-day-follow {
+  margin-top: 14px;
+}
+.next-day-follow summary,
+.detail-expanded summary,
+.coverage-panel summary {
+  cursor: pointer;
+  color: #c8d8e0;
+  font-size: 13px;
+  line-height: 1.8;
+}
+.next-day-follow td small {
+  display: block;
+  color: #8b9fae;
+  font-size: 10px;
+  margin-top: 5px;
+}
+.detail-expanded {
+  margin-top: 24px;
+}
+.detail-expanded .detail-section,
+.detail-expanded .risk-box {
+  margin-top: 24px;
+}
+@media (max-width: 640px) {
+  .closing-picks {
+    grid-template-columns: 1fr;
+  }
+  .closing-panel .section-heading {
+    align-items: flex-start;
+    gap: 12px;
+  }
+  .briefing-times button {
+    padding: 7px 10px;
+  }
+  .brief-volume strong {
+    font-size: 18px;
+  }
+  .stock-heading h3 {
+    max-width: 65%;
+  }
+  .briefing-times {
+    flex-shrink: 0;
   }
 }
