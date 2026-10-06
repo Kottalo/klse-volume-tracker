@@ -30,7 +30,7 @@ const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 const DB_PATH = path.join(DATA_DIR, 'data.db');
 const DIST = path.join(__dirname, 'dist');
 const PORT = process.env.PORT || 8080;
-const VERSION = 'v2.3-market-tracking';
+const VERSION = 'v2.3.1-market-tracking';
 let analysisCache = null;
 
 const DEFAULTS = {
@@ -447,8 +447,10 @@ async function fetchMarket() {
       if (!ticker || seen.has(ticker)) throw new Error('分页出现缺失或重复股票代码');
       seen.add(ticker);
       received++;
-      const numericCode =
-        typeof isin === 'string' ? isin.match(/^MY[A-Z](\d{4})OO\d{3}$/)?.[1] || null : null;
+      // Main/ACE codes have four digits; LEAP codes have five digits and one O.
+      const isinCode =
+        typeof isin === 'string' ? isin.match(/^MY[A-Z](?:(\d{4})OO|(\d{5})O)\d{3}$/) : null;
+      const numericCode = isinCode?.[1] || isinCode?.[2] || null;
       symbols.push({ ticker, name, numericCode });
       if (!(close > 0)) continue;
       out.push({
@@ -478,7 +480,10 @@ async function fetchMarket() {
 
 function storeUniverse(quotes) {
   const stmt = db.prepare(
-    'INSERT INTO universe(stock,name,code,active,last_seen) VALUES(?,?,?,1,?) ON CONFLICT(stock) DO UPDATE SET name=excluded.name,code=COALESCE(excluded.code,universe.code),active=1,last_seen=excluded.last_seen',
+    `INSERT INTO universe(stock,name,code,active,last_seen) VALUES(?,?,?,1,?) ON CONFLICT(stock) DO UPDATE SET name=excluded.name,
+    history_attempt=CASE WHEN universe.code IS NULL AND excluded.code IS NOT NULL THEN NULL ELSE universe.history_attempt END,
+    history_error=CASE WHEN universe.code IS NULL AND excluded.code IS NOT NULL THEN NULL ELSE universe.history_error END,
+    code=COALESCE(excluded.code,universe.code),active=1,last_seen=excluded.last_seen`,
   );
   db.exec('BEGIN');
   try {

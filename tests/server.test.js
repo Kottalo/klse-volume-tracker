@@ -624,3 +624,49 @@ test('legacy slow polling is capped at five minutes and settings reject slower i
   assert.equal(server.loadConfig().poll_interval_minutes, 5);
   assert.equal((await post('/api/settings', { poll_interval_minutes: 30 })).status, 400);
 });
+
+test('five-digit LEAP ISIN codes repair mapping and immediately retry a previous mapping failure', async () => {
+  reset();
+  quote('POLYDM');
+  db.prepare('UPDATE universe SET code=NULL,history_attempt=?,history_error=? WHERE stock=?').run(
+    fixed / 1000,
+    'Yahoo 暂无匹配的数字代码',
+    'POLYDM',
+  );
+  globalThis.fetch = async () =>
+    Response.json({
+      totalCount: 1,
+      data: [
+        {
+          d: [
+            'POLYDM',
+            'Polydamic Group Bhd.',
+            0.45,
+            0.45,
+            0,
+            0,
+            0,
+            100000,
+            100000,
+            0.45,
+            0.45,
+            'MYL03031O001',
+          ],
+        },
+      ],
+    });
+  try {
+    const quotes = await server.fetchMarket();
+    assert.equal(quotes[0].numericCode, '03031');
+    server.storeUniverse(quotes);
+    const u = db.prepare('SELECT * FROM universe WHERE stock=?').get('POLYDM');
+    assert.equal(u.code, '03031');
+    assert.equal(u.history_attempt, null);
+    assert.equal(u.history_error, null);
+    assert.equal(server.historyRefreshQueue().length, 1);
+    const unknown = await (await realFetch(base + '/api/stocks/POLYDM')).json();
+    assert.equal(unknown.stage, 'insufficient');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
