@@ -445,6 +445,70 @@ h2 {
   background: #68ddba10;
   border-color: #3a6559;
 }
+.status-pill.building {
+  color: #85c8ff;
+  background: #16364a;
+  border-color: #38566b;
+}
+.status-pill.tracking {
+  color: var(--amber);
+  background: #efbf7610;
+  border-color: #5c503c;
+}
+.tracking-section,
+.coverage-panel {
+  margin-top: 24px;
+}
+.coverage-panel h2 {
+  font-size: 18px;
+}
+.coverage-panel p {
+  font-size: 12px;
+  line-height: 1.8;
+  color: #aebdca;
+}
+.coverage-issues,
+.signal-search-results {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+.signal-search {
+  display: flex;
+  gap: 10px;
+  margin-top: 18px;
+  flex-wrap: wrap;
+}
+.signal-search input {
+  flex: 1;
+  min-width: 180px;
+  background: #101d27;
+  border: 1px solid #354a57;
+  border-radius: 8px;
+  color: #def0ed;
+  padding: 12px;
+}
+.selection-panel {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid #546473;
+  background: #1c2c36;
+  border-radius: 10px;
+}
+.selection-panel h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+.selection-panel p {
+  font-size: 12px;
+  line-height: 1.8;
+  margin: 4px 0;
+}
+.signal-record + .signal-record {
+  border-top: 1px solid #315450;
+  margin-top: 12px;
+  padding-top: 12px;
+}
 .setup-panel {
   background: #132e30;
   border: 1px solid #315450;
@@ -1998,6 +2062,14 @@ tr:hover td {
   gap: 14px;
   margin-top: 22px;
 }
+.tracking-volume {
+  color: #a5b8c8;
+  font-size: 13px;
+  line-height: 1.8;
+}
+.tracking-volume strong {
+  color: #dfeaf4;
+}
 .volume-bar-row {
   display: grid;
   grid-template-columns: 125px minmax(20px, 1fr) 130px;
@@ -2034,7 +2106,8 @@ tr:hover td {
     gap: 8px;
   }
   .volume-numbers strong {
-    font-size: 18px;
+    font-size: 16px;
+    white-space: nowrap;
   }
   .volume-bar-row {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);

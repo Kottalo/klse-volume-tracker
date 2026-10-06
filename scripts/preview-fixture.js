@@ -92,6 +92,22 @@ db.prepare('INSERT INTO alerts(ts,stock,name,kind,message) VALUES(?,?,?,?,?)').r
 );
 db.prepare("INSERT INTO kv(k,v) VALUES('last_successful_poll',?)").run(String(fixed / 1000));
 const port = Number(process.env.PREVIEW_PORT || 8091);
+// An explicitly labelled historical replay for the BUSCAP acceptance case.
+const buscap = JSON.parse(
+  fs.readFileSync(new URL('../tests/fixtures/buscap-2026.json', import.meta.url), 'utf8'),
+);
+if (reviewDate === buscap.snapshot.date) {
+  db.prepare('INSERT INTO universe(stock,name,code) VALUES(?,?,?)').run(
+    'BUSCAP',
+    '示例 · BUSCAP 历史回放',
+    '0455',
+  );
+  db.prepare(
+    'INSERT INTO live(stock,name,price,prevClose,volume,mtime,session_date) VALUES(?,?,?,?,?,?,?)',
+  ).run('BUSCAP', '示例 · BUSCAP 历史回放', 0.785, 0.66, 6855800, fixed / 1000, reviewDate);
+  for (const b of buscap.bars)
+    insert.run('BUSCAP', b.date, b.volume, b.open, b.high, b.low, b.close);
+}
 const httpServer = app.listen(port, '127.0.0.1', () =>
   console.log('Offline fixture: http://localhost:' + port + ' — all stock data is synthetic.'),
 );

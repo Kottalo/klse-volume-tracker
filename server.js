@@ -30,7 +30,7 @@ const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 const DB_PATH = path.join(DATA_DIR, 'data.db');
 const DIST = path.join(__dirname, 'dist');
 const PORT = process.env.PORT || 8080;
-const VERSION = 'v2.2-volume-setup';
+const VERSION = 'v2.3-market-tracking';
 let analysisCache = null;
 
 const DEFAULTS = {
@@ -143,6 +143,8 @@ function loadConfig() {
   if (process.env.TELEGRAM_CHAT_ID) cfg.telegram_chat_id = process.env.TELEGRAM_CHAT_ID;
   if (process.env.OANOR_KLSE_API_KEY) cfg.oanor_api_key = process.env.OANOR_KLSE_API_KEY;
   if (process.env.LLM_API_KEY) cfg.llm_api_key = process.env.LLM_API_KEY;
+  // Long legacy intervals can miss the entire early breakout window.
+  cfg.poll_interval_minutes = Math.min(5, Math.max(1, Number(cfg.poll_interval_minutes) || 5));
   return cfg;
 }
 
@@ -186,6 +188,22 @@ db.exec(`
 CREATE TABLE IF NOT EXISTS daily_vol(
     stock TEXT, date TEXT, volume INTEGER, PRIMARY KEY(stock, date));
 `);
+for (const [table, column, type] of [
+  ['universe', 'active', 'INTEGER DEFAULT 1'],
+  ['universe', 'last_seen', 'REAL'],
+  ['universe', 'history_attempt', 'REAL'],
+  ['universe', 'history_success', 'REAL'],
+  ['universe', 'history_error', 'TEXT'],
+  ['live', 'high', 'REAL'],
+  ['live', 'low', 'REAL'],
+]) {
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  } catch {}
+}
+db.exec(`CREATE TABLE IF NOT EXISTS potential_events (
+  stock TEXT, date TEXT, kind TEXT, first_seen REAL, last_seen REAL, signal TEXT,
+  PRIMARY KEY(stock,date,kind));`);
 // 迁移: 旧库 live 表补 prevClose / open 列
 try {
   db.exec('ALTER TABLE live ADD COLUMN prevClose REAL');
@@ -296,12 +314,20 @@ function prune() {
 
 // ---------------- Yahoo 数据 ----------------
 async function yahooGet(url) {
-  const res = await fetch(url, {
-    headers: { 'User-Agent': 'Mozilla/5.0' },
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+  let error;
+  for (const host of ['query1.finance.yahoo.com', 'query2.finance.yahoo.com']) {
+    try {
+      const res = await fetch(url.replace('query1.finance.yahoo.com', host), {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      error = e;
+    }
+  }
+  throw error;
 }
 
 function parseChart(d) {
@@ -369,7 +395,7 @@ async function fetchDaily(code, range = '1y') {
 
 // ---------------- TradingView scanner 数据源(全市场, 免费无 key) ----------------
 const TV_COLUMNS =
-  'name,description,open,close,volume,change,change_abs,average_volume_10d_calc,average_volume_30d_calc';
+  'name,description,open,close,volume,change,change_abs,average_volume_10d_calc,average_volume_30d_calc,high,low,isin';
 
 async function tvScan(range) {
   const res = await fetch('https://scanner.tradingview.com/malaysia/scan', {
@@ -389,13 +415,42 @@ async function tvScan(range) {
 
 // 一次拿全市场(约1130只)快照
 async function fetchMarket() {
-  const out = [];
+  const out = [],
+    symbols = [],
+    seen = new Set();
+  let expected = null,
+    received = 0;
   for (let start = 0; ; start += 500) {
     const d = await tvScan([start, start + 500]);
     const data = d.data || [];
+    if (!Number.isInteger(d.totalCount) || d.totalCount <= 0)
+      throw new Error('行情接口缺少完整市场数量');
+    if (expected != null && d.totalCount !== expected)
+      throw new Error('扫描期间股票池数量变化，保留此前完整快照');
+    expected = d.totalCount;
+    if (!data.length && received < expected) throw new Error('全市场扫描提前结束');
     for (const row of data) {
-      const [ticker, name, open, close, volume, changePct, changeAbs, avg10d, avg30d] = row.d;
-      if (!ticker || close == null) continue;
+      const [
+        ticker,
+        name,
+        open,
+        close,
+        volume,
+        changePct,
+        changeAbs,
+        avg10d,
+        avg30d,
+        high,
+        low,
+        isin,
+      ] = row.d;
+      if (!ticker || seen.has(ticker)) throw new Error('分页出现缺失或重复股票代码');
+      seen.add(ticker);
+      received++;
+      const numericCode =
+        typeof isin === 'string' ? isin.match(/^MY[A-Z](\d{4})OO\d{3}$/)?.[1] || null : null;
+      symbols.push({ ticker, name, numericCode });
+      if (!(close > 0)) continue;
       out.push({
         ticker,
         name,
@@ -407,18 +462,47 @@ async function fetchMarket() {
         prevClose: close != null && changeAbs != null ? close - changeAbs : null,
         avg10d,
         avg30d,
+        high,
+        low,
+        numericCode,
       });
     }
-    if (data.length < 500 || start + data.length >= d.totalCount) break;
+    if (received === expected) break;
+    if (data.length < 500 || received > expected) throw new Error('行情分页不完整');
   }
+  Object.defineProperty(out, 'coverage', {
+    value: { expected, received, valid: out.length, symbols },
+  });
   return out;
 }
 
 function storeUniverse(quotes) {
   const stmt = db.prepare(
-    'INSERT INTO universe(stock, name) VALUES(?,?) ON CONFLICT(stock) DO UPDATE SET name=excluded.name',
+    'INSERT INTO universe(stock,name,code,active,last_seen) VALUES(?,?,?,1,?) ON CONFLICT(stock) DO UPDATE SET name=excluded.name,code=COALESCE(excluded.code,universe.code),active=1,last_seen=excluded.last_seen',
   );
-  for (const q of quotes) stmt.run(q.ticker, q.name);
+  db.exec('BEGIN');
+  try {
+    if (quotes.coverage) db.prepare('UPDATE universe SET active=0').run();
+    for (const q of quotes.coverage?.symbols || quotes)
+      stmt.run(q.ticker, q.name, q.numericCode || null, Date.now() / 1000);
+    if (quotes.coverage) {
+      const valid = new Set(quotes.map((q) => q.ticker));
+      const clear = db.prepare(
+        'UPDATE live SET price=NULL,volume=NULL,mtime=NULL,session_date=NULL WHERE stock=?',
+      );
+      for (const q of quotes.coverage.symbols) if (!valid.has(q.ticker)) clear.run(q.ticker);
+    }
+    if (quotes.coverage)
+      kvSet(
+        'market_scan_coverage',
+        JSON.stringify({ ...quotes.coverage, symbols: undefined, at: Date.now() / 1000 }),
+      );
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  analysisCache = null;
 }
 
 function updateQuote(q, cfg = loadConfig()) {
@@ -435,9 +519,22 @@ function updateQuote(q, cfg = loadConfig()) {
     .get(q.ticker, today)?.date;
   const date = regularDay ? today : historicalDate || null;
   db.prepare(
-    `INSERT INTO live(stock, name, price, prevClose, open, volume, avg10d, avg30d, mtime, session_date) VALUES(?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(stock) DO UPDATE SET name=excluded.name, price=excluded.price, prevClose=excluded.prevClose, open=excluded.open, volume=excluded.volume, avg10d=excluded.avg10d, avg30d=excluded.avg30d, mtime=excluded.mtime, session_date=excluded.session_date`,
-  ).run(q.ticker, q.name, q.price, q.prevClose, q.open, q.volume, q.avg10d, q.avg30d, now, date);
+    `INSERT INTO live(stock, name, price, prevClose, open, volume, avg10d, avg30d, mtime, session_date,high,low) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(stock) DO UPDATE SET name=excluded.name, price=excluded.price, prevClose=excluded.prevClose, open=excluded.open, volume=excluded.volume, avg10d=excluded.avg10d, avg30d=excluded.avg30d, mtime=excluded.mtime, session_date=excluded.session_date,high=excluded.high,low=excluded.low`,
+  ).run(
+    q.ticker,
+    q.name,
+    q.price,
+    q.prevClose,
+    q.open,
+    q.volume,
+    q.avg10d,
+    q.avg30d,
+    now,
+    date,
+    q.high ?? null,
+    q.low ?? null,
+  );
 }
 
 // 记录今日累计量快照(用于时段对比差值法)
@@ -533,71 +630,130 @@ async function mapCodeToNumeric(ticker, desc) {
 
 // 回填每日量历史(Yahoo 日线 API 直接拿, 不用自己记录快照): 供「昨日量」对比 + 4W/5D均量
 let backfillPromise = null;
-function backfillDailyVol() {
+function backfillDailyVol(options = {}) {
   if (backfillPromise) return backfillPromise;
-  backfillPromise = performBackfill().finally(() => {
+  backfillPromise = performBackfill(options).finally(() => {
     backfillPromise = null;
   });
   return backfillPromise;
 }
-async function performBackfill() {
-  // 1. 先给没映射的股票补「字母→数字」映射
-  const unmapped = db.prepare('SELECT stock, name FROM universe WHERE code IS NULL').all();
-  if (unmapped.length) {
-    log(`映射 ${unmapped.length} 只股票的数字代码(Yahoo search)...`);
-    for (const u of unmapped) {
-      const c = await mapCodeToNumeric(u.stock, u.name);
-      if (c) db.prepare('UPDATE universe SET code=? WHERE stock=?').run(c, u.stock);
-      await sleep(250);
-    }
-  }
-  // 2. 回填日线历史到 daily_vol
-  const rows = db.prepare('SELECT stock, code FROM universe WHERE code IS NOT NULL').all();
+function completedMarketDate(cfg = loadConfig()) {
+  const day = new Date(Date.now() + 8 * 3600 * 1000);
+  if (day.getUTCHours() < 17) day.setUTCDate(day.getUTCDate() - 1);
+  while (
+    [0, 6].includes(day.getUTCDay()) ||
+    (cfg.market_holidays || []).includes(day.toISOString().slice(0, 10))
+  )
+    day.setUTCDate(day.getUTCDate() - 1);
+  return day.toISOString().slice(0, 10);
+}
+function historyRefreshQueue(force = false) {
+  const expected = completedMarketDate(),
+    now = Date.now() / 1000;
+  return db
+    .prepare(
+      `SELECT u.*,h.latest,h.complete,l.volume FROM universe u
+    LEFT JOIN (SELECT stock,MAX(date) latest,MAX(CASE WHEN close>0 AND high>=close AND low>0 AND low<=close THEN date END) complete_latest,SUM(CASE WHEN close>0 AND high>=close AND low>0 AND low<=close THEN 1 ELSE 0 END) complete FROM daily_vol GROUP BY stock) h ON h.stock=u.stock
+    LEFT JOIN live l ON l.stock=u.stock WHERE u.active=1`,
+    )
+    .all()
+    .filter(
+      (u) =>
+        force ||
+        ((!u.history_attempt || now - u.history_attempt >= 600) &&
+          (!u.code ||
+            !u.latest ||
+            u.latest < expected ||
+            !u.complete ||
+            u.complete_latest < u.latest ||
+            u.history_error)),
+    )
+    .sort((a, b) => Number(!b.latest) - Number(!a.latest) || (b.volume || 0) - (a.volume || 0));
+}
+async function performBackfill({ force = false } = {}) {
+  const rows = historyRefreshQueue(force);
+  if (!rows.length) return { done: 0, total: 0 };
   log(`回填 ${rows.length} 只股票日线历史(Yahoo)...`);
-  let done = 0;
-  for (const u of rows) {
-    try {
-      const d = await yahooGet(
-        `https://query1.finance.yahoo.com/v8/finance/chart/${u.code}.KL?interval=1d&range=6mo`,
+  let done = 0,
+    index = 0;
+  const worker = async () => {
+    while (index < rows.length) {
+      const u = rows[index++];
+      db.prepare('UPDATE universe SET history_attempt=? WHERE stock=?').run(
+        Date.now() / 1000,
+        u.stock,
       );
-      const r = d.chart.result[0];
-      const ts = r.timestamp || [];
-      const q = r.indicators?.quote?.[0] || {};
-      const vol = q.volume || [],
-        oArr = q.open || [],
-        hArr = q.high || [],
-        lArr = q.low || [],
-        cArr = q.close || [];
-      const n = Math.min(ts.length, vol.length);
-      for (let i = 0; i < n; i++) {
-        // Do not treat an unfinished daily bar as a completed breakout candle.
-        const date = mytDate(ts[i]);
-        const local = new Date(Date.now() + 8 * 3600 * 1000);
-        if (date === mytDate(Date.now() / 1000) && local.getUTCHours() < 17) continue;
-        if (vol[i] != null && vol[i] > 0) {
-          db.prepare(
-            `INSERT INTO daily_vol(stock, date, volume, open, high, low, close) VALUES(?,?,?,?,?,?,?)
+      try {
+        if (!u.code) {
+          u.code = await mapCodeToNumeric(u.stock, u.name);
+          if (!u.code) throw new Error('Yahoo 暂无匹配的数字代码');
+          db.prepare('UPDATE universe SET code=? WHERE stock=?').run(u.code, u.stock);
+        }
+        const d = await yahooGet(
+          `https://query1.finance.yahoo.com/v8/finance/chart/${u.code}.KL?interval=1d&range=6mo`,
+        );
+        const r = d.chart?.result?.[0];
+        if (!r || (r.meta?.symbol && r.meta.symbol !== u.code + '.KL'))
+          throw new Error('日线接口没有返回匹配的股票资料');
+        const ts = r.timestamp || [];
+        const q = r.indicators?.quote?.[0] || {};
+        const vol = q.volume || [],
+          oArr = q.open || [],
+          hArr = q.high || [],
+          lArr = q.low || [],
+          cArr = q.close || [];
+        const n = Math.min(ts.length, vol.length);
+        let inserted = 0;
+        for (let i = 0; i < n; i++) {
+          // Do not treat an unfinished daily bar as a completed breakout candle.
+          const date = mytDate(ts[i]);
+          const local = new Date(Date.now() + 8 * 3600 * 1000);
+          if (date === mytDate(Date.now() / 1000) && local.getUTCHours() < 17) continue;
+          if (
+            vol[i] > 0 &&
+            cArr[i] > 0 &&
+            hArr[i] >= cArr[i] &&
+            lArr[i] > 0 &&
+            lArr[i] <= cArr[i]
+          ) {
+            db.prepare(
+              `INSERT INTO daily_vol(stock, date, volume, open, high, low, close) VALUES(?,?,?,?,?,?,?)
             ON CONFLICT(stock, date) DO UPDATE SET volume=excluded.volume, open=excluded.open,
               high=excluded.high, low=excluded.low, close=excluded.close`,
-          ).run(
-            u.stock,
-            mytDate(ts[i]),
-            vol[i],
-            oArr[i] ?? null,
-            hArr[i] ?? null,
-            lArr[i] ?? null,
-            cArr[i] ?? null,
-          );
+            ).run(
+              u.stock,
+              mytDate(ts[i]),
+              vol[i],
+              oArr[i] ?? null,
+              hArr[i] ?? null,
+              lArr[i] ?? null,
+              cArr[i] ?? null,
+            );
+            if (cArr[i] > 0) inserted++;
+          }
         }
+        if (!inserted) throw new Error('暂未取得完整日线');
+        db.prepare('UPDATE universe SET history_success=?,history_error=NULL WHERE stock=?').run(
+          Date.now() / 1000,
+          u.stock,
+        );
+        done++;
+      } catch (e) {
+        log(`日线回填失败 ${u.stock}: ${e.message}`);
+        db.prepare('UPDATE universe SET history_error=? WHERE stock=?').run(
+          String(e.message).slice(0, 160),
+          u.stock,
+        );
       }
-      done++;
-    } catch (e) {
-      log(`日线回填失败 ${u.stock}: ${e.message}`);
+      analysisCache = null;
+      await sleep(80);
     }
-    await sleep(300);
-  }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, rows.length) }, () => worker()));
   log(`日线回填完成 ${done}/${rows.length} 只`);
   analysisCache = null;
+  persistPotentialEvents();
+  return { done, total: rows.length };
 }
 
 // 从 daily_vol 算 4W/5D 均量(同步, 回填后即有数据)
@@ -707,15 +863,15 @@ function computeDaily(code) {
 
 function computeMetrics(cfg) {
   const out = [];
-  const universe = db.prepare('SELECT stock, name FROM universe').all();
+  const universe = db.prepare('SELECT stock, name FROM universe WHERE active=1').all();
   for (const w of universe) {
     const code = w.stock;
-    const live = db
-      .prepare(
-        'SELECT name, price, open, prevClose, volume, mtime, session_date FROM live WHERE stock=?',
-      )
-      .get(code);
-    if (!live) continue;
+    const live =
+      db
+        .prepare(
+          'SELECT name, price, open, prevClose, volume, mtime, session_date FROM live WHERE stock=?',
+        )
+        .get(code) || {};
     const vol = computeVolumes(code, cfg.window);
     let current = null,
       previous = null,
@@ -1368,7 +1524,8 @@ function pickDailyPicks(cfg, limit = 3) {
       name: r.name,
       price: r.price,
       score: r.pattern?.score ?? null,
-      signal: r.stage === 'coiled' ? '放量蓄势' : '蓄势后初步突破',
+      signal:
+        r.stage === 'coiled' ? '放量蓄势' : r.stage === 'building' ? '放量转强' : '蓄势后初步突破',
     }));
 }
 
@@ -1994,6 +2151,11 @@ function poll(backfill = false) {
         // 会污染 daily_vol 的昨日量(导致放量对比失真)。daily_vol 只由 Yahoo 回填(backfillDailyVol)写入。
       }
       const cnt = db.prepare('SELECT COUNT(*) c FROM universe').get().c;
+      persistPotentialEvents();
+      if (historyRefreshQueue().length)
+        backfillDailyVol()
+          .then(broadcast)
+          .catch((e) => log('补齐缺失日线失败: ' + e.message));
       if (isMarketOpen()) await runBroadcast(cfg);
       prune();
       lastPoll = Date.now() / 1000;
@@ -2087,8 +2249,8 @@ function getStockReport(query, cfg = loadConfig()) {
   const upper = String(query).toUpperCase();
   const live = db
     .prepare(
-      `SELECT live.*, universe.code AS numeric_code FROM live LEFT JOIN universe ON universe.stock=live.stock
-    WHERE UPPER(live.stock)=? OR universe.code=? LIMIT 1`,
+      `SELECT live.*,universe.stock,universe.name,universe.code AS numeric_code FROM universe LEFT JOIN live ON universe.stock=live.stock
+    WHERE UPPER(universe.stock)=? OR universe.code=? LIMIT 1`,
     )
     .get(upper, upper);
   if (!live) return null;
@@ -2098,10 +2260,19 @@ function getStockReport(query, cfg = loadConfig()) {
     )
     .all(live.stock, marketDate());
   const pattern = findDoubleBottom(live.stock, cfg, rows);
-  return {
+  const report = {
     ...explainStock({ stock: live, rows, pattern, cfg }),
     numeric_code: live.numeric_code,
     history: rows.slice(-90),
+  };
+  getAnalysisOverview(cfg);
+  return {
+    ...report,
+    selection: analysisCache.decisions.get(report.code) || {
+      eligible: false,
+      selected: false,
+      reason: '当前股票池没有这只股票的有效行情。',
+    },
   };
 }
 
@@ -2119,7 +2290,7 @@ function getAnalysisOverview(cfg) {
   }
   const reports = db
     .prepare(
-      'SELECT live.* FROM live JOIN universe ON universe.stock=live.stock WHERE live.price>0',
+      'SELECT live.*,universe.stock,universe.name,universe.code AS numeric_code,universe.history_error,universe.history_success FROM universe LEFT JOIN live ON universe.stock=live.stock WHERE universe.active=1',
     )
     .all()
     .map((stock) => {
@@ -2139,17 +2310,11 @@ function getAnalysisOverview(cfg) {
       .at(-1) || null;
   // The shortlist uses one market date; old or delisted quotes must not fill current slots.
   const candidates = reports
-    .filter(
-      (r) =>
-        ['coiled', 'confirmed'].includes(r.stage) &&
-        r.volume_setup.qualified &&
-        r.quote_date === snapshotDate,
-    )
+    .filter((r) => r.potential_eligible && r.quote_date === snapshotDate)
     .sort(
       (a, b) =>
-        Number(b.stage === 'coiled') - Number(a.stage === 'coiled') ||
-        b.volume_setup.events.length - a.volume_setup.events.length ||
-        b.volume_setup.average_multiple - a.volume_setup.average_multiple ||
+        b.priority_score - a.priority_score ||
+        (b.potential_signal?.average_multiple || 0) - (a.potential_signal?.average_multiple || 0) ||
         (b.volume_signal.multiple || 0) - (a.volume_signal.multiple || 0) ||
         b.evidence_count - a.evidence_count ||
         (b.pattern?.score || 0) - (a.pattern?.score || 0) ||
@@ -2157,12 +2322,110 @@ function getAnalysisOverview(cfg) {
         (b.metrics?.vr || 0) - (a.metrics?.vr || 0),
     );
   const limit = Math.max(1, Math.min(5, Number(cfg.pick_count) || 3));
+  const rank = new Map(candidates.map((r, i) => [r.code, i + 1]));
+  const decisions = new Map(
+    reports.map((r) => [
+      r.code,
+      {
+        eligible: rank.has(r.code),
+        rank: rank.get(r.code) || null,
+        selected: (rank.get(r.code) || Infinity) <= limit,
+        reason: rank.has(r.code)
+          ? rank.get(r.code) <= limit
+            ? '已进入当前重点精选。'
+            : `信号达标，当前排名第${rank.get(r.code)}，首页只显示前${limit}只；仍持续跟踪。`
+          : ['stale', 'insufficient'].includes(r.stage)
+            ? r.conclusion
+            : !r.volume_signal.pass
+              ? `${r.volume_signal.title}。${r.tracking_signal ? '此前信号仍在重点追踪池。' : ''}`
+              : ['extended', 'tracking'].includes(r.stage)
+                ? '信号已经出现，但价格已明显拉升或本次条件未全部满足；保留追踪，等待新的参与条件。'
+                : '放量已达标，但尚未满足蓄势、转强或突破路径的价格与资料条件。',
+      },
+    ]),
+  );
+  const tracking = reports
+    .filter(
+      (r) =>
+        r.quote_date === snapshotDate &&
+        r.tracking_signal &&
+        !['stale', 'insufficient'].includes(r.stage) &&
+        r.price >= r.tracking_signal.support,
+    )
+    .sort(
+      (a, b) =>
+        Number(b.tracking_signal.kind === 'breakout') -
+          Number(a.tracking_signal.kind === 'breakout') ||
+        (b.change_pct || 0) - (a.change_pct || 0) ||
+        a.tracking_signal.age - b.tracking_signal.age ||
+        b.tracking_signal.average_multiple - a.tracking_signal.average_multiple,
+    );
+  const follow = tracking.filter((r) => !candidates.slice(0, limit).some((c) => c.code === r.code));
+  const universe = db
+    .prepare(
+      'SELECT universe.*,live.price,live.mtime FROM universe LEFT JOIN live ON live.stock=universe.stock WHERE universe.active=1',
+    )
+    .all();
+  const staleCodes = new Set(reports.filter((r) => r.stage === 'stale').map((r) => r.code));
+  const scan = JSON.parse(kvGet('market_scan_coverage', 'null') || 'null');
+  const expectedHistory = completedMarketDate(cfg);
+  const health = universe.map((u) => {
+    const bars = by.get(u.stock) || [],
+      prior = bars.filter((r) => r.date < snapshotDate && r.volume > 0),
+      latest = bars.at(-1)?.date || null;
+    return {
+      code: u.stock,
+      name: u.name,
+      mapped: !!u.code,
+      bars: prior.length,
+      last_date: latest,
+      error: u.history_error,
+      reason: !u.price
+        ? '缺少有效行情'
+        : !u.code
+          ? '数字代码待映射'
+          : !bars.length
+            ? '日线待回填'
+            : prior.length < 20
+              ? '完整交易日不足20个'
+              : staleCodes.has(u.stock)
+                ? '行情或日线已过期'
+                : !bars.slice(-10).every((r) => r.high >= r.close && r.low > 0 && r.low <= r.close)
+                  ? '高低价资料待补齐'
+                  : u.history_error
+                    ? '最近回填失败，正在重试'
+                    : latest < expectedHistory
+                      ? '近期日线有缺口或无成交'
+                      : null,
+    };
+  });
+  const coverage = {
+    expected: scan?.expected || universe.length,
+    received: scan?.received || universe.length,
+    quoted: scan?.valid ?? universe.filter((u) => u.price > 0).length,
+    analyzed: reports.length,
+    history_ready: health.filter((h) => h.bars >= 20).length,
+    ready: health.filter((h) => !h.reason).length,
+    unmapped: health.filter((h) => !h.mapped).length,
+    missing_history: health.filter((h) => !h.last_date).length,
+    insufficient_history: health.filter((h) => h.bars > 0 && h.bars < 20).length,
+    inactive: db.prepare('SELECT COUNT(*) c FROM universe WHERE active=0').get().c,
+    scan_at: scan?.at || null,
+    stale_quotes: staleCodes.size,
+    expected_history_date: expectedHistory,
+    issues: health.filter((h) => h.reason),
+    history_errors: health.filter((h) => h.error).length,
+  };
   const data = {
     candidates: candidates.slice(0, limit),
     limit,
     confirmed: candidates.length,
     coiled: candidates.filter((r) => r.stage === 'coiled').length,
     breakout: candidates.filter((r) => r.stage === 'confirmed').length,
+    building: candidates.filter((r) => r.stage === 'building').length,
+    tracking: follow.slice(0, 3),
+    tracking_count: tracking.length,
+    coverage,
     volume_qualified: reports.filter(
       (r) =>
         r.volume_signal.pass &&
@@ -2173,10 +2436,29 @@ function getAnalysisOverview(cfg) {
     snapshot_date: snapshotDate,
     historical: reports.filter((r) => r.stage === 'stale').length,
     covered: reports.filter((r) => !!r.metrics).length,
-    rule: '先找放量蓄势、尚未大涨的股票，再看蓄势后的初步突破。精选本次成交量必须至少100万股、至少上一交易日2倍；此前10日价格窄幅整理，出现过量增价稳，或本次量达到此前20日均量1.5倍。只比较同一最新市场日期，已明显拉升不入选。',
+    rule: '分别识别放量蓄势、回调整理后的放量转强、放量突破三条路径。当前精选须百万股及昨日两倍量同时达标，价格未明显拉升。过去已达标的信号另行持续追踪，不因今天量倍数下降而消失。',
   };
-  analysisCache = { ts: Date.now(), data };
+  analysisCache = { ts: Date.now(), data, reports, decisions, tracking };
   return data;
+}
+
+function persistPotentialEvents(cfg = loadConfig()) {
+  getAnalysisOverview(cfg);
+  const insert =
+    db.prepare(`INSERT INTO potential_events(stock,date,kind,first_seen,last_seen,signal) VALUES(?,?,?,?,?,?)
+    ON CONFLICT(stock,date,kind) DO UPDATE SET last_seen=excluded.last_seen,signal=excluded.signal`);
+  const now = Date.now() / 1000;
+  db.exec('BEGIN');
+  try {
+    for (const report of analysisCache.reports) {
+      for (const signal of [report.potential_signal, ...report.recent_signals].filter(Boolean))
+        insert.run(report.code, signal.date, signal.kind, now, now, JSON.stringify(signal));
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
 }
 
 function observationState() {
@@ -2199,7 +2481,7 @@ function observationState() {
 function buildState() {
   // 安全: settings 里永远不含 api key
   const cfg = loadConfig();
-  const universeCount = db.prepare('SELECT COUNT(*) c FROM universe').get().c;
+  const universeCount = db.prepare('SELECT COUNT(*) c FROM universe WHERE active=1').get().c;
   return {
     version: VERSION,
     universe_count: universeCount,
@@ -2281,6 +2563,32 @@ app.get('/healthz', (req, res) => res.json({ ok: true }));
 
 app.get('/api/state', (req, res) => {
   res.json(buildState());
+});
+app.get('/api/coverage', (req, res) => res.json(getAnalysisOverview(loadConfig()).coverage));
+app.get('/api/signals', (req, res) => {
+  getAnalysisOverview(loadConfig());
+  const query = String(req.query.q || '').toUpperCase();
+  const pool = analysisCache.tracking.filter((r) =>
+    (r.code + ' ' + r.name).toUpperCase().includes(query),
+  );
+  const page = Math.max(1, Math.min(10000, Math.floor(Number(req.query.page) || 1)));
+  res.json({
+    total: pool.length,
+    page,
+    limit: 20,
+    items: pool
+      .slice((page - 1) * 20, page * 20)
+      .map((r) => ({ ...r, selection: analysisCache.decisions.get(r.code) })),
+    history: query
+      ? db
+          .prepare(
+            'SELECT stock,date,kind,first_seen,last_seen,signal FROM potential_events WHERE UPPER(stock)=? ORDER BY date DESC LIMIT 30',
+          )
+          .all(query)
+          .map((r) => ({ ...r, signal: JSON.parse(r.signal) }))
+      : [],
+    note: '历史规则命中不代表当时已实盘推荐；首次发现时间单独记录。',
+  });
 });
 app.get('/api/stocks/:code', (req, res) => {
   const report = getStockReport(req.params.code);
@@ -2687,7 +2995,7 @@ app.post('/api/backfill', async (req, res) => {
   res.json({ ok: true, msg: '回填已启动, 约需 3-10 分钟, 完成后自动刷新' });
   broadcast();
   try {
-    await backfillDailyVol();
+    await backfillDailyVol({ force: true });
     broadcast();
   } catch (e) {
     log('手动回填失败: ' + e.message);
@@ -2792,6 +3100,10 @@ export {
   saveConfig,
   runScreen,
   fetchMarket,
+  storeUniverse,
+  performBackfill,
+  historyRefreshQueue,
+  persistPotentialEvents,
   getStockReport,
   buildState,
   updateWatchlist,

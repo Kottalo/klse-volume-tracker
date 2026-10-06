@@ -10,6 +10,8 @@ import {
   sessionStart,
   volumeSignal,
   consolidationSetup,
+  potentialSignal,
+  recentPotentialSignals,
 } from '../lib/analysis.js';
 import { validateSettings, ValidationError } from '../lib/settings.js';
 
@@ -214,7 +216,8 @@ test('reports explain measured evidence without converting it into a winning pro
     cfg,
     now,
   });
-  assert.equal(report.stage, 'confirmed');
+  assert.equal(report.stage, 'watch');
+  assert.equal(report.potential_eligible, false);
   assert.equal(report.evidence_count, 2);
   assert.equal(report.levels, null);
   assert.match(formatReport(report), /不是上涨概率/);
@@ -365,7 +368,7 @@ test('million-share and double-volume gates both apply inclusively, even with a 
       now,
     });
     assert.equal(report.volume_signal.pass, pass);
-    assert.equal(report.stage === 'confirmed', pass);
+    assert.equal(report.potential_eligible, false); // Wide historical ranges do not pass the price paths.
     assert.equal(report.volume_signal.current, current);
   }
   assert.equal(volumeSignal(999999, 400000, { minVolume: 0, minMultiple: 0 }).pass, false);
@@ -375,7 +378,12 @@ test('million-share and double-volume gates both apply inclusively, even with a 
 });
 
 test('early volume expansion can qualify before 15 percent gain, while falling prices do not', () => {
-  const rows = history.map((r, i) => ({ ...r, close: 12 + i * 0.01 }));
+  const rows = history.map((r, i) => ({
+    ...r,
+    close: 12 + i * 0.01,
+    high: 12.4 + i * 0.01,
+    low: 11.9 + i * 0.01,
+  }));
   const stock = {
     stock: 'EARLY',
     price: 12.3,
@@ -387,8 +395,9 @@ test('early volume expansion can qualify before 15 percent gain, while falling p
   const report = explainStock({ stock, rows, pattern: null, cfg, now });
   assert.ok(report.metrics.gain20 < 15);
   assert.equal(report.screen_pass, false);
-  assert.equal(report.stage, 'confirmed');
-  assert.match(report.conclusion, /1,200,000 股/);
+  assert.ok(['coiled', 'confirmed', 'building'].includes(report.stage));
+  assert.equal(report.potential_eligible, true);
+  assert.equal(report.volume_signal.current, 1200000);
   const down = explainStock({
     stock: { ...stock, price: 12, prevClose: 12.24 },
     rows,
@@ -399,4 +408,88 @@ test('early volume expansion can qualify before 15 percent gain, while falling p
   assert.equal(down.volume_signal.pass, true);
   assert.equal(down.stage, 'watch');
   assert.match(down.label, /量价/);
+});
+
+const buscap = JSON.parse(
+  fs.readFileSync(new URL('./fixtures/buscap-2026.json', import.meta.url), 'utf8'),
+);
+test('BUSCAP recovery is detected before the rally, and a later breakout remains tracked without changing today volume gates', () => {
+  const bar = buscap.bars.find((r) => r.date === '2026-09-25');
+  const signal = potentialSignal(buscap.bars, bar.close, bar.volume, bar.date, {
+    minAverageValue: 200000,
+  });
+  assert.equal(signal.kind, 'building');
+  assert.equal(signal.eligible, true);
+  assert.equal(signal.resistance, 0.59);
+  assert.ok(signal.multiple > 3);
+  const later = buscap.bars.map((r) =>
+    r.date > bar.date ? { ...r, close: 50, high: 50, low: 1, volume: 99999999 } : r,
+  );
+  assert.deepEqual(
+    potentialSignal(later, bar.close, bar.volume, bar.date, { minAverageValue: 200000 }),
+    signal,
+  );
+  const breakout = buscap.bars.find((r) => r.date === '2026-10-02');
+  const event = potentialSignal(buscap.bars, breakout.close, breakout.volume, breakout.date);
+  assert.equal(event.kind, 'breakout');
+  assert.equal(event.eligible, false);
+  const now = Date.parse('2026-10-06T11:35:00+08:00') / 1000;
+  const report = explainStock({
+    stock: {
+      stock: 'BUSCAP',
+      price: 0.785,
+      volume: 6855800,
+      session_date: '2026-10-06',
+      mtime: now,
+    },
+    rows: buscap.bars,
+    pattern: null,
+    cfg: { ...cfg, min_average_daily_value: 200000 },
+    now,
+  });
+  assert.equal(report.stage, 'tracking');
+  assert.equal(report.potential_eligible, false);
+  assert.equal(report.volume_signal.pass, false);
+  assert.equal(report.tracking_signal.date, '2026-10-02');
+  assert.equal(report.tracking_signal.age, 2);
+  assert.equal(report.tracking_signal.volume, 6375600);
+});
+
+test('potential paths reject observed weak closes and floating point equality cannot become a breakout', () => {
+  const stable = history.map((r) => ({
+    ...r,
+    close: 0.26,
+    high: 0.25999999046,
+    low: 0.255,
+    volume: 500000,
+  }));
+  const signal = potentialSignal(stable, 0.26, 2000000, '2026-10-05');
+  assert.equal(signal.kind, 'coiled');
+  const bar = buscap.bars.find((r) => r.date === '2026-09-25');
+  const weak = buscap.bars.map((r) => (r.date === bar.date ? { ...r, high: 0.65, low: 0.53 } : r));
+  assert.equal(potentialSignal(weak, bar.close, bar.volume, bar.date), null);
+  assert.equal(potentialSignal(buscap.bars, bar.close, 999999, bar.date), null);
+  assert.equal(
+    potentialSignal(
+      [...stable, { date: '2026-10-05', high: 0.29, low: 0.25 }],
+      0.26,
+      2000000,
+      '2026-10-05',
+    ),
+    null,
+  );
+});
+
+test('a newer broken support cannot revive an older lower-support signal', () => {
+  const now = Date.parse('2026-10-06T11:35:00+08:00') / 1000;
+  const report = explainStock({
+    stock: { stock: 'BUSCAP', price: 0.48, volume: 500000, session_date: '2026-10-06', mtime: now },
+    rows: buscap.bars,
+    pattern: null,
+    cfg,
+    now,
+  });
+  assert.ok(report.recent_signals.length > 1);
+  assert.equal(report.tracking_signal, null);
+  assert.equal(report.potential_eligible, false);
 });

@@ -64,6 +64,7 @@ function reset() {
     'watchlist',
     'notification_outbox',
     'kv',
+    'potential_events',
   ])
     db.prepare(`DELETE FROM ${table}`).run();
   saveConfig({ ...DEFAULTS, watchlist: [] });
@@ -288,7 +289,7 @@ test('lunch-break shortlist does not mix older-session or orphaned high-volume s
   db.prepare('UPDATE live SET mtime=?').run(lunch / 1000);
   Date.now = () => lunch;
   try {
-    assert.equal(server.getStockReport('OLD').stage, 'confirmed');
+    assert.equal(server.getStockReport('OLD').potential_eligible, false);
     const state = await (await realFetch(base + '/api/state')).json();
     assert.equal(state.insights.scanned, 2);
     assert.equal(state.insights.volume_qualified, 1);
@@ -302,7 +303,7 @@ test('lunch-break shortlist does not mix older-session or orphaned high-volume s
   }
 });
 
-test('setup shortlist prioritizes unbroken bases over early breakouts and excludes already-rallied stocks', async () => {
+test('setup shortlist ranks evidence across paths and excludes already-rallied stocks', async () => {
   reset();
   seedTrendMarket(3);
   db.prepare('UPDATE live SET price=?,prevClose=? WHERE stock=?').run(11.12, 11, 'STRONG1');
@@ -315,14 +316,14 @@ test('setup shortlist prioritizes unbroken bases over early breakouts and exclud
   assert.deepEqual(
     state.insights.candidates.map((r) => [r.code, r.stage]),
     [
-      ['STRONG0', 'coiled'],
       ['STRONG1', 'confirmed'],
+      ['STRONG0', 'coiled'],
     ],
   );
   assert.equal(state.insights.coiled, 1);
   assert.equal(state.insights.breakout, 1);
   assert.equal(server.getStockReport('STRONG2').stage, 'extended');
-  assert.equal(server.getStockReport('GENERIC').stage, 'confirmed');
+  assert.equal(server.getStockReport('GENERIC').stage, 'watch');
   assert.equal(server.getStockReport('GENERIC').volume_setup.qualified, false);
   updateWatchlist(DEFAULTS);
   assert.deepEqual(
@@ -413,4 +414,213 @@ test('ordinary Telegram members cannot change settings or credentials', async ()
   assert.match(secretReply, /不允许修改/);
   assert.equal(server.loadConfig().llm_api_key, '');
   globalThis.fetch = realFetch;
+});
+
+test('incomplete or duplicate source pagination cannot replace the complete stock pool', async () => {
+  reset();
+  quote('KEEP');
+  for (const scenario of ['short', 'duplicate', 'changed']) {
+    globalThis.fetch = async (url, options) => {
+      const start = JSON.parse(options.body).range[0];
+      const data = Array.from(
+        { length: start === 0 ? 500 : scenario === 'short' ? 0 : 1 },
+        (_, i) => ({
+          d: [
+            start === 500 && scenario === 'duplicate' ? 'S0' : 'S' + (start + i),
+            'Example',
+            1,
+            1,
+            100,
+            0,
+            0,
+            100,
+            100,
+          ],
+        }),
+      );
+      return Response.json({
+        totalCount: start === 500 && scenario === 'changed' ? 502 : 501,
+        data,
+      });
+    };
+    try {
+      await assert.rejects(server.fetchMarket(), /提前结束|重复|数量变化/);
+      assert.equal(db.prepare('SELECT active FROM universe WHERE stock=?').get('KEEP').active, 1);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+});
+
+test('complete universe refresh keeps invalid quotes visible, maps ISIN and retires obsolete entries', async () => {
+  reset();
+  quote('OLD');
+  quote('INVALID');
+  globalThis.fetch = async () =>
+    Response.json({
+      totalCount: 2,
+      data: [
+        {
+          d: [
+            'BUSCAP',
+            'Bus Cap Berhad',
+            0.7,
+            0.785,
+            6855800,
+            18.94,
+            0.125,
+            2000000,
+            2000000,
+            0.8,
+            0.665,
+            'MYQ0455OO004',
+          ],
+        },
+        {
+          d: [
+            'INVALID',
+            'Missing current quote',
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+          ],
+        },
+      ],
+    });
+  try {
+    const quotes = await server.fetchMarket();
+    server.storeUniverse(quotes);
+    quotes.forEach((q) => server.updateQuote(q));
+    assert.equal(db.prepare('SELECT code FROM universe WHERE stock=?').get('BUSCAP').code, '0455');
+    assert.equal(db.prepare('SELECT active FROM universe WHERE stock=?').get('OLD').active, 0);
+    assert.equal(db.prepare('SELECT price FROM live WHERE stock=?').get('INVALID').price, null);
+    const state = await (await realFetch(base + '/api/state')).json();
+    assert.equal(state.insights.scanned, 2);
+    assert.equal(state.stocks.length, 2);
+    const c = await (await realFetch(base + '/api/coverage')).json();
+    assert.equal(c.expected, 2);
+    assert.equal(c.received, 2);
+    assert.equal(c.quoted, 1);
+    assert.equal(c.analyzed, 2);
+    assert.ok(c.issues.some((i) => i.code === 'INVALID' && i.reason === '缺少有效行情'));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('history failure preserves existing bars, records the gap and retry recovers incomplete OHLC', async () => {
+  reset();
+  quote('RETRY');
+  db.prepare('INSERT INTO daily_vol(stock,date,volume,close) VALUES(?,?,?,?)').run(
+    'RETRY',
+    '2026-10-02',
+    1200000,
+    1,
+  );
+  globalThis.fetch = async () => new Response('temporary', { status: 503 });
+  try {
+    assert.deepEqual(await server.performBackfill(), { done: 0, total: 1 });
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM daily_vol').get().c, 1);
+    assert.ok(db.prepare('SELECT history_error FROM universe').get().history_error);
+    assert.equal(server.historyRefreshQueue().length, 0); // ten-minute retry backoff
+    globalThis.fetch = async () =>
+      Response.json({
+        chart: {
+          result: [
+            {
+              meta: { symbol: '0001.KL' },
+              timestamp: [Date.parse('2026-10-02T09:00:00+08:00') / 1000],
+              indicators: {
+                quote: [{ volume: [1200000], open: [0.95], high: [1.05], low: [0.94], close: [1] }],
+              },
+            },
+          ],
+        },
+      });
+    assert.deepEqual(await server.performBackfill({ force: true }), { done: 1, total: 1 });
+    assert.equal(db.prepare('SELECT high FROM daily_vol').get().high, 1.05);
+    assert.equal(db.prepare('SELECT history_error FROM universe').get().history_error, null);
+    assert.equal(server.historyRefreshQueue().length, 0);
+    const c = await (await realFetch(base + '/api/coverage')).json();
+    assert.equal(c.insufficient_history, 1); // One repaired bar is not invented as twenty bars.
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('qualified signals outside the top three remain queryable and ledger deduplication preserves discovery time', async () => {
+  reset();
+  seedTrendMarket(5);
+  let r = server.getStockReport('STRONG0');
+  assert.equal(r.selection.selected, false);
+  assert.equal(r.selection.rank, 5);
+  assert.match(r.selection.reason, /排名第5/);
+  server.persistPotentialEvents();
+  const first = db
+    .prepare('SELECT first_seen FROM potential_events WHERE stock=? ORDER BY date DESC')
+    .get('STRONG0').first_seen;
+  const count = db.prepare('SELECT COUNT(*) c FROM potential_events').get().c;
+  server.persistPotentialEvents();
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM potential_events').get().c, count);
+  assert.equal(
+    db
+      .prepare('SELECT first_seen FROM potential_events WHERE stock=? ORDER BY date DESC')
+      .get('STRONG0').first_seen,
+    first,
+  );
+  const signals = await (await realFetch(base + '/api/signals?q=STRONG0')).json();
+  assert.equal(signals.total, 1);
+  assert.equal(signals.items[0].code, 'STRONG0');
+  assert.ok(signals.history.length > 0);
+  assert.match(signals.note, /不代表当时/);
+});
+
+test('BUSCAP historical breakout is tracked by public APIs even though current double-volume fails', async () => {
+  reset();
+  const fixture = JSON.parse(
+    fs.readFileSync(new URL('./fixtures/buscap-2026.json', import.meta.url), 'utf8'),
+  );
+  const current = Date.parse('2026-10-06T11:35:00+08:00');
+  Date.now = () => current;
+  try {
+    quote('BUSCAP', 0.785, 6855800);
+    db.prepare('UPDATE live SET session_date=?,mtime=?,prevClose=? WHERE stock=?').run(
+      '2026-10-06',
+      current / 1000,
+      0.66,
+      'BUSCAP',
+    );
+    const insert = db.prepare(
+      'INSERT INTO daily_vol(stock,date,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?)',
+    );
+    for (const b of fixture.bars)
+      insert.run('BUSCAP', b.date, b.open, b.high, b.low, b.close, b.volume);
+    const report = await (await realFetch(base + '/api/stocks/BUSCAP')).json();
+    assert.equal(report.stage, 'tracking');
+    assert.equal(report.selection.selected, false);
+    assert.match(report.selection.reason, /追踪池/);
+    assert.equal(report.tracking_signal.date, '2026-10-02');
+    assert.equal(report.volume_signal.pass, false);
+    server.persistPotentialEvents();
+    const signals = await (await realFetch(base + '/api/signals?q=BUSCAP')).json();
+    assert.equal(signals.total, 1);
+    assert.ok(signals.history.some((s) => s.date === '2026-09-25' && s.kind === 'building'));
+    assert.ok(signals.history.every((s) => s.first_seen === current / 1000));
+  } finally {
+    Date.now = () => fixed;
+  }
+});
+
+test('legacy slow polling is capped at five minutes and settings reject slower intervals', async () => {
+  reset();
+  saveConfig({ ...DEFAULTS, poll_interval_minutes: 30 });
+  assert.equal(server.loadConfig().poll_interval_minutes, 5);
+  assert.equal((await post('/api/settings', { poll_interval_minutes: 30 })).status, 400);
 });

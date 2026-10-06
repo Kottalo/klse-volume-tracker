@@ -196,6 +196,8 @@ export default function App() {
   };
   const insights = state?.insights,
     stocks = state?.stocks || [];
+  const [signalQuery, setSignalQuery] = useState(''),
+    [signalResults, setSignalResults] = useState(null);
   const candidates = (insights?.candidates || []).filter(
     (r) => filter === 'all' || r.stage === filter,
   );
@@ -210,14 +212,14 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
   const titles = {
-    overview: '量先放大，价格还在蓄势。',
+    overview: '量先放大，持续追踪潜力信号。',
     market: '从全市场找到你的关注。',
     watch: '关注之后，继续核对。',
     alerts: '市场有变化，依据要更新。',
     method: '每个信号，都有它的边界。',
   };
   const subtitles = {
-    overview: '扫描全市场，优先找成交量已放大、价格仍在整理的少数股票，提前关注突破机会。',
+    overview: '扫描全市场，分别寻找放量蓄势、放量转强和突破信号，已有信号持续跟踪。',
     market: '搜索公司或代码，点开股票查看分析依据。',
     watch: '你的关注保存在当前浏览器；系统观察记录用于跟踪规则表现。',
     alerts: '异动是研究的起点。价格变化本身不等于买入理由。',
@@ -339,7 +341,7 @@ export default function App() {
                         label="市场覆盖"
                         value={number(state.universe_count, 0)}
                         unit="只股票"
-                        note="当前已取得的股票池"
+                        note={`上游 ${insights?.coverage?.received ?? state.universe_count} 只 · 历史可分析 ${insights?.coverage?.history_ready ?? insights?.covered ?? 0} 只`}
                       />
                       <Stat
                         label="明显放量"
@@ -348,10 +350,10 @@ export default function App() {
                         note="百万股以上，且至少昨日两倍"
                       />
                       <Stat
-                        label="放量蓄势候选"
+                        label="当前精选候选"
                         value={number(insights?.confirmed || 0, 0)}
                         unit="只"
-                        note={`全市场：${insights?.coiled || 0} 只尚未突破 · ${insights?.breakout || 0} 只初步突破`}
+                        note={`蓄势 ${insights?.coiled || 0} · 转强 ${insights?.building || 0} · 突破 ${insights?.breakout || 0}`}
                         accent
                       />
                       <Stat
@@ -364,13 +366,14 @@ export default function App() {
                     <section className="opportunities">
                       <div className="section-heading">
                         <div>
-                          <h2>放量蓄势精选</h2>
-                          <p>{`优先尚未拉升、已有量增价稳记录的股票，最多 ${insights?.limit || 3} 只。已明显大涨不入选，入选不足不凑数。`}</p>
+                          <h2>当前参与条件精选</h2>
+                          <p>{`比较量能强度、价格位置和信号依据，最多 ${insights?.limit || 3} 只。已明显拉升转入持续追踪，入选不足不凑数。`}</p>
                         </div>
                         <div className="tabs" aria-label="候选筛选">
                           {[
                             ['all', '全部'],
                             ['coiled', '尚未突破'],
+                            ['building', '放量转强'],
                             ['confirmed', '初步突破'],
                           ].map(([id, label]) => (
                             <button
@@ -413,13 +416,179 @@ export default function App() {
                               ? '正在补齐历史资料，完成后会自动重新分析。'
                               : filter !== 'all'
                                 ? '当前精选没有这一阶段的候选，可切换其他阶段查看。'
-                                : '尚无股票同时满足百万股、两倍放量及窄幅蓄势条件。继续扫描，不用较弱信号凑数。'
+                                : '尚无股票同时满足百万股、两倍放量及蓄势、转强或突破条件。继续扫描，不用较弱信号凑数。'
                           }
                           action={() => navigate('market')}
                           actionLabel="查看全市场"
                         />
                       )}
                     </section>
+                    <section className="opportunities tracking-section">
+                      <div className="section-heading">
+                        <div>
+                          <h2>已有信号 · 重点追踪</h2>
+                          <p>
+                            最近5个有成交交易日的信号，守住支撑且资料有效就继续追踪；今天量未达标或已明显拉升，会明确说明。首页展示3只，全部记录可查询。
+                          </p>
+                        </div>
+                      </div>
+                      {insights?.tracking?.length ? (
+                        <div className="card-grid">
+                          {insights.tracking.map((r) => (
+                            <article className="opportunity-card" key={r.code}>
+                              <div className="card-top">
+                                <span className="ticker">{r.code}</span>
+                                <Status report={r} />
+                              </div>
+                              <h3>{r.name}</h3>
+                              <div className="card-price">
+                                {price(r.price)}{' '}
+                                <span className={r.change_pct >= 0 ? 'up' : 'down'}>
+                                  {percent(r.change_pct)}
+                                </span>
+                              </div>
+                              <p className="tracking-volume">
+                                本次成交 <strong>{volume(r.volume)}</strong> ·{' '}
+                                {r.volume_signal.previous_date || '上一交易日'} 的{' '}
+                                <strong>{number(r.volume_signal.multiple)} 倍</strong>
+                                <br />
+                                {r.volume_signal.pass
+                                  ? '本次百万股、两倍量均达标'
+                                  : '本次两个成交量门槛尚未同时达标'}
+                              </p>
+                              <SignalPanel report={r} compact />
+                              <p className="conclusion">{r.conclusion}</p>
+                              <button className="text-button" onClick={() => setSelected(r.code)}>
+                                查看追踪与未入选原因 <Icon name="arrow" size={16} />
+                              </button>
+                            </article>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="muted">暂无资料新鲜且参考支撑仍有效的近期信号。</p>
+                      )}
+                      <form
+                        className="signal-search"
+                        onSubmit={async (e) => {
+                          e.preventDefault();
+                          try {
+                            setSignalResults({
+                              ...(await request(
+                                '/api/signals?q=' + encodeURIComponent(signalQuery),
+                              )),
+                              query: signalQuery,
+                            });
+                          } catch {
+                            setNotice('暂时无法查询追踪记录。');
+                          }
+                        }}
+                      >
+                        <input
+                          aria-label="查询全市场信号"
+                          placeholder="股票代码，如 BUSCAP；留空查全部"
+                          value={signalQuery}
+                          onChange={(e) => setSignalQuery(e.target.value)}
+                        />
+                        <button className="secondary-button" type="submit">
+                          查询全部信号
+                        </button>
+                      </form>
+                      {signalResults && (
+                        <div className="signal-search-results">
+                          <p>
+                            符合查询的持续追踪股票 {signalResults.total}{' '}
+                            只，显示最多20只；历史回放不代表当时已推送。
+                          </p>
+                          {signalResults.items.map((r) => (
+                            <button
+                              className="stock-link"
+                              key={r.code}
+                              onClick={() => setSelected(r.code)}
+                            >
+                              <strong>{r.code}</strong>
+                              <span>
+                                {r.tracking_signal.date} · {r.label}
+                              </span>
+                            </button>
+                          ))}
+                          {!signalResults.items.length && (
+                            <p>没有仍在追踪窗口内的有效信号，可在全市场查看该股票的详细判断。</p>
+                          )}
+                          {signalResults.total > 20 && (
+                            <div className="signal-search">
+                              <button
+                                className="secondary-button"
+                                disabled={signalResults.page <= 1}
+                                onClick={async () => {
+                                  try {
+                                    setSignalResults({
+                                      ...(await request(
+                                        '/api/signals?q=' +
+                                          encodeURIComponent(signalResults.query) +
+                                          '&page=' +
+                                          (signalResults.page - 1),
+                                      )),
+                                      query: signalResults.query,
+                                    });
+                                  } catch {
+                                    setNotice('暂时无法查询追踪记录。');
+                                  }
+                                }}
+                              >
+                                上一页
+                              </button>
+                              <span>第 {signalResults.page} 页</span>
+                              <button
+                                className="secondary-button"
+                                disabled={signalResults.page * 20 >= signalResults.total}
+                                onClick={async () => {
+                                  try {
+                                    setSignalResults({
+                                      ...(await request(
+                                        '/api/signals?q=' +
+                                          encodeURIComponent(signalResults.query) +
+                                          '&page=' +
+                                          (signalResults.page + 1),
+                                      )),
+                                      query: signalResults.query,
+                                    });
+                                  } catch {
+                                    setNotice('暂时无法查询追踪记录。');
+                                  }
+                                }}
+                              >
+                                下一页
+                              </button>
+                            </div>
+                          )}
+                          {signalResults.history?.length > 0 && (
+                            <details>
+                              <summary>
+                                已保存的历史信号（{signalResults.history.length} 条）
+                              </summary>
+                              {signalResults.history.map((s) => (
+                                <div className="signal-record" key={s.date + s.kind}>
+                                  <strong>
+                                    {s.date} ·{' '}
+                                    {s.kind === 'coiled'
+                                      ? '放量蓄势'
+                                      : s.kind === 'building'
+                                        ? '放量转强'
+                                        : '放量突破'}
+                                  </strong>
+                                  <p>
+                                    {volume(s.signal.volume)} · 前一交易日{' '}
+                                    {number(s.signal.multiple)} 倍 · 系统首次记录{' '}
+                                    {time(s.first_seen)}
+                                  </p>
+                                </div>
+                              ))}
+                            </details>
+                          )}
+                        </div>
+                      )}
+                    </section>
+                    <CoveragePanel coverage={insights?.coverage} open={setSelected} />
                     <div className="bottom-grid">
                       <section className="panel">
                         <div className="section-heading">
@@ -568,18 +737,24 @@ function Opportunity({ report: r, favorite, toggle, open }) {
         </span>
       </div>
       <VolumePanel report={r} compact />
-      <SetupPanel report={r} compact />
+      {r.volume_setup?.qualified ? (
+        <SetupPanel report={r} compact />
+      ) : (
+        <SignalPanel report={r} compact />
+      )}
       <p className="conclusion">{r.conclusion}</p>
       <div className="entry-summary">
         <span>参与参考</span>
         <strong>
-          {r.volume_setup?.qualified
-            ? '突破关注 ' + price(r.volume_setup.resistance)
-            : r.levels
-              ? price(r.levels.zone_low) + '–' + number(r.levels.zone_high, 3)
-              : r.metrics
-                ? '关注 ' + price(r.metrics.ma5) + ' 附近的支撑'
-                : '等待资料更新'}
+          {r.potential_signal?.eligible
+            ? '突破关注 ' + price(r.potential_signal.resistance)
+            : r.volume_setup?.qualified
+              ? '突破关注 ' + price(r.volume_setup.resistance)
+              : r.levels
+                ? price(r.levels.zone_low) + '–' + number(r.levels.zone_high, 3)
+                : r.metrics
+                  ? '关注 ' + price(r.metrics.ma5) + ' 附近的支撑'
+                  : '等待资料更新'}
         </strong>
       </div>
       <div className="evidence-chips">
@@ -692,6 +867,68 @@ function VolumePanel({ report, compact = false }) {
           ? '盘中累计量，对比上一交易日全天；今日尚未收盘。'
           : `按 ${signal.current_date || '所示日期'} 成交量对比；不代表当前盘中成交。`}
       </p>
+    </section>
+  );
+}
+
+function SignalPanel({ report, compact = false }) {
+  const signals = [report.potential_signal, ...(report.recent_signals || [])].filter(Boolean);
+  if (!signals.length) return null;
+  return (
+    <section className="setup-panel" aria-label="已出现的量价信号">
+      <h3>信号已出现，继续看是否守住</h3>
+      {(compact ? [report.tracking_signal || signals[0]] : signals.slice(0, 5)).map((s) => (
+        <div className="signal-record" key={s.date + s.kind}>
+          <strong>
+            {s.date} ·{' '}
+            {s.kind === 'coiled' ? '放量蓄势' : s.kind === 'building' ? '放量转强' : '放量突破'}
+          </strong>
+          <p>
+            成交 {volume(s.volume)}，前一交易日的 {number(s.multiple)} 倍；当时价格 {price(s.price)}
+            。
+          </p>
+          <p>
+            突破关注 {price(s.resistance)} · 失效参考 {price(s.support)}
+          </p>
+        </div>
+      ))}
+      <p className="volume-timing">
+        历史日期属于量价规则回放，不代表系统当时已实盘推荐。今天是否过线请看本次成交量。
+      </p>
+    </section>
+  );
+}
+
+function CoveragePanel({ coverage, open }) {
+  if (!coverage) return null;
+  return (
+    <section className="panel coverage-panel">
+      <h2>全市场追踪覆盖</h2>
+      <p>
+        上游返回 {coverage.expected} 只，已抓取 {coverage.received} 只，逐股分析 {coverage.analyzed}{' '}
+        只；{coverage.history_ready} 只具备至少20个历史交易日。已移出 {coverage.inactive}{' '}
+        条旧股票池记录。
+      </p>
+      <p>
+        待映射 {coverage.unmapped} 只 · 无日线 {coverage.missing_history} 只 · 历史交易日不足{' '}
+        {coverage.insufficient_history} 只 · 回填失败 {coverage.history_errors}{' '}
+        只。缺失资料自动重试，上市时间短或无成交的股票仍可能不足20日。
+      </p>
+      {coverage.issues.length > 0 && (
+        <details>
+          <summary>查看资料待补齐的股票（{coverage.issues.length} 只）</summary>
+          <div className="coverage-issues">
+            {coverage.issues.map((i) => (
+              <button className="stock-link" key={i.code} onClick={() => open(i.code)}>
+                <strong>{i.code}</strong>
+                <span>
+                  {i.reason} · 完整日线 {i.bars} 日
+                </span>
+              </button>
+            ))}
+          </div>
+        </details>
+      )}
     </section>
   );
 }
@@ -1066,7 +1303,19 @@ function StockDetail({ code, close, favorite, toggle }) {
             </button>
           </div>
           <VolumePanel report={r} />
-          <SetupPanel report={r} />
+          {r.selection && (
+            <section className="selection-panel">
+              <h3>为什么入选或未入选</h3>
+              <p>{r.selection.reason}</p>
+              {r.selection.rank && (
+                <p>全市场候选排名第 {r.selection.rank}；排序依据不是上涨概率。</p>
+              )}
+            </section>
+          )}
+          <SignalPanel report={r} />
+          {((!r.potential_signal && !r.tracking_signal) || r.volume_setup?.qualified) && (
+            <SetupPanel report={r} />
+          )}
           <div className={`verdict ${r.stage}`}>
             <Status report={r} />
             {r.snapshot && (
@@ -1087,7 +1336,7 @@ function StockDetail({ code, close, favorite, toggle }) {
           <PriceChart history={r.history} levels={r.levels} />
           <section className="detail-section">
             <div className="section-heading">
-              <h3>支持这个判断的依据</h3>
+              <h3>本次筛选条件核对</h3>
               <span className="muted">
                 {r.evidence_count}/{r.checks.length} 项依据满足 · 非上涨概率
               </span>
@@ -1373,7 +1622,7 @@ function AdminSettings({ state, close, updated }) {
     ['pick_count', '最多精选几只', 1, 5],
     ['min_average_daily_value', '20日平均成交额下限（RM，估算）', 0, 1000000000],
     ['screen_min_volume', '精选成交量下限（股，至少100万）', 1000000, 1000000000000],
-    ['poll_interval_minutes', '更新间隔（分钟）', 1, 60],
+    ['poll_interval_minutes', '更新间隔（分钟）', 1, 5],
     ['screen_min_gain', '20日涨幅下限（%）', -100, 1000],
     ['screen_max_gain', '20日涨幅上限（%）', -100, 1000],
     ['screen_vol_mult', '本次 / 上一交易日全天量（至少2倍）', 2, 100],
