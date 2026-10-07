@@ -25,7 +25,6 @@ const {
   updateWatchlist,
   evaluateAlerts,
   evaluateGapUp,
-  prepareBroadcast,
   deliverOutbox,
   findDoubleBottom,
 } = server;
@@ -373,32 +372,123 @@ test('market pagination scans beyond the old fixed cap and sorts by a stable sym
   }
 });
 
-test('deduplication and outbox survive a failed broadcast without creating a second copy', async () => {
+test('scans stay silent, one scheduled message retries without a second copy', async () => {
   reset();
   seedTrendMarket(1);
-  const cfg = {
-    ...DEFAULTS,
-    telegram_bot_token: 'FAKE_TEST_TOKEN',
-    telegram_chat_id: 'TEST_CHAT',
-  };
+  const cfg = { ...DEFAULTS, telegram_bot_token: 'FAKE_TEST_TOKEN', telegram_chat_id: 'TEST_CHAT' };
   saveConfig(cfg);
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({ ok: false, description: 'temporary failure' }), {
-      headers: { 'Content-Type': 'application/json' },
-    });
-  await server.runBroadcast(cfg);
-  let outbox = db.prepare('SELECT * FROM notification_outbox').all();
-  assert.equal(outbox.length, 1);
-  assert.equal(outbox[0].sent_at, null);
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({ ok: true, result: {} }), {
-      headers: { 'Content-Type': 'application/json' },
-    });
-  await server.runBroadcast(cfg);
-  outbox = db.prepare('SELECT * FROM notification_outbox').all();
-  assert.equal(outbox.length, 1);
-  assert.ok(outbox[0].sent_at);
-  globalThis.fetch = realFetch;
+  let sends = 0;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/sendMessage')) sends++;
+    return Response.json({ ok: false, description: 'temporary failure' });
+  };
+  try {
+    await server.runBroadcast(cfg);
+    assert.equal(sends, 0);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 0);
+    briefingClock('10:30:20', 1);
+    saveConfig(cfg);
+    server.recordHalfHourBriefing('10:30', cfg);
+    await deliverOutbox(cfg);
+    assert.equal(sends, 1);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 1);
+    assert.equal(db.prepare('SELECT sent_at FROM notification_outbox').get().sent_at, null);
+    globalThis.fetch = async () => Response.json({ ok: true, result: {} });
+    await server.runBroadcast(cfg);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 1);
+    assert.ok(db.prepare('SELECT sent_at FROM notification_outbox').get().sent_at);
+    assert.equal(server.recordHalfHourBriefing('10:30', cfg), null);
+  } finally {
+    Date.now = () => fixed;
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('one scheduled message combines picks, saved outcomes and alerts without repeating updates', async () => {
+  reset();
+  seedTrendMarket(2);
+  const cfg = { ...DEFAULTS, telegram_bot_token: 'FAKE_TEST_TOKEN', telegram_chat_id: 'TEST_CHAT' };
+  const messages = [];
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes('/sendMessage')) messages.push(JSON.parse(options.body).text);
+    return Response.json({ ok: true, result: {} });
+  };
+  try {
+    briefingClock('10:05:20', 2);
+    saveConfig(cfg);
+    await server.runBroadcast(cfg);
+    db.prepare("UPDATE watchlist SET entry_price=10 WHERE stock='STRONG0'").run();
+    briefingClock('10:10:20', 2);
+    saveConfig(cfg);
+    await server.runBroadcast(cfg);
+    const resolved = db
+      .prepare("SELECT resolved_pct FROM watchlist WHERE stock='STRONG0'")
+      .get().resolved_pct;
+    assert.ok(resolved >= 8);
+    db.prepare('INSERT INTO alerts(ts,stock,name,kind,message) VALUES(?,?,?,?,?)').run(
+      Date.now() / 1000,
+      'OTHER',
+      'Other',
+      'volume',
+      '时段成交量为上一时段3倍。',
+    );
+    assert.equal(messages.length, 0);
+    briefingClock('10:30:20', 2);
+    saveConfig(cfg);
+    const first = server.recordHalfHourBriefing('10:30', cfg);
+    await deliverOutbox(cfg);
+    assert.equal(messages.length, 1);
+    assert.match(messages[0], /半小时精选/);
+    assert.match(messages[0], /STRONG0.*RM/);
+    assert.match(messages[0], /追踪结果\nSTRONG0 · 涨幅达标/);
+    assert.match(messages[0], /本时段异动\nOTHER/);
+    assert.deepEqual(server.halfHourBriefingState(cfg).latest.updates, first.updates);
+    // Later prices do not rewrite the outcome captured when it resolved.
+    db.prepare("UPDATE live SET price=10.5 WHERE stock='STRONG0'").run();
+    await server.runBroadcast(cfg);
+    assert.equal(messages.length, 1);
+    assert.equal(
+      db.prepare("SELECT resolved_pct FROM watchlist WHERE stock='STRONG0'").get().resolved_pct,
+      resolved,
+    );
+    briefingClock('11:00:20', 2);
+    saveConfig(cfg);
+    const second = server.recordHalfHourBriefing('11:00', cfg);
+    await deliverOutbox(cfg);
+    assert.equal(messages.length, 2);
+    assert.deepEqual(second.updates.observations, []);
+    assert.deepEqual(second.updates.alerts, []);
+  } finally {
+    Date.now = () => fixed;
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('a normal message above the old 1800-character threshold is sent once and cancelled notices stay silent', async () => {
+  reset();
+  const cfg = { ...DEFAULTS, telegram_bot_token: 'FAKE_TEST_TOKEN', telegram_chat_id: 'TEST_CHAT' };
+  const messages = [];
+  globalThis.fetch = async (url, options) => {
+    assert.ok(String(url).includes('/sendMessage'));
+    messages.push(JSON.parse(options.body).text);
+    return Response.json({ ok: true, result: {} });
+  };
+  try {
+    const text = '精选与解释\n'.repeat(400);
+    assert.ok(text.length > 1800 && text.length < 4000);
+    assert.equal((await server.sendTelegramText(text, cfg)).ok, true);
+    assert.deepEqual(messages, [text]);
+    db.prepare('INSERT INTO notification_outbox(ts,text,cancelled_at) VALUES(?,?,?)').run(
+      Date.now() / 1000,
+      'legacy immediate notice',
+      Date.now() / 1000,
+    );
+    await deliverOutbox(cfg);
+    assert.equal(messages.length, 1);
+    assert.equal(server.buildState().status.pending_notifications, 0);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
 
 test('ordinary Telegram members cannot change settings or credentials', async () => {
@@ -700,7 +790,7 @@ test('unchanged half-hour picks each produce one durable notification and a matc
   try {
     briefingClock('10:00:20', 2);
     saveConfig(cfg);
-    prepareBroadcast(cfg); // consume the intraday ticker-change signature first.
+    await server.runBroadcast(cfg); // scans never enqueue an immediate shortlist.
     const first = server.recordHalfHourBriefing('10:00', cfg);
     assert.equal(first.items.length, 2);
     assert.equal(server.recordHalfHourBriefing('10:00', cfg), null);
@@ -868,6 +958,7 @@ test('a failing transaction leaves neither a published closing bulletin nor a no
     assert.throws(() => server.recordFinalBriefing('16:00', cfg), /simulated/);
     assert.equal(db.prepare('SELECT COUNT(*) c FROM closing_briefings').get().c, 0);
     assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 0);
+    assert.equal(db.prepare("SELECT v FROM kv WHERE k='briefing_update_cursor'").get(), undefined);
   } finally {
     db.exec('DROP TRIGGER IF EXISTS fail_briefing');
     Date.now = () => fixed;
@@ -920,10 +1011,11 @@ test('next-day tracking waits for the next trading date, distinguishes intraday 
   }
 });
 
-test('closing bulletins supplement normal intraday shortlists and can use website-only notices', async () => {
+test('closing slots use the single scheduled channel and can use website-only notices', async () => {
   reset();
   seedTrendMarket(2);
-  assert.match(prepareBroadcast(DEFAULTS), /全市场筛选/);
+  await server.runBroadcast(DEFAULTS);
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 0);
   assert.equal(
     (await post('/api/settings', { final_briefing_on: true, final_briefing_telegram: false }))
       .status,
@@ -950,6 +1042,9 @@ test('closing bulletins supplement normal intraday shortlists and can use websit
 test('the automatic closing scheduler forces a complete fresh scan, serializes ticks and retries a failed second slot', async () => {
   reset();
   seedTrendMarket(2);
+  const cfg = { ...DEFAULTS, telegram_bot_token: 'FAKE_TEST_TOKEN', telegram_chat_id: 'TEST_CHAT' };
+  saveConfig(cfg);
+  let sends = 0;
   let scans = 0,
     fail = false;
   globalThis.fetch = async (url) => {
@@ -975,6 +1070,10 @@ test('the automatic closing scheduler forces a complete fresh scan, serializes t
           ],
         })),
       });
+    }
+    if (String(url).includes('/sendMessage')) {
+      sends++;
+      return Response.json({ ok: true, result: {} });
     }
     return new Response('no fixture data', { status: 404 });
   };
@@ -1008,7 +1107,11 @@ test('the automatic closing scheduler forces a complete fresh scan, serializes t
     await server.maybeFinalBriefings();
     assert.equal(db.prepare('SELECT COUNT(*) c FROM closing_briefings').get().c, 4);
     assert.equal(server.closingBriefingState().today[0].slot, '16:30');
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 0);
+    assert.equal(sends, 4); // one API send per slot, including both final slots.
+    assert.equal(
+      db.prepare('SELECT COUNT(*) c FROM notification_outbox WHERE sent_at IS NOT NULL').get().c,
+      4,
+    );
   } finally {
     Date.now = () => fixed;
     globalThis.fetch = realFetch;

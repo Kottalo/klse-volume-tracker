@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import './styles.css';
 import { reportSummary, signalReferences } from '../lib/analysis.js';
+import { briefingUpdateLines } from '../lib/briefings.js';
 
 const number = (v, d = 2) =>
   v == null || !Number.isFinite(v) ? '—' : v.toLocaleString('en-MY', { maximumFractionDigits: d });
@@ -126,17 +127,21 @@ export default function App() {
       if (!active) return;
       setState(next);
       setError('');
-      const latest = next.alerts?.[0];
+      const latest = next.half_hour_briefing?.latest;
+      const key = latest ? `${latest.date} ${latest.slot}` : '';
       if (
         latest &&
         lastAlert.current != null &&
-        latest.id > lastAlert.current &&
+        key > lastAlert.current &&
         typeof Notification !== 'undefined' &&
         Notification.permission === 'granted'
       )
-        new Notification(`${latest.name} · 新异动`, { body: latest.message });
-      if (latest) lastAlert.current = latest.id;
-      else if (lastAlert.current === null) lastAlert.current = 0;
+        new Notification(`KLSE · ${latest.slot}精选通报`, {
+          body: latest.items.length
+            ? latest.items.map((r) => r.code).join('、')
+            : '本次没有符合完整条件的股票。',
+        });
+      lastAlert.current = key;
     };
     request('/api/state')
       .then(accept)
@@ -191,8 +196,8 @@ export default function App() {
     const permission = await Notification.requestPermission();
     setNotice(
       permission === 'granted'
-        ? '已开启新异动通知，保持页面打开即可接收。'
-        : '未开启桌面通知，仍可在异动提醒页查看。',
+        ? '已开启半小时通报通知，保持页面打开即可接收。'
+        : '未开启桌面通知，仍可在网页查看通报。',
     );
   };
   const insights = state?.insights,
@@ -840,7 +845,7 @@ function HalfHourBriefing({ data, open }) {
             : '已暂停'}
       </summary>
       <p className="briefing-note">
-        09:30–12:30、14:30–15:30每30分钟通报，名单未变也发送；16:00、16:30另发尾盘精选。
+        交易时段每30分钟一条，精选、异动和追踪结果合并；16:00、16:30为三倍量尾盘精选。
       </p>
       {latest && (
         <>
@@ -855,28 +860,40 @@ function HalfHourBriefing({ data, open }) {
 }
 
 function BriefingItems({ record, open }) {
-  if (!record.items.length) return <p className="muted">本次没有符合完整条件的股票，不凑数。</p>;
   return (
-    <div className="closing-picks">
-      {record.items.map((item) => (
-        <article key={item.code}>
-          <div>
-            <strong>{item.code}</strong>
-            <span>{price(item.price)}</span>
-          </div>
-          <p>
-            <b>{volume(item.volume)}</b> · 昨日 <b>{number(item.multiple)}倍</b>
+    <>
+      {record.items.length ? (
+        <div className="closing-picks">
+          {record.items.map((item) => (
+            <article key={item.code}>
+              <div>
+                <strong>{item.code}</strong>
+                <span>{price(item.price)}</span>
+              </div>
+              <p>
+                <b>{volume(item.volume)}</b> · 昨日 <b>{number(item.multiple)}倍</b>
+              </p>
+              <p>{item.reason}</p>
+              <p>
+                关注 {price(item.resistance)} · 失效 {price(item.support)}
+              </p>
+              <button className="text-button" onClick={() => open(item.code)}>
+                查看详情 <Icon name="arrow" size={14} />
+              </button>
+            </article>
+          ))}
+        </div>
+      ) : (
+        <p className="muted">本次没有符合完整条件的股票，不凑数。</p>
+      )}
+      {briefingUpdateLines(record.updates)
+        .filter(Boolean)
+        .map((line, index) => (
+          <p className="briefing-note" key={index}>
+            {line}
           </p>
-          <p>{item.reason}</p>
-          <p>
-            关注 {price(item.resistance)} · 失效 {price(item.support)}
-          </p>
-          <button className="text-button" onClick={() => open(item.code)}>
-            查看详情 <Icon name="arrow" size={14} />
-          </button>
-        </article>
-      ))}
-    </div>
+        ))}
+    </>
   );
 }
 function Opportunity({ report: r, favorite, toggle, open }) {

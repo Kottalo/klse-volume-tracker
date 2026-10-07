@@ -45,7 +45,7 @@ const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 const DB_PATH = path.join(DATA_DIR, 'data.db');
 const DIST = path.join(__dirname, 'dist');
 const PORT = process.env.PORT || 8080;
-const VERSION = 'v2.5-half-hour-briefings';
+const VERSION = 'v2.5.1-unified-briefings';
 let analysisCache = null;
 
 const DEFAULTS = {
@@ -300,6 +300,25 @@ if (
     .some((c) => c.name === 'minimum_multiple')
 )
   db.exec('ALTER TABLE closing_briefings ADD COLUMN minimum_multiple REAL DEFAULT 3');
+for (const [table, column, type] of [
+  ['closing_briefings', 'updates', "TEXT DEFAULT '{}'"],
+  ['watchlist', 'resolved_pct', 'REAL'],
+  ['notification_outbox', 'cancelled_at', 'INTEGER'],
+]) {
+  if (
+    !db
+      .prepare(`PRAGMA table_info(${table})`)
+      .all()
+      .some((c) => c.name === column)
+  )
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+}
+// Retain the audit trail, but do not send legacy immediate notices after upgrading.
+db.prepare(
+  `UPDATE notification_outbox SET cancelled_at=?,last_error=?
+  WHERE sent_at IS NULL AND cancelled_at IS NULL
+  AND id NOT IN (SELECT outbox_id FROM closing_briefings WHERE outbox_id IS NOT NULL)`,
+).run(Math.floor(Date.now() / 1000), '即时通报已取消，改为半小时合并通报');
 // Earlier versions counted polls as days. Recalculate surviving observations from stored trading dates.
 if (!db.prepare("SELECT 1 FROM kv WHERE k='observation_days_v2'").get()) {
   db.prepare(
@@ -1612,8 +1631,16 @@ function updateWatchlist(cfg) {
     else if (pct <= -Number(cfg.loss_pct ?? 5)) outcome = 'loss';
     else if (days >= Number(cfg.watch_days ?? 15)) outcome = 'expired';
     db.prepare(
-      'UPDATE watchlist SET best_pct=?, days=?, outcome=?, resolved_date=?, last_checked_date=? WHERE stock=?',
-    ).run(best, days, outcome, outcome === 'observing' ? null : today, today, w.stock);
+      'UPDATE watchlist SET best_pct=?, days=?, outcome=?, resolved_date=?, last_checked_date=?, resolved_pct=? WHERE stock=?',
+    ).run(
+      best,
+      days,
+      outcome,
+      outcome === 'observing' ? null : today,
+      today,
+      outcome === 'observing' ? null : pct,
+      w.stock,
+    );
     updates.push({
       code: w.stock,
       name: lv.name || w.name || w.stock,
@@ -1631,62 +1658,15 @@ function updateWatchlist(cfg) {
   return { picks, updates, tally };
 }
 
-function prepareBroadcast(cfg) {
-  const date = marketDate(),
-    parts = [],
-    observations = updateWatchlist(cfg);
-  const shortlist = getAnalysisOverview(cfg);
-  const signature = date + '|' + shortlist.candidates.map((report) => report.code).join(',');
-  if (shortlist.candidates.length && kvGet('shortlist_broadcast_signature', '') !== signature) {
-    parts.push(
-      '🔎 全市场筛选 · 优先考虑 ' +
-        shortlist.candidates.length +
-        '只\n\n' +
-        shortlist.candidates.map((report) => formatReport(report)).join('\n\n'),
-    );
-    kvSet('shortlist_broadcast_signature', signature);
-  }
-  const changes = observations.updates.filter((item) => item.outcome !== 'observing');
-  if (changes.length) {
-    const labels = { win: '涨幅达标', loss: '跌幅触发', expired: '观察到期' };
-    parts.push(
-      '📈 观察结果更新\n' +
-        changes
-          .map(
-            (item) =>
-              item.name +
-              ' (' +
-              item.code +
-              ') · ' +
-              labels[item.outcome] +
-              ' · ' +
-              (item.pct >= 0 ? '+' : '') +
-              item.pct +
-              '%',
-          )
-          .join('\n') +
-        '\n规则观察记录，不是实盘收益。',
-    );
-  }
-  bcastQueue = [];
-  if (!parts.length) return null;
-  return (
-    '📡 KLSE 潜力精选 · ' +
-    date +
-    '\n\n' +
-    parts.join('\n\n') +
-    '\n\n👉 ' +
-    (process.env.PUBLIC_URL || 'https://www.synthe-fantasia.site')
-  );
-}
-
 let deliveryPromise = null;
 function deliverOutbox(cfg) {
   if (deliveryPromise) return deliveryPromise;
   deliveryPromise = (async () => {
     if (!(cfg.telegram_bot_token && cfg.telegram_chat_id)) return;
     const pending = db
-      .prepare('SELECT * FROM notification_outbox WHERE sent_at IS NULL ORDER BY id LIMIT 5')
+      .prepare(
+        'SELECT * FROM notification_outbox WHERE sent_at IS NULL AND cancelled_at IS NULL ORDER BY id LIMIT 5',
+      )
       .all();
     for (const item of pending) {
       const result = await sendTelegramText(item.text, cfg);
@@ -1713,12 +1693,8 @@ function runBroadcast(cfg) {
       await evaluatePriceDrop(cfg, dropPool);
       await evaluateGapUp(cfg, gapPool);
       await evaluateDoubleBottom(cfg);
-      const text = prepareBroadcast(cfg);
-      if (text && cfg.telegram_bot_token && cfg.telegram_chat_id)
-        db.prepare('INSERT INTO notification_outbox(ts,text) VALUES(?,?)').run(
-          Math.floor(Date.now() / 1000),
-          text,
-        );
+      updateWatchlist(cfg);
+      bcastQueue = [];
       db.exec('COMMIT');
     } catch (e) {
       db.exec('ROLLBACK');
@@ -1737,13 +1713,13 @@ async function sendTelegramText(text, cfg) {
   const chat = (cfg.telegram_chat_id || '').trim();
   if (!token || !chat) return { ok: false, error: 'Telegram 未配置' };
   try {
-    // Split at paragraph boundaries below Telegram's 4096-character limit.
+    // Keep a normal bulletin in one message, below Telegram's 4096-character limit.
     const chunks = [];
     let current = '';
     for (const paragraph of text.split('\n')) {
-      for (let offset = 0; offset < paragraph.length || offset === 0; offset += 1800) {
-        const line = paragraph.slice(offset, offset + 1800);
-        if (current.length + line.length + 1 > 1800) {
+      for (let offset = 0; offset < paragraph.length || offset === 0; offset += 4000) {
+        const line = paragraph.slice(offset, offset + 4000);
+        if (current.length + line.length + 1 > 4000) {
           chunks.push(current);
           current = '';
         }
@@ -2262,6 +2238,44 @@ function recordHalfHourBriefing(slot, cfg = loadConfig(), now = Date.now() / 100
   return recordScheduledBriefing(slot, cfg, now, false);
 }
 
+function pendingBriefingUpdates(date, items) {
+  const saved = JSON.parse(kvGet('briefing_update_cursor', '{}'));
+  const cursor = saved.date === date ? saved : { date, alert_id: 0, observations: [] };
+  const reported = new Set(cursor.observations);
+  const observations = db
+    .prepare(
+      "SELECT stock,outcome,added_date,resolved_pct FROM watchlist WHERE resolved_date=? AND outcome<>'observing'",
+    )
+    .all(date)
+    .filter((r) => !reported.has(r.stock + '|' + r.added_date + '|' + r.outcome));
+  const alerts = db
+    .prepare('SELECT id,stock,kind,message FROM alerts WHERE ts>=? AND id>? ORDER BY id DESC')
+    .all(slotTimestamp(date, '00:00'), cursor.alert_id);
+  const selected = new Set(items.map((r) => r.code));
+  const extraAlerts = alerts.filter((r) => !selected.has(r.stock));
+  const labels = { win: '涨幅达标', loss: '跌幅触发', expired: '观察到期' };
+  return {
+    updates: {
+      observations: observations
+        .slice(0, 3)
+        .map((r) => ({ code: r.stock, label: labels[r.outcome], pct: r.resolved_pct })),
+      observation_count: observations.length,
+      alerts: extraAlerts
+        .slice(0, 3)
+        .map((r) => ({ code: r.stock, message: String(r.message || '').slice(0, 100) })),
+      alert_count: extraAlerts.length,
+    },
+    cursor: {
+      date,
+      alert_id: alerts[0]?.id || cursor.alert_id,
+      observations: [
+        ...reported,
+        ...observations.map((r) => r.stock + '|' + r.added_date + '|' + r.outcome),
+      ],
+    },
+  };
+}
+
 function recordScheduledBriefing(slot, cfg, now, closing) {
   const date = marketDate(now);
   const completed = db
@@ -2305,6 +2319,8 @@ function recordScheduledBriefing(slot, cfg, now, closing) {
     items,
     minimum_multiple: Math.max(closing ? 3 : 2, cfg.screen_vol_mult || 2),
   };
+  const pending = pendingBriefingUpdates(date, items);
+  record.updates = pending.updates;
   const format = closing ? formatBriefing : formatHalfHourBriefing;
   const text = format(record, process.env.PUBLIC_URL || 'https://synthe-fantasia.site/');
   db.exec('BEGIN IMMEDIATE');
@@ -2318,7 +2334,7 @@ function recordScheduledBriefing(slot, cfg, now, closing) {
       );
     }
     db.prepare(
-      'INSERT INTO closing_briefings(date,slot,created_at,quote_at,status,items,text,outbox_id,minimum_multiple) VALUES(?,?,?,?,?,?,?,?,?)',
+      'INSERT INTO closing_briefings(date,slot,created_at,quote_at,status,items,text,outbox_id,minimum_multiple,updates) VALUES(?,?,?,?,?,?,?,?,?,?)',
     ).run(
       date,
       slot,
@@ -2329,7 +2345,9 @@ function recordScheduledBriefing(slot, cfg, now, closing) {
       text,
       outboxId,
       record.minimum_multiple,
+      JSON.stringify(record.updates),
     );
+    kvSet('briefing_update_cursor', JSON.stringify(pending.cursor));
     db.exec('COMMIT');
   } catch (e) {
     db.exec('ROLLBACK');
@@ -2373,7 +2391,13 @@ function closingBriefingState(cfg = loadConfig()) {
       "SELECT * FROM closing_briefings WHERE slot IN ('16:00','16:30') ORDER BY date DESC,slot DESC LIMIT 12",
     )
     .all()
-    .map((r) => ({ ...r, items: JSON.parse(r.items), text: undefined, outbox_id: undefined }));
+    .map((r) => ({
+      ...r,
+      items: JSON.parse(r.items),
+      updates: JSON.parse(r.updates || '{}'),
+      text: undefined,
+      outbox_id: undefined,
+    }));
   const today = records.filter((r) => r.date === date);
   const previous = records.filter((r) => r.date < date);
   const seen = new Set(),
@@ -2454,7 +2478,7 @@ function halfHourBriefingState(cfg = loadConfig()) {
     .prepare(
       `SELECT b.*,o.sent_at,o.attempts FROM closing_briefings b
     LEFT JOIN notification_outbox o ON o.id=b.outbox_id
-    WHERE b.slot NOT IN ('16:00','16:30') ORDER BY b.date DESC,b.slot DESC LIMIT 1`,
+    ORDER BY b.date DESC,b.slot DESC LIMIT 1`,
     )
     .get();
   const latest = row
@@ -2464,6 +2488,7 @@ function halfHourBriefingState(cfg = loadConfig()) {
         quote_at: row.quote_at,
         status: row.status,
         items: JSON.parse(row.items),
+        updates: JSON.parse(row.updates || '{}'),
         minimum_multiple: row.minimum_multiple,
         delivery: row.outbox_id
           ? row.sent_at
@@ -2475,10 +2500,13 @@ function halfHourBriefingState(cfg = loadConfig()) {
       }
     : null;
   const enabled = cfg.half_hour_briefing_on !== false;
-  const next =
-    enabled && tradingDay(date, cfg.market_holidays || [])
-      ? HALF_HOUR_SLOTS.find((slot) => slotTimestamp(date, slot) > now) || null
-      : null;
+  const schedule = [
+    ...(enabled ? HALF_HOUR_SLOTS : []),
+    ...(cfg.final_briefing_on !== false ? BRIEFING_SLOTS : []),
+  ];
+  const next = tradingDay(date, cfg.market_holidays || [])
+    ? schedule.find((slot) => slotTimestamp(date, slot) > now) || null
+    : null;
   return { date, enabled, next_slot: next, latest };
 }
 
@@ -2795,7 +2823,9 @@ function buildState() {
       backfilling: !!backfillPromise,
       error: lastPollError,
       pending_notifications: db
-        .prepare('SELECT COUNT(*) c FROM notification_outbox WHERE sent_at IS NULL')
+        .prepare(
+          'SELECT COUNT(*) c FROM notification_outbox WHERE sent_at IS NULL AND cancelled_at IS NULL',
+        )
         .get().c,
       calendar_note: '按马来西亚常规交易时段判断；节假日需维护休市日期。',
       now: Math.floor(Date.now() / 1000),
@@ -3209,7 +3239,11 @@ app.post('/api/broadcast', async (req, res) => {
   broadcast();
   res.json({
     ok: true,
-    pending: db.prepare('SELECT COUNT(*) c FROM notification_outbox WHERE sent_at IS NULL').get().c,
+    pending: db
+      .prepare(
+        'SELECT COUNT(*) c FROM notification_outbox WHERE sent_at IS NULL AND cancelled_at IS NULL',
+      )
+      .get().c,
   });
 });
 
@@ -3384,7 +3418,6 @@ export {
   evaluateGapUp,
   evaluatePriceDrop,
   evaluateDoubleBottom,
-  prepareBroadcast,
   recordFinalBriefing,
   recordHalfHourBriefing,
   maybeFinalBriefings,

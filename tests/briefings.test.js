@@ -73,6 +73,43 @@ test('MYT slot windows survive restart, skip weekends/holidays and never backdat
   assert.equal(nextTradingDate('2026-10-09', ['2026-10-12']), '2026-10-13');
 });
 
+test('three picks and concise updates fit a single Telegram message', () => {
+  const text = formatHalfHourBriefing(
+    {
+      date: '2026-10-07',
+      slot: '10:00',
+      quote_at: at('2026-10-07T10:00:20'),
+      minimum_multiple: 2,
+      items: Array.from({ length: 3 }, (_, i) => ({
+        code: 'STOCK' + i,
+        price: 1.234,
+        volume: 1500000,
+        multiple: 3.456,
+        resistance: 1.3,
+        support: 1.1,
+        reason: '量价证据'.repeat(150),
+      })),
+      updates: {
+        observations: Array.from({ length: 3 }, (_, i) => ({
+          code: 'FOLLOW' + i,
+          label: '涨幅达标',
+          pct: 8.12,
+        })),
+        observation_count: 8,
+        alerts: Array.from({ length: 3 }, (_, i) => ({
+          code: 'ALERT' + i,
+          message: '异动证据'.repeat(25),
+        })),
+        alert_count: 50,
+      },
+    },
+    'https://example.test',
+  );
+  assert.ok(text.length < 4000);
+  assert.match(text, /共8只/);
+  assert.match(text, /共50条/);
+});
+
 test('closing picks filter the full ranked pool using strict million-share, inclusive three-times and fresh slot quotes', () => {
   const now = at('2026-10-06T16:00:30');
   const base = {
