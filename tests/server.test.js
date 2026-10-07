@@ -693,6 +693,86 @@ function briefingClock(time, count = 1) {
   return current / 1000;
 }
 
+test('unchanged half-hour picks each produce one durable notification and a matching public snapshot', async () => {
+  reset();
+  seedTrendMarket(2);
+  const cfg = { ...DEFAULTS, telegram_bot_token: 'FAKE_TEST_TOKEN', telegram_chat_id: 'TEST_CHAT' };
+  try {
+    briefingClock('10:00:20', 2);
+    saveConfig(cfg);
+    prepareBroadcast(cfg); // consume the intraday ticker-change signature first.
+    const first = server.recordHalfHourBriefing('10:00', cfg);
+    assert.equal(first.items.length, 2);
+    assert.equal(server.recordHalfHourBriefing('10:00', cfg), null);
+    briefingClock('10:30:20', 2);
+    saveConfig(cfg);
+    const second = server.recordHalfHourBriefing('10:30', cfg);
+    assert.deepEqual(
+      second.items,
+      first.items.map((r) => ({ ...r, quote_at: Date.now() / 1000 })),
+    );
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 2);
+    let state = await (await realFetch(base + '/api/state')).json();
+    assert.equal(state.closing_briefings.latest, null);
+    assert.deepEqual(state.half_hour_briefing.latest.items, second.items);
+    assert.equal(state.half_hour_briefing.latest.delivery, '等待发送');
+    assert.equal(JSON.stringify(state).includes('FAKE_TEST_TOKEN'), false);
+    const text = db
+      .prepare('SELECT text FROM notification_outbox ORDER BY id DESC LIMIT 1')
+      .get().text;
+    for (const item of second.items) {
+      assert.ok(text.includes(item.code));
+      assert.ok(text.includes(item.reason));
+      assert.ok(text.includes('RM ' + item.price));
+    }
+    globalThis.fetch = async () => Response.json({ ok: false, description: 'temporary' });
+    await deliverOutbox(cfg);
+    assert.equal(server.halfHourBriefingState(cfg).latest.delivery, '等待发送'); // first queued notice failed before second was attempted.
+    globalThis.fetch = async () => Response.json({ ok: true, result: {} });
+    await deliverOutbox(cfg);
+    assert.equal(server.halfHourBriefingState(cfg).latest.delivery, 'Telegram已发送');
+    assert.equal(server.recordHalfHourBriefing('10:30', cfg), null);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 2);
+  } finally {
+    Date.now = () => fixed;
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('a complete empty half-hour scan is still notified, while disabled or stale slots do not invent a result', () => {
+  reset();
+  seedTrendMarket(1);
+  const cfg = { ...DEFAULTS, telegram_bot_token: 'FAKE_TEST_TOKEN', telegram_chat_id: 'TEST_CHAT' };
+  try {
+    briefingClock('12:30:20');
+    saveConfig(cfg);
+    assert.equal(
+      server.recordHalfHourBriefing('12:30', { ...cfg, half_hour_briefing_on: false }),
+      null,
+    );
+    db.prepare('UPDATE live SET volume=500000').run();
+    saveConfig(cfg);
+    const r = server.recordHalfHourBriefing('12:30', cfg);
+    assert.equal(r.status, 'empty');
+    assert.match(db.prepare('SELECT text FROM notification_outbox').get().text, /没有符合完整条件/);
+    assert.equal(server.closingBriefingState(cfg).today.length, 0);
+    briefingClock('14:30:20');
+    db.prepare('UPDATE kv SET v=? WHERE k=?').run(
+      JSON.stringify({ expected: 1, received: 1, at: Date.now() / 1000 - 21 }),
+      'market_scan_coverage',
+    );
+    saveConfig(cfg);
+    assert.equal(server.recordHalfHourBriefing('14:30', cfg), null);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 1);
+    briefingClock('14:31:00');
+    saveConfig(cfg);
+    assert.ok(server.recordHalfHourBriefing('14:30', cfg));
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 2);
+  } finally {
+    Date.now = () => fixed;
+  }
+});
+
 test('two closing slots use the full pool, freeze snapshot prices and atomically deduplicate the website and notification queue', async () => {
   reset();
   seedTrendMarket(5);
@@ -899,25 +979,34 @@ test('the automatic closing scheduler forces a complete fresh scan, serializes t
     return new Response('no fixture data', { status: 404 });
   };
   try {
+    Date.now = () => Date.parse('2026-10-05T14:30:20+08:00');
+    await Promise.all([server.maybeFinalBriefings(), server.maybeFinalBriefings()]);
+    assert.equal(scans, 1);
+    assert.equal(server.halfHourBriefingState().latest.slot, '14:30');
+    Date.now = () => Date.parse('2026-10-05T15:00:20+08:00');
+    await server.maybeFinalBriefings();
+    assert.equal(scans, 2);
+    assert.equal(server.halfHourBriefingState().latest.slot, '15:00');
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM closing_briefings').get().c, 2);
     Date.now = () => Date.parse('2026-10-05T16:00:20+08:00');
     await Promise.all([
       server.maybeFinalBriefings(),
       server.maybeFinalBriefings(),
       server.maybeFinalBriefings(),
     ]);
-    assert.equal(scans, 1);
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM closing_briefings').get().c, 1);
+    assert.equal(scans, 3);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM closing_briefings').get().c, 3);
     assert.equal(server.closingBriefingState().today[0].slot, '16:00');
     await server.maybeFinalBriefings();
-    assert.equal(scans, 1);
+    assert.equal(scans, 3);
     Date.now = () => Date.parse('2026-10-05T16:30:20+08:00');
     fail = true;
     await server.maybeFinalBriefings();
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM closing_briefings').get().c, 1);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM closing_briefings').get().c, 3);
     Date.now = () => Date.parse('2026-10-05T16:30:40+08:00');
     fail = false;
     await server.maybeFinalBriefings();
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM closing_briefings').get().c, 2);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM closing_briefings').get().c, 4);
     assert.equal(server.closingBriefingState().today[0].slot, '16:30');
     assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 0);
   } finally {

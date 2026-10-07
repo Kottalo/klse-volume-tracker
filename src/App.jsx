@@ -368,6 +368,7 @@ export default function App() {
                       />
                     </section>
                     <ClosingBriefings data={state.closing_briefings} open={setSelected} />
+                    <HalfHourBriefing data={state.half_hour_briefing} open={setSelected} />
                     <section className="opportunities">
                       <div className="section-heading">
                         <div>
@@ -765,30 +766,7 @@ function ClosingBriefings({ data, open }) {
           <p className="briefing-caption">
             {latest.date} {latest.slot} MYT · 行情抓取 {time(latest.quote_at)}
           </p>
-          {latest.items.length ? (
-            <div className="closing-picks">
-              {latest.items.map((item) => (
-                <article key={item.code}>
-                  <div>
-                    <strong>{item.code}</strong>
-                    <span>{price(item.price)}</span>
-                  </div>
-                  <p>
-                    <b>{volume(item.volume)}</b> · 昨日 <b>{number(item.multiple)}倍</b>
-                  </p>
-                  <p>{item.reason}</p>
-                  <p>
-                    关注 {price(item.resistance)} · 失效 {price(item.support)}
-                  </p>
-                  <button className="text-button" onClick={() => open(item.code)}>
-                    查看详情 <Icon name="arrow" size={14} />
-                  </button>
-                </article>
-              ))}
-            </div>
-          ) : (
-            <p className="muted">本次没有符合完整条件的股票，不凑数。</p>
-          )}
+          <BriefingItems record={latest} open={open} />
         </>
       ) : (
         <p className="muted">
@@ -843,6 +821,62 @@ function ClosingBriefings({ data, open }) {
         </details>
       )}
     </section>
+  );
+}
+
+function HalfHourBriefing({ data, open }) {
+  if (!data) return null;
+  const latest = data.latest;
+  return (
+    <details className="panel half-hour-panel">
+      <summary>
+        半小时通报 ·{' '}
+        {latest
+          ? `${latest.date} ${latest.slot} · ${latest.delivery}`
+          : data.enabled
+            ? data.next_slot
+              ? `下一次 ${data.next_slot} MYT`
+              : '等待交易时段'
+            : '已暂停'}
+      </summary>
+      <p className="briefing-note">
+        09:30–12:30、14:30–15:30每30分钟通报，名单未变也发送；16:00、16:30另发尾盘精选。
+      </p>
+      {latest && (
+        <>
+          <p className="briefing-caption">
+            {latest.date} {latest.slot} MYT · 行情抓取 {time(latest.quote_at)} · 本次通报快照
+          </p>
+          <BriefingItems record={latest} open={open} />
+        </>
+      )}
+    </details>
+  );
+}
+
+function BriefingItems({ record, open }) {
+  if (!record.items.length) return <p className="muted">本次没有符合完整条件的股票，不凑数。</p>;
+  return (
+    <div className="closing-picks">
+      {record.items.map((item) => (
+        <article key={item.code}>
+          <div>
+            <strong>{item.code}</strong>
+            <span>{price(item.price)}</span>
+          </div>
+          <p>
+            <b>{volume(item.volume)}</b> · 昨日 <b>{number(item.multiple)}倍</b>
+          </p>
+          <p>{item.reason}</p>
+          <p>
+            关注 {price(item.resistance)} · 失效 {price(item.support)}
+          </p>
+          <button className="text-button" onClick={() => open(item.code)}>
+            查看详情 <Icon name="arrow" size={14} />
+          </button>
+        </article>
+      ))}
+    </div>
   );
 }
 function Opportunity({ report: r, favorite, toggle, open }) {
@@ -1770,6 +1804,7 @@ function AdminSettings({ state, close, updated }) {
     patch.window = draft.window;
     patch.screen_on = draft.screen_on;
     patch.final_briefing_on = draft.final_briefing_on !== false;
+    patch.half_hour_briefing_on = draft.half_hour_briefing_on !== false;
     patch.final_briefing_telegram = draft.final_briefing_telegram !== false;
     mutate('/api/settings', patch);
   };
@@ -1830,6 +1865,14 @@ function AdminSettings({ state, close, updated }) {
           <label className="checkbox-label">
             <input
               type="checkbox"
+              checked={draft.half_hour_briefing_on !== false}
+              onChange={(e) => setDraft({ ...draft, half_hour_briefing_on: e.target.checked })}
+            />
+            交易时段每半小时通报
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
               checked={draft.final_briefing_on !== false}
               onChange={(e) => setDraft({ ...draft, final_briefing_on: e.target.checked })}
             />
@@ -1841,7 +1884,7 @@ function AdminSettings({ state, close, updated }) {
               checked={draft.final_briefing_telegram !== false}
               onChange={(e) => setDraft({ ...draft, final_briefing_telegram: e.target.checked })}
             />
-            尾盘通报发送到Telegram
+            定时通报发送到Telegram
           </label>
         </div>
         <p className="data-note">

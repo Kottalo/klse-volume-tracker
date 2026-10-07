@@ -19,6 +19,7 @@ React + Vite 前端，Express + SQLite 后端，SSE 自动推送。行情来自 
 - **我的关注**：用户自己的星标保存在浏览器；与系统的策略观察记录分开。
 - **异动记录**：无需 Telegram，也能在网页看到放量、急涨、暴跌和形态异动。
 - **Telegram**：`/top` 与网页共用简短解释。盘中精选、观察结果和异动提醒照常推送，16:00、16:30额外通报三倍量精选。管理设置可关闭 Telegram 尾盘推送、只在网页通报。
+- **每半小时通报**：交易日MYT09:30–12:30、14:30–15:30每半小时固定通报当前精选，名单不变也发送；无合格股票也报告。16:00、16:30由更严格的尾盘通报接替，不再额外发一份两倍量定时通报。午休和16:30之后不发送半小时通报。固定通报不受盘中名单变化的去重规则影响；网页“半小时通报”保留与Telegram相同的价格、量和解释快照，并显示发送状态。
 
 趋势、量能和双底仅是技术条件，没有覆盖财报、估值和公司公告。形态评分不是上涨概率；量度目标不保证达到。系统观察记录未模拟真实成交、费用与滑点，不能作为实盘收益。详见 [Investor.gov 历史表现说明](https://www.investor.gov/introduction-investing/general-resources/news-alerts/alerts-bulletins/investor-bulletins-47)。
 
@@ -107,7 +108,8 @@ Render Blueprint 使用 `render.yaml`：Node24、`npm ci && npm test && npm run 
 | ------------------------------------- | ------- | -------------------------------------------------- |
 | `pick_count`                          | 3       | 精选和同时观察的目标数量，首页最多5只              |
 | `final_briefing_on`                   | `true`  | MYT 交易日16:00与16:30固定通报，最多3只            |
-| `final_briefing_telegram`             | `true`  | 已配置 Telegram 时同步尾盘通报；关闭后只显示网页   |
+| `half_hour_briefing_on`               | `true`  | MYT交易时段每半小时固定通报，名单未变也发送        |
+| `final_briefing_telegram`             | `true`  | 已配置 Telegram 时同步定时通报；关闭后只显示网页   |
 | `min_average_daily_value`             | 200000  | 最近20个完整交易日平均成交额估算下限，RM           |
 | `poll_interval_minutes`               | 5       | 市场快照更新间隔，1–5分钟；旧的更慢配置按5分钟执行 |
 | `window`                              | `1d`    | 看板成交量对比时段                                 |

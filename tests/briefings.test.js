@@ -5,9 +5,57 @@ import {
   finalCandidates,
   nextTradingDate,
   formatBriefing,
+  dueHalfHourSlots,
+  halfHourCandidates,
+  formatHalfHourBriefing,
 } from '../lib/briefings.js';
 
 const at = (s) => Date.parse(s + '+08:00') / 1000;
+test('half-hour slots repeat unchanged lists, stop for lunch, and reserve the two final slots', () => {
+  for (const slot of ['09:30', '10:00', '11:30', '12:30', '14:30', '15:30']) {
+    const now = at('2026-10-07T' + slot + ':20');
+    assert.deepEqual(dueHalfHourSlots({}, [], now), [slot]);
+    assert.deepEqual(dueHalfHourSlots({}, [slot], now), []);
+  }
+  for (const time of [
+    '09:00:00',
+    '13:00:00',
+    '13:30:00',
+    '14:00:00',
+    '16:00:00',
+    '16:30:00',
+    '17:00:00',
+  ])
+    assert.deepEqual(dueHalfHourSlots({}, [], at('2026-10-07T' + time)), []);
+  assert.deepEqual(dueHalfHourSlots({}, [], at('2026-10-10T10:00:00')), []);
+  assert.deepEqual(
+    dueHalfHourSlots({ market_holidays: ['2026-10-07'] }, [], at('2026-10-07T10:00:00')),
+    [],
+  );
+  assert.deepEqual(
+    dueHalfHourSlots({ half_hour_briefing_on: false }, [], at('2026-10-07T10:00:00')),
+    [],
+  );
+  assert.deepEqual(dueHalfHourSlots({}, [], at('2026-10-07T10:10:00')), []);
+  const now = at('2026-10-07T10:00:20');
+  const r = {
+    potential_eligible: true,
+    quote_date: '2026-10-07',
+    fetched_at: now,
+    volume: 1000000,
+    volume_signal: { multiple: 2 },
+  };
+  assert.equal(halfHourCandidates([r], {}, '10:00', now).length, 1);
+  assert.equal(finalCandidates([r], {}, '10:00', now).length, 0);
+  assert.equal(halfHourCandidates([{ ...r, fetched_at: now - 21 }], {}, '10:00', now).length, 0);
+  assert.match(
+    formatHalfHourBriefing(
+      { date: '2026-10-07', slot: '10:00', quote_at: now, minimum_multiple: 2, items: [] },
+      'https://example.test',
+    ),
+    /半小时精选.*10:00/,
+  );
+});
 test('MYT slot windows survive restart, skip weekends/holidays and never backdate a missed bulletin', () => {
   const cfg = { final_briefing_on: true, market_holidays: ['2026-10-07'] };
   assert.deepEqual(dueBriefingSlots(cfg, [], at('2026-10-06T15:59:59')), []);

@@ -21,10 +21,14 @@ import { validateSettings, parameterPatch, ValidationError } from './lib/setting
 import { protectApi } from './lib/security.js';
 import {
   BRIEFING_SLOTS,
+  HALF_HOUR_SLOTS,
   dueBriefingSlots,
+  dueHalfHourSlots,
   finalCandidates,
+  halfHourCandidates,
   conciseReason,
   formatBriefing,
+  formatHalfHourBriefing,
   nextTradingDate,
   slotTimestamp,
   tradingDay,
@@ -41,7 +45,7 @@ const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 const DB_PATH = path.join(DATA_DIR, 'data.db');
 const DIST = path.join(__dirname, 'dist');
 const PORT = process.env.PORT || 8080;
-const VERSION = 'v2.4.1-session-fix';
+const VERSION = 'v2.5-half-hour-briefings';
 let analysisCache = null;
 
 const DEFAULTS = {
@@ -73,6 +77,7 @@ const DEFAULTS = {
   pick_count: 3, // 每日精选几只(宁少勿多, 别让用户被一堆票淹没)
   min_average_daily_value: 200000, // 最近20个完整交易日平均成交额估算下限(RM)
   final_briefing_on: true,
+  half_hour_briefing_on: true,
   final_briefing_telegram: true,
   win_pct: 8, // 观察名单里涨到这个幅度算「应证」
   loss_pct: 5, // 跌到这个幅度算「证伪」
@@ -1690,6 +1695,7 @@ function deliverOutbox(cfg) {
       ).run(result.ok ? Math.floor(Date.now() / 1000) : null, result.error || null, item.id);
       if (!result.ok) break;
     }
+    if (pending.length && clients.size) broadcast();
   })().finally(() => {
     deliveryPromise = null;
   });
@@ -2243,18 +2249,27 @@ function startPolling() {
   }, 5000);
   pollTelegram();
   setInterval(() => {
-    maybeFinalBriefings().catch((e) => log('尾盘通报失败: ' + e.message));
+    maybeFinalBriefings().catch((e) => log('定时通报失败: ' + e.message));
   }, 15000);
-  maybeFinalBriefings().catch((e) => log('尾盘通报启动检查失败: ' + e.message));
+  maybeFinalBriefings().catch((e) => log('定时通报启动检查失败: ' + e.message));
 }
 
 function recordFinalBriefing(slot, cfg = loadConfig(), now = Date.now() / 1000) {
+  return recordScheduledBriefing(slot, cfg, now, true);
+}
+
+function recordHalfHourBriefing(slot, cfg = loadConfig(), now = Date.now() / 1000) {
+  return recordScheduledBriefing(slot, cfg, now, false);
+}
+
+function recordScheduledBriefing(slot, cfg, now, closing) {
   const date = marketDate(now);
   const completed = db
     .prepare('SELECT slot FROM closing_briefings WHERE date=?')
     .all(date)
     .map((r) => r.slot);
-  if (!dueBriefingSlots(cfg, completed, now).includes(slot)) return null;
+  const due = closing ? dueBriefingSlots : dueHalfHourSlots;
+  if (!due(cfg, completed, now).includes(slot)) return null;
   getAnalysisOverview(cfg);
   const scan = analysisCache.data.coverage;
   // A complete scan fetched after this slot is required, even for an empty bulletin.
@@ -2266,7 +2281,8 @@ function recordFinalBriefing(slot, cfg = loadConfig(), now = Date.now() / 1000) 
     scan.expected !== scan.received
   )
     return null;
-  const items = finalCandidates(analysisCache.ranked, cfg, slot, now).map((r) => ({
+  const pick = closing ? finalCandidates : halfHourCandidates;
+  const items = pick(analysisCache.ranked, cfg, slot, now).map((r) => ({
     code: r.code,
     name: r.name,
     price: r.price,
@@ -2287,9 +2303,10 @@ function recordFinalBriefing(slot, cfg = loadConfig(), now = Date.now() / 1000) 
     quote_at: scan.scan_at,
     status: items.length ? 'ready' : 'empty',
     items,
-    minimum_multiple: Math.max(3, cfg.screen_vol_mult || 2),
+    minimum_multiple: Math.max(closing ? 3 : 2, cfg.screen_vol_mult || 2),
   };
-  const text = formatBriefing(record, process.env.PUBLIC_URL || 'https://synthe-fantasia.site/');
+  const format = closing ? formatBriefing : formatHalfHourBriefing;
+  const text = format(record, process.env.PUBLIC_URL || 'https://synthe-fantasia.site/');
   db.exec('BEGIN IMMEDIATE');
   try {
     let outboxId = null;
@@ -2331,12 +2348,15 @@ function maybeFinalBriefings() {
       .prepare('SELECT slot FROM closing_briefings WHERE date=?')
       .all(date)
       .map((r) => r.slot);
-    const slots = dueBriefingSlots(cfg, done);
+    const slots = [...dueHalfHourSlots(cfg, done), ...dueBriefingSlots(cfg, done)];
     if (!slots.length) return;
     await poll(); // force a fresh whole-market scan at the slot, independent of normal polling.
     let recorded = false;
     const currentCfg = loadConfig();
-    for (const slot of slots) if (recordFinalBriefing(slot, currentCfg)) recorded = true;
+    for (const slot of slots) {
+      const record = BRIEFING_SLOTS.includes(slot) ? recordFinalBriefing : recordHalfHourBriefing;
+      if (record(slot, currentCfg)) recorded = true;
+    }
     if (recorded) broadcast();
     await deliverOutbox(currentCfg);
   })().finally(() => {
@@ -2349,7 +2369,9 @@ function closingBriefingState(cfg = loadConfig()) {
   const date = marketDate(),
     now = Date.now() / 1000;
   const records = db
-    .prepare('SELECT * FROM closing_briefings ORDER BY date DESC,slot DESC LIMIT 12')
+    .prepare(
+      "SELECT * FROM closing_briefings WHERE slot IN ('16:00','16:30') ORDER BY date DESC,slot DESC LIMIT 12",
+    )
     .all()
     .map((r) => ({ ...r, items: JSON.parse(r.items), text: undefined, outbox_id: undefined }));
   const today = records.filter((r) => r.date === date);
@@ -2423,6 +2445,41 @@ function closingBriefingState(cfg = loadConfig()) {
     latest: records[0] || null,
     follow: follow.slice(0, 12),
   };
+}
+
+function halfHourBriefingState(cfg = loadConfig()) {
+  const date = marketDate(),
+    now = Date.now() / 1000;
+  const row = db
+    .prepare(
+      `SELECT b.*,o.sent_at,o.attempts FROM closing_briefings b
+    LEFT JOIN notification_outbox o ON o.id=b.outbox_id
+    WHERE b.slot NOT IN ('16:00','16:30') ORDER BY b.date DESC,b.slot DESC LIMIT 1`,
+    )
+    .get();
+  const latest = row
+    ? {
+        date: row.date,
+        slot: row.slot,
+        quote_at: row.quote_at,
+        status: row.status,
+        items: JSON.parse(row.items),
+        minimum_multiple: row.minimum_multiple,
+        delivery: row.outbox_id
+          ? row.sent_at
+            ? 'Telegram已发送'
+            : row.attempts
+              ? '发送重试中'
+              : '等待发送'
+          : '仅网页',
+      }
+    : null;
+  const enabled = cfg.half_hour_briefing_on !== false;
+  const next =
+    enabled && tradingDay(date, cfg.market_holidays || [])
+      ? HALF_HOUR_SLOTS.find((slot) => slotTimestamp(date, slot) > now) || null
+      : null;
+  return { date, enabled, next_slot: next, latest };
 }
 
 // ---------------- SSE ----------------
@@ -2710,6 +2767,7 @@ function buildState() {
       pick_count: cfg.pick_count ?? 3,
       min_average_daily_value: cfg.min_average_daily_value ?? 200000,
       final_briefing_on: cfg.final_briefing_on !== false,
+      half_hour_briefing_on: cfg.half_hour_briefing_on !== false,
       final_briefing_telegram: cfg.final_briefing_telegram !== false,
       win_pct: cfg.win_pct ?? 8,
       loss_pct: cfg.loss_pct ?? 5,
@@ -2726,6 +2784,7 @@ function buildState() {
     insights: getAnalysisOverview(cfg),
     observations: observationState(),
     closing_briefings: closingBriefingState(cfg),
+    half_hour_briefing: halfHourBriefingState(cfg),
     alerts: db.prepare('SELECT * FROM alerts ORDER BY id DESC LIMIT 50').all(),
     admin_enabled: !!process.env.ADMIN_TOKEN,
     status: {
@@ -3327,8 +3386,10 @@ export {
   evaluateDoubleBottom,
   prepareBroadcast,
   recordFinalBriefing,
+  recordHalfHourBriefing,
   maybeFinalBriefings,
   closingBriefingState,
+  halfHourBriefingState,
   deliverOutbox,
   runBroadcast,
   findDoubleBottom,

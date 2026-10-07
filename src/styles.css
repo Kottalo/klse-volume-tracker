@@ -2184,6 +2184,18 @@ tr:hover td {
   margin: 0 0 28px;
   border-color: #427564;
 }
+.half-hour-panel {
+  margin: 0 0 24px;
+  padding: 16px 22px;
+}
+.half-hour-panel > summary {
+  cursor: pointer;
+  font-size: 13px;
+  color: #b8d7ca;
+}
+.half-hour-panel[open] > summary {
+  margin-bottom: 12px;
+}
 .closing-panel .section-heading {
   margin-bottom: 12px;
 }
