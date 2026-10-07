@@ -15,6 +15,7 @@ import {
   observationDays,
   explainStock,
   formatReport,
+  isLunchBreak,
 } from './lib/analysis.js';
 import { validateSettings, parameterPatch, ValidationError } from './lib/settings.js';
 import { protectApi } from './lib/security.js';
@@ -40,7 +41,7 @@ const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 const DB_PATH = path.join(DATA_DIR, 'data.db');
 const DIST = path.join(__dirname, 'dist');
 const PORT = process.env.PORT || 8080;
-const VERSION = 'v2.4-closing-briefings';
+const VERSION = 'v2.4.1-session-fix';
 let analysisCache = null;
 
 const DEFAULTS = {
@@ -1625,17 +1626,13 @@ function updateWatchlist(cfg) {
   return { picks, updates, tally };
 }
 
-function prepareBroadcast(cfg, { includeShortlist = true } = {}) {
+function prepareBroadcast(cfg) {
   const date = marketDate(),
     parts = [],
     observations = updateWatchlist(cfg);
   const shortlist = getAnalysisOverview(cfg);
   const signature = date + '|' + shortlist.candidates.map((report) => report.code).join(',');
-  if (
-    includeShortlist &&
-    shortlist.candidates.length &&
-    kvGet('shortlist_broadcast_signature', '') !== signature
-  ) {
+  if (shortlist.candidates.length && kvGet('shortlist_broadcast_signature', '') !== signature) {
     parts.push(
       '🔎 全市场筛选 · 优先考虑 ' +
         shortlist.candidates.length +
@@ -1710,7 +1707,7 @@ function runBroadcast(cfg) {
       await evaluatePriceDrop(cfg, dropPool);
       await evaluateGapUp(cfg, gapPool);
       await evaluateDoubleBottom(cfg);
-      const text = prepareBroadcast(cfg, { includeShortlist: cfg.final_briefing_on === false });
+      const text = prepareBroadcast(cfg);
       if (text && cfg.telegram_bot_token && cfg.telegram_chat_id)
         db.prepare('INSERT INTO notification_outbox(ts,text) VALUES(?,?)').run(
           Math.floor(Date.now() / 1000),
@@ -2733,6 +2730,7 @@ function buildState() {
     admin_enabled: !!process.env.ADMIN_TOKEN,
     status: {
       market_open: isMarketOpen(),
+      lunch_break: isLunchBreak(Date.now() / 1000, cfg.market_holidays || []),
       last_poll: lastPoll || Number(kvGet('last_successful_poll', 0)) || null,
       polling: !!pollPromise,
       backfilling: !!backfillPromise,

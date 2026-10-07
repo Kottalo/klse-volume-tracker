@@ -327,11 +327,16 @@ export default function App() {
                   </div>
                   <span className="session-badge">
                     <i className={state.status.market_open ? 'online' : ''} />
-                    {state.status.market_open ? '常规交易时段' : '常规休市时段'}
+                    {state.status.market_open
+                      ? '常规交易时段'
+                      : state.status.lunch_break
+                        ? '午休 · 上午快照'
+                        : '常规休市时段'}
                   </span>
                 </div>
                 <div className="data-caption">
-                  快照 {time(state.status.last_poll)} · 免费行情可能延迟
+                  {state.status.lunch_break ? '上午快照' : '快照'} {time(state.status.last_poll)} ·
+                  免费行情可能延迟
                 </div>
                 {page === 'overview' && (
                   <>
@@ -869,7 +874,7 @@ function Opportunity({ report: r, favorite, toggle, open }) {
       <SignalLevels report={r} />
       <div className="card-bottom">
         <span>
-          {r.snapshot ? '收盘 · ' : ''}
+          {r.morning_snapshot ? '上午 · ' : r.snapshot ? '收盘 · ' : ''}
           {r.quote_date || '资料待补齐'}
         </span>
         <button className="text-button" onClick={open}>

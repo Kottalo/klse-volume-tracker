@@ -12,6 +12,8 @@ import {
   consolidationSetup,
   potentialSignal,
   recentPotentialSignals,
+  isLunchBreak,
+  reportSummary,
 } from '../lib/analysis.js';
 import { validateSettings, ValidationError } from '../lib/settings.js';
 
@@ -32,6 +34,84 @@ const history = Array.from({ length: 25 }, (_, i) => ({
   high: 11 + i / 10,
   low: 9 + i / 10,
 }));
+
+test('lunch preserves the final morning snapshot, rejects genuinely stale data and ends at afternoon open', () => {
+  const at = (time) => Date.parse('2026-10-05T' + time + '+08:00') / 1000;
+  const rows = history.map((r, i) => ({
+    ...r,
+    close: 12 + i * 0.01,
+    high: 12.4 + i * 0.01,
+    low: 11.9 + i * 0.01,
+  }));
+  const stock = {
+    stock: 'EARLY',
+    price: 12.3,
+    prevClose: 12.24,
+    volume: 1200000,
+    session_date: '2026-10-05',
+    mtime: at('12:24:00'),
+  };
+  const report = (time, overrides = {}, config = cfg) =>
+    explainStock({
+      stock: { ...stock, ...overrides },
+      rows,
+      pattern: null,
+      cfg: config,
+      now: at(time),
+    });
+  for (const time of ['12:30:00', '13:30:00', '14:29:59']) {
+    const r = report(time);
+    assert.equal(r.potential_eligible, true);
+    assert.equal(r.morning_snapshot, true);
+    assert.equal(r.snapshot, false);
+    assert.equal(r.volume_signal.current_label, '上午累计成交量');
+    assert.equal(r.fetched_at, stock.mtime);
+    assert.match(r.sources.quotes, /上午时段快照/);
+  }
+  assert.equal(report('13:30:00', { mtime: at('12:00:00') }).stage, 'stale');
+  assert.equal(report('13:30:00', { mtime: at('13:31:00') }).stage, 'stale');
+  assert.equal(report('13:30:00', { session_date: '2026-10-02' }).potential_eligible, false);
+  assert.equal(report('13:30:00', {}, { ...cfg, market_holidays: ['2026-10-05'] }).stage, 'stale');
+  assert.equal(report('14:30:00').stage, 'stale');
+  assert.equal(report('14:31:00', { mtime: at('14:30:30') }).potential_eligible, true);
+  assert.equal(isLunchBreak(Date.parse('2026-10-10T13:00:00+08:00') / 1000), false);
+});
+
+test('short explanations keep measured volume, price position and the next condition', () => {
+  const r = {
+    stage: 'confirmed',
+    change_pct: 2,
+    potential_signal: { resistance: 0.685, support: 0.625, average_multiple: 2.9 },
+  };
+  const text = reportSummary(r);
+  assert.match(text, /20日均量的2.9倍/);
+  assert.match(text, /RM 0.685/);
+  assert.match(text, /守住/);
+  assert.ok(text.length < 90);
+  assert.match(reportSummary({ ...r, stage: 'extended', change_pct: 8.21 }), /当日已涨8.21%/);
+});
+
+test('HKB on Oct 7 has three-times volume but is tracked after its rally, including during lunch', () => {
+  const fixture = JSON.parse(
+    fs.readFileSync(new URL('./fixtures/hkb-2026-10-07.json', import.meta.url), 'utf8'),
+  );
+  const r = explainStock({
+    stock: fixture.snapshot,
+    rows: fixture.bars,
+    pattern: null,
+    cfg,
+    now: Date.parse('2026-10-07T13:15:00+08:00') / 1000,
+  });
+  assert.equal(r.morning_snapshot, true);
+  assert.equal(r.stage, 'extended');
+  assert.equal(r.volume_signal.pass, true);
+  assert.equal(r.volume_signal.multiple, 3923600 / 998600);
+  assert.equal(r.potential_eligible, false);
+  assert.equal(r.tracking_signal.date, '2026-10-07');
+  assert.equal(r.potential_signal.resistance, 0.685);
+  assert.equal(r.potential_signal.eligible, false);
+  assert.match(reportSummary(r), /8.21%/);
+});
 
 test('historical calculations use only bars before the reference day', () => {
   const reference = history[22].date;

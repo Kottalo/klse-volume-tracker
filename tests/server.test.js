@@ -181,7 +181,6 @@ test('failed Telegram deliveries remain in the outbox and can be retried', async
   );
   const cfg = {
     ...DEFAULTS,
-    final_briefing_on: false,
     telegram_bot_token: 'FAKE_TEST_TOKEN',
     telegram_chat_id: 'TEST_CHAT',
   };
@@ -291,8 +290,8 @@ test('lunch-break shortlist does not mix older-session or orphaned high-volume s
   );
   db.prepare('UPDATE live SET session_date=? WHERE stock=?').run('2026-10-02', 'OLD');
   db.prepare('DELETE FROM universe WHERE stock=?').run('ORPHAN');
-  const lunch = fixed + 145 * 60000;
-  db.prepare('UPDATE live SET mtime=?').run(lunch / 1000);
+  const lunch = Date.parse('2026-10-05T13:30:00+08:00');
+  db.prepare('UPDATE live SET mtime=?').run(Date.parse('2026-10-05T12:24:00+08:00') / 1000);
   Date.now = () => lunch;
   try {
     assert.equal(server.getStockReport('OLD').potential_eligible, false);
@@ -300,6 +299,8 @@ test('lunch-break shortlist does not mix older-session or orphaned high-volume s
     assert.equal(state.insights.scanned, 2);
     assert.equal(state.insights.volume_qualified, 1);
     assert.equal(state.insights.snapshot_date, '2026-10-05');
+    assert.equal(state.status.lunch_break, true);
+    assert.equal(state.insights.candidates[0].morning_snapshot, true);
     assert.deepEqual(
       state.insights.candidates.map((r) => r.code),
       ['STRONG0'],
@@ -377,7 +378,6 @@ test('deduplication and outbox survive a failed broadcast without creating a sec
   seedTrendMarket(1);
   const cfg = {
     ...DEFAULTS,
-    final_briefing_on: false,
     telegram_bot_token: 'FAKE_TEST_TOKEN',
     telegram_chat_id: 'TEST_CHAT',
   };
@@ -840,10 +840,10 @@ test('next-day tracking waits for the next trading date, distinguishes intraday 
   }
 });
 
-test('scheduled mode suppresses intraday shortlist pushes while settings can switch to website-only notices', async () => {
+test('closing bulletins supplement normal intraday shortlists and can use website-only notices', async () => {
   reset();
   seedTrendMarket(2);
-  assert.equal(prepareBroadcast(DEFAULTS, { includeShortlist: false }), null);
+  assert.match(prepareBroadcast(DEFAULTS), /全市场筛选/);
   assert.equal(
     (await post('/api/settings', { final_briefing_on: true, final_briefing_telegram: false }))
       .status,
