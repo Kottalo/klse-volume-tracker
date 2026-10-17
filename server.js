@@ -2,9 +2,12 @@
 // Node.js + Express + 内置 node:sqlite + SSE 推送
 // 数据源: Yahoo Finance 免费盘中接口(无需 key)
 import express from 'express';
+import { chartModel } from './lib/stock-chart.js';
+import { chartPng } from './lib/chart-image.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import {
   marketDate,
@@ -21,14 +24,7 @@ import { validateSettings, parameterPatch, ValidationError } from './lib/setting
 import { protectApi } from './lib/security.js';
 import {
   BRIEFING_SLOTS,
-  HALF_HOUR_SLOTS,
-  dueBriefingSlots,
-  dueHalfHourSlots,
-  finalCandidates,
-  halfHourCandidates,
   conciseReason,
-  formatBriefing,
-  formatHalfHourBriefing,
   nextTradingDate,
   slotTimestamp,
   tradingDay,
@@ -45,7 +41,7 @@ const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 const DB_PATH = path.join(DATA_DIR, 'data.db');
 const DIST = path.join(__dirname, 'dist');
 const PORT = process.env.PORT || 8080;
-const VERSION = 'v2.5.1-unified-briefings';
+const VERSION = 'v2.6-potential-candles';
 let analysisCache = null;
 
 const DEFAULTS = {
@@ -76,9 +72,10 @@ const DEFAULTS = {
   llm_api_key: '', // DeepSeek API key(留空则只支持斜杠命令, 不支持自然语言)
   pick_count: 3, // 每日精选几只(宁少勿多, 别让用户被一堆票淹没)
   min_average_daily_value: 200000, // 最近20个完整交易日平均成交额估算下限(RM)
-  final_briefing_on: true,
-  half_hour_briefing_on: true,
+  final_briefing_on: false,
+  half_hour_briefing_on: false,
   final_briefing_telegram: true,
+  potential_alerts_telegram: true,
   win_pct: 8, // 观察名单里涨到这个幅度算「应证」
   loss_pct: 5, // 跌到这个幅度算「证伪」
   watch_days: 15, // 观察多少天后没动静就归档
@@ -162,7 +159,9 @@ function loadConfig() {
   if (process.env.OANOR_KLSE_API_KEY) cfg.oanor_api_key = process.env.OANOR_KLSE_API_KEY;
   if (process.env.LLM_API_KEY) cfg.llm_api_key = process.env.LLM_API_KEY;
   // Long legacy intervals can miss the entire early breakout window.
-  cfg.poll_interval_minutes = Math.min(5, Math.max(1, Number(cfg.poll_interval_minutes) || 5));
+  cfg.poll_interval_minutes = 5;
+  cfg.final_briefing_on = false;
+  cfg.half_hour_briefing_on = false;
   return cfg;
 }
 
@@ -304,6 +303,7 @@ for (const [table, column, type] of [
   ['closing_briefings', 'updates', "TEXT DEFAULT '{}'"],
   ['watchlist', 'resolved_pct', 'REAL'],
   ['notification_outbox', 'cancelled_at', 'INTEGER'],
+  ['notification_outbox', 'charts', 'TEXT'],
 ]) {
   if (
     !db
@@ -313,12 +313,13 @@ for (const [table, column, type] of [
   )
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
 }
-// Retain the audit trail, but do not send legacy immediate notices after upgrading.
+// Retain old records but cancel outstanding fixed-time/text-only broadcasts.
 db.prepare(
-  `UPDATE notification_outbox SET cancelled_at=?,last_error=?
-  WHERE sent_at IS NULL AND cancelled_at IS NULL
-  AND id NOT IN (SELECT outbox_id FROM closing_briefings WHERE outbox_id IS NOT NULL)`,
-).run(Math.floor(Date.now() / 1000), '即时通报已取消，改为半小时合并通报');
+  'UPDATE notification_outbox SET cancelled_at=?,last_error=? WHERE sent_at IS NULL AND cancelled_at IS NULL AND charts IS NULL',
+).run(Math.floor(Date.now() / 1000), '固定通报已取消，改为新潜力信号图文推送');
+db.exec(
+  'CREATE TABLE IF NOT EXISTS potential_pushes (key TEXT PRIMARY KEY, stock TEXT, date TEXT, kind TEXT, created_at REAL, outbox_id INTEGER)',
+);
 // Earlier versions counted polls as days. Recalculate surviving observations from stored trading dates.
 if (!db.prepare("SELECT 1 FROM kv WHERE k='observation_days_v2'").get()) {
   db.prepare(
@@ -1658,6 +1659,130 @@ function updateWatchlist(cfg) {
   return { picks, updates, tally };
 }
 
+function recordPotentialAlerts(cfg = loadConfig()) {
+  if (!isMarketOpen() || !cfg.screen_on) return null;
+  const overview = getAnalysisOverview(cfg),
+    now = Date.now() / 1000,
+    date = marketDate();
+  const scan = overview.coverage;
+  if (
+    !scan.scan_at ||
+    scan.scan_at > now ||
+    now - scan.scan_at > 180 ||
+    scan.expected !== scan.received
+  )
+    return null;
+  const picks = overview.candidates
+    .filter(
+      (r) =>
+        r.potential_eligible &&
+        !r.snapshot &&
+        !r.morning_snapshot &&
+        r.quote_date === date &&
+        r.fetched_at <= now &&
+        now - r.fetched_at <= 180,
+    )
+    .map((r) => ({
+      report: r,
+      key: `${r.code}|${r.potential_signal.date}|${r.potential_signal.kind}`,
+    }))
+    .filter((r) => !db.prepare('SELECT 1 FROM potential_pushes WHERE key=?').get(r.key))
+    .map((r) => ({ ...r, chart: getStockReport(r.report.code, cfg).chart }))
+    .filter((r) => r.chart.rows.length >= 20)
+    .slice(0, 3);
+  if (!picks.length) return null;
+  const charts = picks.map((r) => r.chart);
+  const text = [
+    '🔎 新潜力信号 · ' + date,
+    ...picks.map(
+      ({ report: r }) =>
+        `${r.code} · RM ${r.price} · ${(r.volume / 10000).toFixed(2)}万股 · 昨日${r.volume_signal.multiple.toFixed(2)}倍\n${conciseReason(r)}`,
+    ),
+    '实心箭头＝策略买点；空心箭头＝待突破。盘中未收盘，不保证上涨。',
+    process.env.PUBLIC_URL || 'https://synthe-fantasia.site/',
+  ].join('\n\n');
+  if (text.length > 1024) throw new Error('图文说明超过Telegram图片说明长度');
+  db.exec('SAVEPOINT potential_alert');
+  try {
+    const id = Number(
+      db
+        .prepare(
+          'INSERT INTO notification_outbox(ts,text,charts,cancelled_at,last_error) VALUES(?,?,?,?,?)',
+        )
+        .run(
+          Math.floor(now),
+          text,
+          JSON.stringify(charts),
+          cfg.potential_alerts_telegram === false ||
+            !(cfg.telegram_bot_token && cfg.telegram_chat_id)
+            ? Math.floor(now)
+            : null,
+          cfg.potential_alerts_telegram === false ||
+            !(cfg.telegram_bot_token && cfg.telegram_chat_id)
+            ? '仅网页'
+            : null,
+        ).lastInsertRowid,
+    );
+    for (const item of picks)
+      db.prepare(
+        'INSERT INTO potential_pushes(key,stock,date,kind,created_at,outbox_id) VALUES(?,?,?,?,?,?)',
+      ).run(item.key, item.report.code, date, item.report.potential_signal.kind, now, id);
+    db.exec('RELEASE potential_alert');
+    return { id, text, charts };
+  } catch (error) {
+    db.exec('ROLLBACK TO potential_alert');
+    db.exec('RELEASE potential_alert');
+    throw error;
+  }
+}
+
+function potentialAlertState() {
+  const row = db
+    .prepare(
+      'SELECT id,ts,text,sent_at,attempts,cancelled_at,last_error,charts FROM notification_outbox WHERE charts IS NOT NULL ORDER BY id DESC LIMIT 1',
+    )
+    .get();
+  return row
+    ? {
+        id: row.id,
+        at: row.ts,
+        text: row.text,
+        codes: JSON.parse(row.charts).map((r) => r.code),
+        image: `/api/potential-alerts/${row.id}/chart.png`,
+        delivery: row.sent_at
+          ? 'Telegram已发送'
+          : row.cancelled_at
+            ? row.last_error === '仅网页'
+              ? '仅网页'
+              : '信号过期，已停止发送'
+            : row.attempts
+              ? '发送重试中'
+              : '等待发送',
+      }
+    : null;
+}
+
+async function sendTelegramChart(caption, charts, cfg) {
+  if (!(cfg.telegram_bot_token && cfg.telegram_chat_id))
+    return { ok: false, error: 'Telegram 未配置' };
+  try {
+    const body = new FormData();
+    body.set('chat_id', cfg.telegram_chat_id.trim());
+    body.set('caption', caption);
+    body.set('photo', new Blob([chartPng(charts)], { type: 'image/png' }), 'potential-candles.png');
+    const response = await fetch(
+      `https://api.telegram.org/bot${cfg.telegram_bot_token.trim()}/sendPhoto`,
+      { method: 'POST', body, signal: AbortSignal.timeout(20000) },
+    );
+    const result = await response.json();
+    return response.ok && result.ok
+      ? { ok: true }
+      : { ok: false, error: 'Telegram图片发送失败，稍后重试' };
+  } catch {
+    return { ok: false, error: '图表生成或图片发送失败，稍后重试' };
+  }
+}
+
 let deliveryPromise = null;
 function deliverOutbox(cfg) {
   if (deliveryPromise) return deliveryPromise;
@@ -1669,7 +1794,28 @@ function deliverOutbox(cfg) {
       )
       .all();
     for (const item of pending) {
-      const result = await sendTelegramText(item.text, cfg);
+      if (item.charts && cfg.potential_alerts_telegram === false) {
+        db.prepare('UPDATE notification_outbox SET cancelled_at=?,last_error=? WHERE id=?').run(
+          Math.floor(Date.now() / 1000),
+          '仅网页',
+          item.id,
+        );
+        continue;
+      }
+      if (
+        item.charts &&
+        (Date.now() / 1000 - item.ts > 15 * 60 || marketDate(item.ts) !== marketDate())
+      ) {
+        db.prepare('UPDATE notification_outbox SET cancelled_at=?,last_error=? WHERE id=?').run(
+          Math.floor(Date.now() / 1000),
+          '信号已过期，停止发送旧报价',
+          item.id,
+        );
+        continue;
+      }
+      const result = item.charts
+        ? await sendTelegramChart(item.text, JSON.parse(item.charts), cfg)
+        : await sendTelegramText(item.text, cfg);
       db.prepare(
         'UPDATE notification_outbox SET attempts=attempts+1,sent_at=?,last_error=? WHERE id=?',
       ).run(result.ok ? Math.floor(Date.now() / 1000) : null, result.error || null, item.id);
@@ -1694,6 +1840,7 @@ function runBroadcast(cfg) {
       await evaluateGapUp(cfg, gapPool);
       await evaluateDoubleBottom(cfg);
       updateWatchlist(cfg);
+      recordPotentialAlerts(cfg);
       bcastQueue = [];
       db.exec('COMMIT');
     } catch (e) {
@@ -2214,7 +2361,9 @@ function maybeBackfill() {
 function startPolling() {
   if (pollTimer) return;
   pollTimer = setInterval(() => {
-    if (isMarketOpen()) maybePoll(); // 内部有节流, 数据陈旧才真抓
+    if (isMarketOpen()) maybePoll().catch((e) => log('市场扫描失败: ' + e.message));
+  }, 15000); // Five-minute throttle; avoid a full extra minute after a slow scan.
+  setInterval(() => {
     maybeBackfill(); // 收盘后回填昨日量
     deliverOutbox(loadConfig()).catch((e) => log('通知重试失败: ' + e.message));
   }, 60 * 1000);
@@ -2224,163 +2373,6 @@ function startPolling() {
     pollTelegram();
   }, 5000);
   pollTelegram();
-  setInterval(() => {
-    maybeFinalBriefings().catch((e) => log('定时通报失败: ' + e.message));
-  }, 15000);
-  maybeFinalBriefings().catch((e) => log('定时通报启动检查失败: ' + e.message));
-}
-
-function recordFinalBriefing(slot, cfg = loadConfig(), now = Date.now() / 1000) {
-  return recordScheduledBriefing(slot, cfg, now, true);
-}
-
-function recordHalfHourBriefing(slot, cfg = loadConfig(), now = Date.now() / 1000) {
-  return recordScheduledBriefing(slot, cfg, now, false);
-}
-
-function pendingBriefingUpdates(date, items) {
-  const saved = JSON.parse(kvGet('briefing_update_cursor', '{}'));
-  const cursor = saved.date === date ? saved : { date, alert_id: 0, observations: [] };
-  const reported = new Set(cursor.observations);
-  const observations = db
-    .prepare(
-      "SELECT stock,outcome,added_date,resolved_pct FROM watchlist WHERE resolved_date=? AND outcome<>'observing'",
-    )
-    .all(date)
-    .filter((r) => !reported.has(r.stock + '|' + r.added_date + '|' + r.outcome));
-  const alerts = db
-    .prepare('SELECT id,stock,kind,message FROM alerts WHERE ts>=? AND id>? ORDER BY id DESC')
-    .all(slotTimestamp(date, '00:00'), cursor.alert_id);
-  const selected = new Set(items.map((r) => r.code));
-  const extraAlerts = alerts.filter((r) => !selected.has(r.stock));
-  const labels = { win: '涨幅达标', loss: '跌幅触发', expired: '观察到期' };
-  return {
-    updates: {
-      observations: observations
-        .slice(0, 3)
-        .map((r) => ({ code: r.stock, label: labels[r.outcome], pct: r.resolved_pct })),
-      observation_count: observations.length,
-      alerts: extraAlerts
-        .slice(0, 3)
-        .map((r) => ({ code: r.stock, message: String(r.message || '').slice(0, 100) })),
-      alert_count: extraAlerts.length,
-    },
-    cursor: {
-      date,
-      alert_id: alerts[0]?.id || cursor.alert_id,
-      observations: [
-        ...reported,
-        ...observations.map((r) => r.stock + '|' + r.added_date + '|' + r.outcome),
-      ],
-    },
-  };
-}
-
-function recordScheduledBriefing(slot, cfg, now, closing) {
-  const date = marketDate(now);
-  const completed = db
-    .prepare('SELECT slot FROM closing_briefings WHERE date=?')
-    .all(date)
-    .map((r) => r.slot);
-  const due = closing ? dueBriefingSlots : dueHalfHourSlots;
-  if (!due(cfg, completed, now).includes(slot)) return null;
-  getAnalysisOverview(cfg);
-  const scan = analysisCache.data.coverage;
-  // A complete scan fetched after this slot is required, even for an empty bulletin.
-  if (
-    !scan.scan_at ||
-    scan.scan_at < slotTimestamp(date, slot) ||
-    scan.scan_at > now ||
-    now - scan.scan_at > 180 ||
-    scan.expected !== scan.received
-  )
-    return null;
-  const pick = closing ? finalCandidates : halfHourCandidates;
-  const items = pick(analysisCache.ranked, cfg, slot, now).map((r) => ({
-    code: r.code,
-    name: r.name,
-    price: r.price,
-    volume: r.volume,
-    previous_volume: r.volume_signal.previous,
-    previous_date: r.volume_signal.previous_date,
-    multiple: r.volume_signal.multiple,
-    stage: r.stage,
-    reason: conciseReason(r),
-    resistance: r.potential_signal.resistance,
-    support: r.potential_signal.support,
-    quote_at: r.fetched_at,
-  }));
-  const record = {
-    date,
-    slot,
-    created_at: now,
-    quote_at: scan.scan_at,
-    status: items.length ? 'ready' : 'empty',
-    items,
-    minimum_multiple: Math.max(closing ? 3 : 2, cfg.screen_vol_mult || 2),
-  };
-  const pending = pendingBriefingUpdates(date, items);
-  record.updates = pending.updates;
-  const format = closing ? formatBriefing : formatHalfHourBriefing;
-  const text = format(record, process.env.PUBLIC_URL || 'https://synthe-fantasia.site/');
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    let outboxId = null;
-    if (cfg.final_briefing_telegram !== false && cfg.telegram_bot_token && cfg.telegram_chat_id) {
-      outboxId = Number(
-        db
-          .prepare('INSERT INTO notification_outbox(ts,text) VALUES(?,?)')
-          .run(Math.floor(now), text).lastInsertRowid,
-      );
-    }
-    db.prepare(
-      'INSERT INTO closing_briefings(date,slot,created_at,quote_at,status,items,text,outbox_id,minimum_multiple,updates) VALUES(?,?,?,?,?,?,?,?,?,?)',
-    ).run(
-      date,
-      slot,
-      now,
-      scan.scan_at,
-      record.status,
-      JSON.stringify(items),
-      text,
-      outboxId,
-      record.minimum_multiple,
-      JSON.stringify(record.updates),
-    );
-    kvSet('briefing_update_cursor', JSON.stringify(pending.cursor));
-    db.exec('COMMIT');
-  } catch (e) {
-    db.exec('ROLLBACK');
-    throw e;
-  }
-  return record;
-}
-
-let finalBriefingPromise = null;
-function maybeFinalBriefings() {
-  if (finalBriefingPromise) return finalBriefingPromise;
-  finalBriefingPromise = (async () => {
-    const cfg = loadConfig(),
-      date = marketDate();
-    const done = db
-      .prepare('SELECT slot FROM closing_briefings WHERE date=?')
-      .all(date)
-      .map((r) => r.slot);
-    const slots = [...dueHalfHourSlots(cfg, done), ...dueBriefingSlots(cfg, done)];
-    if (!slots.length) return;
-    await poll(); // force a fresh whole-market scan at the slot, independent of normal polling.
-    let recorded = false;
-    const currentCfg = loadConfig();
-    for (const slot of slots) {
-      const record = BRIEFING_SLOTS.includes(slot) ? recordFinalBriefing : recordHalfHourBriefing;
-      if (record(slot, currentCfg)) recorded = true;
-    }
-    if (recorded) broadcast();
-    await deliverOutbox(currentCfg);
-  })().finally(() => {
-    finalBriefingPromise = null;
-  });
-  return finalBriefingPromise;
 }
 
 function closingBriefingState(cfg = loadConfig()) {
@@ -2471,45 +2463,6 @@ function closingBriefingState(cfg = loadConfig()) {
   };
 }
 
-function halfHourBriefingState(cfg = loadConfig()) {
-  const date = marketDate(),
-    now = Date.now() / 1000;
-  const row = db
-    .prepare(
-      `SELECT b.*,o.sent_at,o.attempts FROM closing_briefings b
-    LEFT JOIN notification_outbox o ON o.id=b.outbox_id
-    ORDER BY b.date DESC,b.slot DESC LIMIT 1`,
-    )
-    .get();
-  const latest = row
-    ? {
-        date: row.date,
-        slot: row.slot,
-        quote_at: row.quote_at,
-        status: row.status,
-        items: JSON.parse(row.items),
-        updates: JSON.parse(row.updates || '{}'),
-        minimum_multiple: row.minimum_multiple,
-        delivery: row.outbox_id
-          ? row.sent_at
-            ? 'Telegram已发送'
-            : row.attempts
-              ? '发送重试中'
-              : '等待发送'
-          : '仅网页',
-      }
-    : null;
-  const enabled = cfg.half_hour_briefing_on !== false;
-  const schedule = [
-    ...(enabled ? HALF_HOUR_SLOTS : []),
-    ...(cfg.final_briefing_on !== false ? BRIEFING_SLOTS : []),
-  ];
-  const next = tradingDay(date, cfg.market_holidays || [])
-    ? schedule.find((slot) => slotTimestamp(date, slot) > now) || null
-    : null;
-  return { date, enabled, next_slot: next, latest };
-}
-
 // ---------------- SSE ----------------
 const clients = new Set();
 
@@ -2560,6 +2513,7 @@ function getStockReport(query, cfg = loadConfig()) {
     numeric_code: live.numeric_code,
     history: rows.slice(-90),
   };
+  report.chart = chartModel(report, live);
   getAnalysisOverview(cfg);
   return {
     ...report,
@@ -2797,6 +2751,7 @@ function buildState() {
       final_briefing_on: cfg.final_briefing_on !== false,
       half_hour_briefing_on: cfg.half_hour_briefing_on !== false,
       final_briefing_telegram: cfg.final_briefing_telegram !== false,
+      potential_alerts_telegram: cfg.potential_alerts_telegram !== false,
       win_pct: cfg.win_pct ?? 8,
       loss_pct: cfg.loss_pct ?? 5,
       watch_days: cfg.watch_days ?? 15,
@@ -2812,7 +2767,8 @@ function buildState() {
     insights: getAnalysisOverview(cfg),
     observations: observationState(),
     closing_briefings: closingBriefingState(cfg),
-    half_hour_briefing: halfHourBriefingState(cfg),
+    half_hour_briefing: { enabled: false, next_slot: null, latest: null },
+    potential_alert: potentialAlertState(),
     alerts: db.prepare('SELECT * FROM alerts ORDER BY id DESC LIMIT 50').all(),
     admin_enabled: !!process.env.ADMIN_TOKEN,
     status: {
@@ -2892,6 +2848,25 @@ app.get('/api/signals', (req, res) => {
       : [],
     note: '历史规则命中不代表当时已实盘推荐；首次发现时间单独记录。',
   });
+});
+function serveChart(req, res, charts) {
+  const tag = '"' + createHash('sha256').update(JSON.stringify(charts)).digest('hex') + '"';
+  res.set({ ETag: tag, 'Cache-Control': 'public, max-age=60' });
+  if (req.headers['if-none-match'] === tag) return res.status(304).end();
+  res.type('png').send(Buffer.from(chartPng(charts)));
+}
+app.get('/api/stocks/:code/chart.png', (req, res) => {
+  const report = getStockReport(req.params.code);
+  if (!report) return res.status(404).json({ error: '没有这只股票' });
+  serveChart(req, res, [report.chart]);
+});
+app.get('/api/potential-alerts/:id/chart.png', (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) return res.status(404).end();
+  const row = db
+    .prepare('SELECT charts FROM notification_outbox WHERE id=? AND charts IS NOT NULL')
+    .get(req.params.id);
+  if (!row) return res.status(404).end();
+  serveChart(req, res, JSON.parse(row.charts));
 });
 app.get('/api/stocks/:code', (req, res) => {
   const report = getStockReport(req.params.code);
@@ -3418,13 +3393,12 @@ export {
   evaluateGapUp,
   evaluatePriceDrop,
   evaluateDoubleBottom,
-  recordFinalBriefing,
-  recordHalfHourBriefing,
-  maybeFinalBriefings,
   closingBriefingState,
-  halfHourBriefingState,
   deliverOutbox,
   runBroadcast,
+  recordPotentialAlerts,
+  sendTelegramChart,
+  maybePoll,
   findDoubleBottom,
   updateQuote,
   computeVolumes,

@@ -1103,9 +1103,49 @@ tr:hover td {
   padding: 19px 15px 10px;
   background: #0f1922;
 }
-.price-chart svg {
+.price-chart svg,
+.price-chart img,
+.potential-notice img {
   width: 100%;
   display: block;
+}
+.price-chart img,
+.potential-notice img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 12px;
+}
+.potential-notice {
+  margin-bottom: 24px;
+  padding: 18px 22px;
+}
+.potential-notice summary {
+  cursor: pointer;
+  font-size: 14px;
+  color: #b8d7ca;
+}
+.chart-action {
+  display: grid;
+  gap: 6px;
+  margin: 8px 0 16px;
+  color: #eebf68;
+  font-size: 15px;
+}
+.chart-action span {
+  font-size: 13px;
+  color: #eaa4ab;
+}
+.chart-action.up {
+  color: #52d8ad;
+}
+.potential-notice .tabs {
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+.price-chart .section-heading a {
+  color: #54d6ba;
+  font-size: 13px;
 }
 .price-chart h3 {
   font-size: 13px;

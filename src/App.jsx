@@ -1,7 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import './styles.css';
 import { reportSummary, signalReferences } from '../lib/analysis.js';
-import { briefingUpdateLines } from '../lib/briefings.js';
 
 const number = (v, d = 2) =>
   v == null || !Number.isFinite(v) ? '—' : v.toLocaleString('en-MY', { maximumFractionDigits: d });
@@ -127,8 +126,8 @@ export default function App() {
       if (!active) return;
       setState(next);
       setError('');
-      const latest = next.half_hour_briefing?.latest;
-      const key = latest ? `${latest.date} ${latest.slot}` : '';
+      const latest = next.potential_alert;
+      const key = latest?.id || 0;
       if (
         latest &&
         lastAlert.current != null &&
@@ -136,11 +135,7 @@ export default function App() {
         typeof Notification !== 'undefined' &&
         Notification.permission === 'granted'
       )
-        new Notification(`KLSE · ${latest.slot}精选通报`, {
-          body: latest.items.length
-            ? latest.items.map((r) => r.code).join('、')
-            : '本次没有符合完整条件的股票。',
-        });
+        new Notification('KLSE · 新潜力信号', { body: latest.codes.join('、') });
       lastAlert.current = key;
     };
     request('/api/state')
@@ -196,7 +191,7 @@ export default function App() {
     const permission = await Notification.requestPermission();
     setNotice(
       permission === 'granted'
-        ? '已开启半小时通报通知，保持页面打开即可接收。'
+        ? '已开启新潜力信号通知，保持页面打开即可接收。'
         : '未开启桌面通知，仍可在网页查看通报。',
     );
   };
@@ -225,7 +220,7 @@ export default function App() {
     method: '每个信号，都有它的边界。',
   };
   const subtitles = {
-    overview: '看成交量，看关键价位。16:00、16:30 再通报。',
+    overview: '每5分钟扫描，新潜力信号才推送。点开K线查看策略买点。',
     market: '搜索公司或代码，点开股票查看分析依据。',
     watch: '你的关注保存在当前浏览器；系统观察记录用于跟踪规则表现。',
     alerts: '异动是研究的起点。价格变化本身不等于买入理由。',
@@ -372,8 +367,7 @@ export default function App() {
                         note="保存在当前浏览器"
                       />
                     </section>
-                    <ClosingBriefings data={state.closing_briefings} open={setSelected} />
-                    <HalfHourBriefing data={state.half_hour_briefing} open={setSelected} />
+                    <PotentialNotice data={state.potential_alert} open={setSelected} />
                     <section className="opportunities">
                       <div className="section-heading">
                         <div>
@@ -738,162 +732,25 @@ function SignalLevels({ report }) {
   );
 }
 
-function ClosingBriefings({ data, open }) {
-  const [slot, setSlot] = useState(null);
-  if (!data) return null;
-  const latest = data.today.find((r) => r.slot === slot) || data.today[0] || data.latest;
+function PotentialNotice({ data, open }) {
+  if (!data) return <p className="data-note">仅推送新达标信号；未达标不发，同一信号不重复发。</p>;
   return (
-    <section className="panel closing-panel">
-      <div className="section-heading">
-        <div>
-          <h2>尾盘通报</h2>
-          <p>
-            量 &gt;100万股 · 昨日 ≥{latest?.minimum_multiple || data.minimum_multiple || 3}倍 ·
-            仍符合参与条件
-          </p>
-        </div>
-        <div className="briefing-times">
-          {data.slots.map((t) => (
-            <button
-              key={t}
-              className={latest?.date === data.date && latest.slot === t ? 'selected' : ''}
-              disabled={!data.today.some((r) => r.slot === t)}
-              onClick={() => setSlot(t)}
-            >
-              {t}
-              <small>{data.windows?.[t] || '等待通报'}</small>
-            </button>
-          ))}
-        </div>
-      </div>
-      {latest ? (
-        <>
-          <p className="briefing-caption">
-            {latest.date} {latest.slot} MYT · 行情抓取 {time(latest.quote_at)}
-          </p>
-          <BriefingItems record={latest} open={open} />
-        </>
-      ) : (
-        <p className="muted">
-          {data.enabled
-            ? '交易日16:00、16:30生成精选；行情未准备好时延迟通报。'
-            : '定时通报已暂停。'}
-        </p>
-      )}
-      <p className="briefing-note">
-        {data.telegram ? 'Telegram＋网页通报' : '网页通报'} · 次日表现继续追踪，信号不保证上涨。
-      </p>
-      {data.follow.length > 0 && (
-        <details className="next-day-follow">
-          <summary>查看次日表现</summary>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>股票 / 通报</th>
-                  <th>通报参考价</th>
-                  <th>次日价</th>
-                  <th>变化</th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.follow.map((item) => (
-                  <tr key={item.date + item.code}>
-                    <td>
-                      <button className="stock-link" onClick={() => open(item.code)}>
-                        {item.code}
-                      </button>
-                      <small>
-                        {item.date} {item.slot}
-                      </small>
-                    </td>
-                    <td>{price(item.reference_price)}</td>
-                    <td>
-                      {price(item.price)}
-                      <small>
-                        {item.next_date} · {item.status}
-                      </small>
-                    </td>
-                    <td className={item.change_pct >= 0 ? 'up' : 'down'}>
-                      {percent(item.change_pct)}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <p className="data-note">通报价格观察，不代表实际成交或收益。</p>
-        </details>
-      )}
-    </section>
-  );
-}
-
-function HalfHourBriefing({ data, open }) {
-  if (!data) return null;
-  const latest = data.latest;
-  return (
-    <details className="panel half-hour-panel">
+    <details className="panel potential-notice">
       <summary>
-        半小时通报 ·{' '}
-        {latest
-          ? `${latest.date} ${latest.slot} · ${latest.delivery}`
-          : data.enabled
-            ? data.next_slot
-              ? `下一次 ${data.next_slot} MYT`
-              : '等待交易时段'
-            : '已暂停'}
+        最近潜力信号 · {time(data.at)} · {data.delivery}
       </summary>
-      <p className="briefing-note">
-        交易时段每30分钟一条，精选、异动和追踪结果合并；16:00、16:30为三倍量尾盘精选。
-      </p>
-      {latest && (
-        <>
-          <p className="briefing-caption">
-            {latest.date} {latest.slot} MYT · 行情抓取 {time(latest.quote_at)} · 本次通报快照
-          </p>
-          <BriefingItems record={latest} open={open} />
-        </>
-      )}
-    </details>
-  );
-}
-
-function BriefingItems({ record, open }) {
-  return (
-    <>
-      {record.items.length ? (
-        <div className="closing-picks">
-          {record.items.map((item) => (
-            <article key={item.code}>
-              <div>
-                <strong>{item.code}</strong>
-                <span>{price(item.price)}</span>
-              </div>
-              <p>
-                <b>{volume(item.volume)}</b> · 昨日 <b>{number(item.multiple)}倍</b>
-              </p>
-              <p>{item.reason}</p>
-              <p>
-                关注 {price(item.resistance)} · 失效 {price(item.support)}
-              </p>
-              <button className="text-button" onClick={() => open(item.code)}>
-                查看详情 <Icon name="arrow" size={14} />
-              </button>
-            </article>
-          ))}
-        </div>
-      ) : (
-        <p className="muted">本次没有符合完整条件的股票，不凑数。</p>
-      )}
-      {briefingUpdateLines(record.updates)
-        .filter(Boolean)
-        .map((line, index) => (
-          <p className="briefing-note" key={index}>
-            {line}
-          </p>
+      <p className="data-note">这是当时的推送快照；最新判断请点股票查看。</p>
+      <a href={data.image} target="_blank" rel="noreferrer" aria-label="放大推送K线图">
+        <img src={data.image} alt={data.codes.join('、') + '的推送蜡烛K线与策略买点'} />
+      </a>
+      <div className="tabs">
+        {data.codes.map((code) => (
+          <button key={code} onClick={() => open(code)}>
+            {code} · 最新K线
+          </button>
         ))}
-    </>
+      </div>
+    </details>
   );
 }
 function Opportunity({ report: r, favorite, toggle, open }) {
@@ -929,7 +786,7 @@ function Opportunity({ report: r, favorite, toggle, open }) {
           {r.quote_date || '资料待补齐'}
         </span>
         <button className="text-button" onClick={open}>
-          完整分析 <Icon name="arrow" size={16} />
+          买点K线 <Icon name="arrow" size={16} />
         </button>
       </div>
     </article>
@@ -1475,6 +1332,7 @@ function StockDetail({ code, close, favorite, toggle }) {
               {favorite ? '已关注' : '加入关注'}
             </button>
           </div>
+          <PriceChart report={r} />
           <VolumePanel report={r} />
           {r.selection && (
             <section className="selection-panel">
@@ -1490,7 +1348,7 @@ function StockDetail({ code, close, favorite, toggle }) {
             <h3>{reportSummary(r)}</h3>
             <SignalLevels report={r} />
           </div>
-          <PriceChart history={r.history} levels={r.levels} />
+
           <details className="detail-expanded">
             <summary>查看完整分析、历史信号与风险</summary>
             <p className="conclusion">{r.conclusion}</p>
@@ -1610,92 +1468,29 @@ function StockDetail({ code, close, favorite, toggle }) {
     </Modal>
   );
 }
-function PriceChart({ history, levels }) {
-  if (history.length < 2)
-    return <div className="chart-empty">历史资料不足，暂时无法绘制价格走势。</div>;
-  const rows = history.slice(-60),
-    w = 720,
-    h = 220,
-    p = 24,
-    values = rows.map((r) => r.close),
-    max = Math.max(...values, levels?.neck || 0) * 1.03,
-    min = Math.min(...values) * 0.97;
-  const x = (i) => p + (i * (w - p * 2)) / (rows.length - 1),
-    y = (v) => p + ((max - v) / (max - min)) * (h - p * 2),
-    points = rows.map((r, i) => `${x(i)},${y(r.close)}`).join(' '),
-    maxVol = Math.max(1, ...rows.map((r) => r.volume || 0));
+function PriceChart({ report }) {
+  const source =
+    '/api/stocks/' + encodeURIComponent(report.code) + '/chart.png?v=' + report.fetched_at;
   return (
     <section className="price-chart">
       <div className="section-heading">
-        <h3>近{rows.length}个交易日走势</h3>
-        <span className="muted">日线收盘价 · RM</span>
+        <h3>蜡烛K线 · 策略买点</h3>
+        <a href={source} target="_blank" rel="noreferrer">
+          放大K线 ↗
+        </a>
       </div>
-      <svg
-        viewBox={`0 0 ${w} ${h + 70}`}
-        role="img"
-        aria-label={`${rows[0].date}至${rows.at(-1).date}的日线收盘价和成交量`}
-      >
-        <defs>
-          <linearGradient id="chart-fill" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#54d6ba" stopOpacity=".22" />
-            <stop offset="100%" stopColor="#54d6ba" stopOpacity="0" />
-          </linearGradient>
-        </defs>
-        {[0, 1, 2].map((i) => {
-          const v = min + ((max - min) * i) / 2;
-          return (
-            <g key={i}>
-              <line x1={p} y1={y(v)} x2={w - p} y2={y(v)} stroke="#27313d" strokeDasharray="3 5" />
-              <text x={p} y={y(v) - 7} fill="#7b8b9b" fontSize="10">
-                {number(v, 3)}
-              </text>
-            </g>
-          );
-        })}
-        <polygon points={`${p},${h - p} ${points} ${w - p},${h - p}`} fill="url(#chart-fill)" />
-        <polyline
-          points={points}
-          fill="none"
-          stroke="#54d6ba"
-          strokeWidth="2.5"
-          strokeLinejoin="round"
-        />
-        {levels?.neck && levels.neck >= min && levels.neck <= max && (
-          <g>
-            <line
-              x1={p}
-              x2={w - p}
-              y1={y(levels.neck)}
-              y2={y(levels.neck)}
-              stroke="#f5bb67"
-              strokeDasharray="6 4"
-            />
-            <text x={w - p} y={y(levels.neck) - 7} textAnchor="end" fill="#f5bb67" fontSize="11">
-              突破位 {number(levels.neck, 3)}
-            </text>
-          </g>
-        )}
-        {rows.map((r, i) => (
-          <rect
-            key={r.date}
-            x={x(i) - 2}
-            y={h + 40 - ((r.volume || 0) / maxVol) * 35}
-            width="4"
-            height={((r.volume || 0) / maxVol) * 35}
-            fill="#3e766e"
-          >
-            <title>
-              {r.date} · 收盘 RM {r.close} · 成交量 {volume(r.volume)}
-            </title>
-          </rect>
-        ))}
-        <text x={p} y={h + 62} fill="#7b8b9b" fontSize="11">
-          {rows[0].date}
-        </text>
-        <text x={w - p} y={h + 62} textAnchor="end" fill="#7b8b9b" fontSize="11">
-          {rows.at(-1).date}
-        </text>
-      </svg>
+      <p className={`chart-action ${report.chart?.confirmed ? 'up' : ''}`}>
+        <strong>
+          {report.chart?.marker
+            ? `${report.chart.marker} ${price(report.chart.marker_price)}`
+            : '暂无当前策略买点'}
+        </strong>
+        {report.chart?.support > 0 && <span>跌破 {price(report.chart.support)} 则失效</span>}
+      </p>
+      <a href={source} target="_blank" rel="noreferrer" aria-label="点击放大蜡烛K线">
+        <img src={source} alt={report.code + '日K线、成交量、策略买点、突破位和止损参考位'} />
+      </a>
+      <p className="data-note">实心箭头＝策略买点；空心箭头＝等待突破。图中盘中蜡烛尚未收盘。</p>
     </section>
   );
 }
@@ -1791,7 +1586,7 @@ function AdminSettings({ state, close, updated }) {
     ['pick_count', '最多精选几只', 1, 5],
     ['min_average_daily_value', '20日平均成交额下限（RM，估算）', 0, 1000000000],
     ['screen_min_volume', '精选成交量下限（股，至少100万）', 1000000, 1000000000000],
-    ['poll_interval_minutes', '更新间隔（分钟）', 1, 5],
+
     ['screen_min_gain', '20日涨幅下限（%）', -100, 1000],
     ['screen_max_gain', '20日涨幅上限（%）', -100, 1000],
     ['screen_vol_mult', '本次 / 上一交易日全天量（至少2倍）', 2, 100],
@@ -1820,9 +1615,7 @@ function AdminSettings({ state, close, updated }) {
     const patch = Object.fromEntries(fields.map(([key]) => [key, Number(draft[key])]));
     patch.window = draft.window;
     patch.screen_on = draft.screen_on;
-    patch.final_briefing_on = draft.final_briefing_on !== false;
-    patch.half_hour_briefing_on = draft.half_hour_briefing_on !== false;
-    patch.final_briefing_telegram = draft.final_briefing_telegram !== false;
+    patch.potential_alerts_telegram = draft.potential_alerts_telegram !== false;
     mutate('/api/settings', patch);
   };
   return (
@@ -1882,27 +1675,12 @@ function AdminSettings({ state, close, updated }) {
           <label className="checkbox-label">
             <input
               type="checkbox"
-              checked={draft.half_hour_briefing_on !== false}
-              onChange={(e) => setDraft({ ...draft, half_hour_briefing_on: e.target.checked })}
+              checked={draft.potential_alerts_telegram !== false}
+              onChange={(e) => setDraft({ ...draft, potential_alerts_telegram: e.target.checked })}
             />
-            交易时段每半小时通报
+            新潜力信号发送图文到Telegram
           </label>
-          <label className="checkbox-label">
-            <input
-              type="checkbox"
-              checked={draft.final_briefing_on !== false}
-              onChange={(e) => setDraft({ ...draft, final_briefing_on: e.target.checked })}
-            />
-            16:00、16:30尾盘通报
-          </label>
-          <label className="checkbox-label">
-            <input
-              type="checkbox"
-              checked={draft.final_briefing_telegram !== false}
-              onChange={(e) => setDraft({ ...draft, final_briefing_telegram: e.target.checked })}
-            />
-            定时通报发送到Telegram
-          </label>
+          <p className="data-note">固定每5分钟扫描；已取消半小时及尾盘定时推送。</p>
         </div>
         <p className="data-note">
           分钟和小时对比只在同一连续交易时段内资料充足时计算；午休与跨日不会拼接成有效窗口。

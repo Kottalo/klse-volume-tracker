@@ -65,6 +65,7 @@ function reset() {
     'kv',
     'potential_events',
     'closing_briefings',
+    'potential_pushes',
   ])
     db.prepare(`DELETE FROM ${table}`).run();
   saveConfig({ ...DEFAULTS, watchlist: [] });
@@ -229,6 +230,8 @@ function seedTrendMarket(count = 5) {
     dates.forEach((date, index) =>
       insert.run(code, date, index === 19 ? 1500000 : 500000, 11, 11.1, 10.9),
     );
+    db.prepare('UPDATE daily_vol SET open=close WHERE stock=?').run(code);
+    db.prepare('UPDATE live SET high=11.1,low=10.9 WHERE stock=?').run(code);
   }
 }
 
@@ -368,98 +371,6 @@ test('market pagination scans beyond the old fixed cap and sorts by a stable sym
     assert.equal(quotes.length, 5501);
     assert.equal(ranges.at(-1), 5500);
   } finally {
-    globalThis.fetch = realFetch;
-  }
-});
-
-test('scans stay silent, one scheduled message retries without a second copy', async () => {
-  reset();
-  seedTrendMarket(1);
-  const cfg = { ...DEFAULTS, telegram_bot_token: 'FAKE_TEST_TOKEN', telegram_chat_id: 'TEST_CHAT' };
-  saveConfig(cfg);
-  let sends = 0;
-  globalThis.fetch = async (url) => {
-    if (String(url).includes('/sendMessage')) sends++;
-    return Response.json({ ok: false, description: 'temporary failure' });
-  };
-  try {
-    await server.runBroadcast(cfg);
-    assert.equal(sends, 0);
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 0);
-    briefingClock('10:30:20', 1);
-    saveConfig(cfg);
-    server.recordHalfHourBriefing('10:30', cfg);
-    await deliverOutbox(cfg);
-    assert.equal(sends, 1);
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 1);
-    assert.equal(db.prepare('SELECT sent_at FROM notification_outbox').get().sent_at, null);
-    globalThis.fetch = async () => Response.json({ ok: true, result: {} });
-    await server.runBroadcast(cfg);
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 1);
-    assert.ok(db.prepare('SELECT sent_at FROM notification_outbox').get().sent_at);
-    assert.equal(server.recordHalfHourBriefing('10:30', cfg), null);
-  } finally {
-    Date.now = () => fixed;
-    globalThis.fetch = realFetch;
-  }
-});
-
-test('one scheduled message combines picks, saved outcomes and alerts without repeating updates', async () => {
-  reset();
-  seedTrendMarket(2);
-  const cfg = { ...DEFAULTS, telegram_bot_token: 'FAKE_TEST_TOKEN', telegram_chat_id: 'TEST_CHAT' };
-  const messages = [];
-  globalThis.fetch = async (url, options) => {
-    if (String(url).includes('/sendMessage')) messages.push(JSON.parse(options.body).text);
-    return Response.json({ ok: true, result: {} });
-  };
-  try {
-    briefingClock('10:05:20', 2);
-    saveConfig(cfg);
-    await server.runBroadcast(cfg);
-    db.prepare("UPDATE watchlist SET entry_price=10 WHERE stock='STRONG0'").run();
-    briefingClock('10:10:20', 2);
-    saveConfig(cfg);
-    await server.runBroadcast(cfg);
-    const resolved = db
-      .prepare("SELECT resolved_pct FROM watchlist WHERE stock='STRONG0'")
-      .get().resolved_pct;
-    assert.ok(resolved >= 8);
-    db.prepare('INSERT INTO alerts(ts,stock,name,kind,message) VALUES(?,?,?,?,?)').run(
-      Date.now() / 1000,
-      'OTHER',
-      'Other',
-      'volume',
-      '时段成交量为上一时段3倍。',
-    );
-    assert.equal(messages.length, 0);
-    briefingClock('10:30:20', 2);
-    saveConfig(cfg);
-    const first = server.recordHalfHourBriefing('10:30', cfg);
-    await deliverOutbox(cfg);
-    assert.equal(messages.length, 1);
-    assert.match(messages[0], /半小时精选/);
-    assert.match(messages[0], /STRONG0.*RM/);
-    assert.match(messages[0], /追踪结果\nSTRONG0 · 涨幅达标/);
-    assert.match(messages[0], /本时段异动\nOTHER/);
-    assert.deepEqual(server.halfHourBriefingState(cfg).latest.updates, first.updates);
-    // Later prices do not rewrite the outcome captured when it resolved.
-    db.prepare("UPDATE live SET price=10.5 WHERE stock='STRONG0'").run();
-    await server.runBroadcast(cfg);
-    assert.equal(messages.length, 1);
-    assert.equal(
-      db.prepare("SELECT resolved_pct FROM watchlist WHERE stock='STRONG0'").get().resolved_pct,
-      resolved,
-    );
-    briefingClock('11:00:20', 2);
-    saveConfig(cfg);
-    const second = server.recordHalfHourBriefing('11:00', cfg);
-    await deliverOutbox(cfg);
-    assert.equal(messages.length, 2);
-    assert.deepEqual(second.updates.observations, []);
-    assert.deepEqual(second.updates.alerts, []);
-  } finally {
-    Date.now = () => fixed;
     globalThis.fetch = realFetch;
   }
 });
@@ -783,188 +694,6 @@ function briefingClock(time, count = 1) {
   return current / 1000;
 }
 
-test('unchanged half-hour picks each produce one durable notification and a matching public snapshot', async () => {
-  reset();
-  seedTrendMarket(2);
-  const cfg = { ...DEFAULTS, telegram_bot_token: 'FAKE_TEST_TOKEN', telegram_chat_id: 'TEST_CHAT' };
-  try {
-    briefingClock('10:00:20', 2);
-    saveConfig(cfg);
-    await server.runBroadcast(cfg); // scans never enqueue an immediate shortlist.
-    const first = server.recordHalfHourBriefing('10:00', cfg);
-    assert.equal(first.items.length, 2);
-    assert.equal(server.recordHalfHourBriefing('10:00', cfg), null);
-    briefingClock('10:30:20', 2);
-    saveConfig(cfg);
-    const second = server.recordHalfHourBriefing('10:30', cfg);
-    assert.deepEqual(
-      second.items,
-      first.items.map((r) => ({ ...r, quote_at: Date.now() / 1000 })),
-    );
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 2);
-    let state = await (await realFetch(base + '/api/state')).json();
-    assert.equal(state.closing_briefings.latest, null);
-    assert.deepEqual(state.half_hour_briefing.latest.items, second.items);
-    assert.equal(state.half_hour_briefing.latest.delivery, '等待发送');
-    assert.equal(JSON.stringify(state).includes('FAKE_TEST_TOKEN'), false);
-    const text = db
-      .prepare('SELECT text FROM notification_outbox ORDER BY id DESC LIMIT 1')
-      .get().text;
-    for (const item of second.items) {
-      assert.ok(text.includes(item.code));
-      assert.ok(text.includes(item.reason));
-      assert.ok(text.includes('RM ' + item.price));
-    }
-    globalThis.fetch = async () => Response.json({ ok: false, description: 'temporary' });
-    await deliverOutbox(cfg);
-    assert.equal(server.halfHourBriefingState(cfg).latest.delivery, '等待发送'); // first queued notice failed before second was attempted.
-    globalThis.fetch = async () => Response.json({ ok: true, result: {} });
-    await deliverOutbox(cfg);
-    assert.equal(server.halfHourBriefingState(cfg).latest.delivery, 'Telegram已发送');
-    assert.equal(server.recordHalfHourBriefing('10:30', cfg), null);
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 2);
-  } finally {
-    Date.now = () => fixed;
-    globalThis.fetch = realFetch;
-  }
-});
-
-test('a complete empty half-hour scan is still notified, while disabled or stale slots do not invent a result', () => {
-  reset();
-  seedTrendMarket(1);
-  const cfg = { ...DEFAULTS, telegram_bot_token: 'FAKE_TEST_TOKEN', telegram_chat_id: 'TEST_CHAT' };
-  try {
-    briefingClock('12:30:20');
-    saveConfig(cfg);
-    assert.equal(
-      server.recordHalfHourBriefing('12:30', { ...cfg, half_hour_briefing_on: false }),
-      null,
-    );
-    db.prepare('UPDATE live SET volume=500000').run();
-    saveConfig(cfg);
-    const r = server.recordHalfHourBriefing('12:30', cfg);
-    assert.equal(r.status, 'empty');
-    assert.match(db.prepare('SELECT text FROM notification_outbox').get().text, /没有符合完整条件/);
-    assert.equal(server.closingBriefingState(cfg).today.length, 0);
-    briefingClock('14:30:20');
-    db.prepare('UPDATE kv SET v=? WHERE k=?').run(
-      JSON.stringify({ expected: 1, received: 1, at: Date.now() / 1000 - 21 }),
-      'market_scan_coverage',
-    );
-    saveConfig(cfg);
-    assert.equal(server.recordHalfHourBriefing('14:30', cfg), null);
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 1);
-    briefingClock('14:31:00');
-    saveConfig(cfg);
-    assert.ok(server.recordHalfHourBriefing('14:30', cfg));
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 2);
-  } finally {
-    Date.now = () => fixed;
-  }
-});
-
-test('two closing slots use the full pool, freeze snapshot prices and atomically deduplicate the website and notification queue', async () => {
-  reset();
-  seedTrendMarket(5);
-  const cfg = { ...DEFAULTS, telegram_bot_token: 'FAKE_TEST_TOKEN', telegram_chat_id: 'TEST_CHAT' };
-  for (let i = 1; i < 5; i++) {
-    db.prepare('UPDATE live SET volume=2000000 WHERE stock=?').run('STRONG' + i);
-    db.prepare('UPDATE daily_vol SET volume=900000 WHERE stock=? AND date=?').run(
-      'STRONG' + i,
-      '2026-10-02',
-    );
-  }
-  db.prepare('UPDATE live SET volume=1500000 WHERE stock=?').run('STRONG0');
-  try {
-    briefingClock('16:00:30', 5);
-    saveConfig(cfg);
-    const state = server.buildState();
-    assert.ok(!state.insights.candidates.some((r) => r.code === 'STRONG0'));
-    const first = server.recordFinalBriefing('16:00', cfg);
-    assert.deepEqual(
-      first.items.map((r) => r.code),
-      ['STRONG0'],
-    );
-    assert.equal(server.recordFinalBriefing('16:00', cfg), null);
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM closing_briefings').get().c, 1);
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 1);
-    briefingClock('16:30:30', 5);
-    db.prepare('UPDATE live SET price=11.04,volume=1600000 WHERE stock=?').run('STRONG0');
-    saveConfig(cfg);
-    assert.equal(server.recordFinalBriefing('16:30', cfg).items[0].price, 11.04);
-    const snapshot = JSON.parse(
-      db.prepare('SELECT items FROM closing_briefings WHERE slot=?').get('16:00').items,
-    );
-    assert.equal(snapshot[0].price, 11.02);
-    assert.equal(snapshot[0].volume, 1500000);
-    assert.equal(
-      server.closingBriefingState({ ...cfg, screen_vol_mult: 4 }).latest.minimum_multiple,
-      3,
-    );
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 2);
-    globalThis.fetch = async () => Response.json({ ok: false, description: 'temporary failure' });
-    await deliverOutbox(cfg);
-    assert.equal(
-      db.prepare('SELECT COUNT(*) c FROM notification_outbox WHERE sent_at IS NULL').get().c,
-      2,
-    );
-    assert.equal(server.recordFinalBriefing('16:30', cfg), null);
-    globalThis.fetch = async () => Response.json({ ok: true, result: {} });
-    await deliverOutbox(cfg);
-    assert.equal(
-      db.prepare('SELECT COUNT(*) c FROM notification_outbox WHERE sent_at IS NULL').get().c,
-      0,
-    );
-  } finally {
-    Date.now = () => fixed;
-    globalThis.fetch = realFetch;
-  }
-});
-
-test('late-day scans cannot substitute stale data; a completed empty scan is reported honestly', () => {
-  reset();
-  seedTrendMarket(1);
-  try {
-    const now = briefingClock('16:00:20');
-    db.prepare('UPDATE kv SET v=? WHERE k=?').run(
-      JSON.stringify({ expected: 1, received: 1, valid: 1, at: now - 21 }),
-      'market_scan_coverage',
-    );
-    saveConfig(DEFAULTS);
-    assert.equal(server.recordFinalBriefing('16:00'), null);
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM closing_briefings').get().c, 0);
-    briefingClock('16:00:40');
-    saveConfig(DEFAULTS);
-    const r = server.recordFinalBriefing('16:00');
-    assert.equal(r.status, 'empty');
-    assert.deepEqual(r.items, []);
-    assert.match(db.prepare('SELECT text FROM closing_briefings').get().text, /没有符合完整条件/);
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 0);
-  } finally {
-    Date.now = () => fixed;
-  }
-});
-
-test('a failing transaction leaves neither a published closing bulletin nor a notification', () => {
-  reset();
-  seedTrendMarket(2);
-  const cfg = { ...DEFAULTS, telegram_bot_token: 'FAKE_TEST_TOKEN', telegram_chat_id: 'TEST_CHAT' };
-  try {
-    briefingClock('16:00:20', 2);
-    saveConfig(cfg);
-    db.exec(
-      "CREATE TRIGGER fail_briefing BEFORE INSERT ON closing_briefings BEGIN SELECT RAISE(ABORT,'simulated'); END;",
-    );
-    assert.throws(() => server.recordFinalBriefing('16:00', cfg), /simulated/);
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM closing_briefings').get().c, 0);
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 0);
-    assert.equal(db.prepare("SELECT v FROM kv WHERE k='briefing_update_cursor'").get(), undefined);
-  } finally {
-    db.exec('DROP TRIGGER IF EXISTS fail_briefing');
-    Date.now = () => fixed;
-  }
-});
-
 test('next-day tracking waits for the next trading date, distinguishes intraday and close, and shows losses', () => {
   reset();
   quote('FOLLOW', 0.97, 2000000);
@@ -1011,107 +740,227 @@ test('next-day tracking waits for the next trading date, distinguishes intraday 
   }
 });
 
-test('closing slots use the single scheduled channel and can use website-only notices', async () => {
+function seedPotentialScan(time = '10:05:20', count = 2) {
   reset();
-  seedTrendMarket(2);
-  await server.runBroadcast(DEFAULTS);
-  assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 0);
-  assert.equal(
-    (await post('/api/settings', { final_briefing_on: true, final_briefing_telegram: false }))
-      .status,
-    200,
-  );
-  assert.equal(server.loadConfig().final_briefing_telegram, false);
-  assert.equal((await post('/api/settings', { final_briefing_telegram: 'false' })).status, 400);
+  seedTrendMarket(count);
+  briefingClock(time, count);
+  const cfg = { ...DEFAULTS, telegram_bot_token: 'FAKE_TEST_TOKEN', telegram_chat_id: 'TEST_CHAT' };
+  saveConfig(cfg);
+  return cfg;
+}
+
+test('new potential signals send one photo with a short caption, freeze its chart and persist deduplication', async () => {
+  const cfg = seedPotentialScan();
+  const photos = [];
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes('/sendPhoto')) {
+      assert.ok(options.body instanceof FormData);
+      photos.push({
+        caption: options.body.get('caption'),
+        bytes: Buffer.from(await options.body.get('photo').arrayBuffer()),
+      });
+    } else assert.ok(!String(url).includes('/sendMessage'));
+    return Response.json({ ok: true, result: {} });
+  };
   try {
-    briefingClock('16:00:30', 2);
-    const cfg = {
-      ...DEFAULTS,
-      final_briefing_telegram: false,
-      telegram_bot_token: 'FAKE_TEST_TOKEN',
-      telegram_chat_id: 'TEST_CHAT',
-    };
+    await server.runBroadcast(cfg);
+    assert.equal(photos.length, 1);
+    assert.ok(photos[0].caption.length <= 1024);
+    assert.match(photos[0].caption, /新潜力信号/);
+    const state = server.buildState();
+    assert.equal(state.potential_alert.codes.length, 2);
+    assert.equal(state.potential_alert.delivery, 'Telegram已发送');
+    const image = await realFetch(base + state.potential_alert.image);
+    assert.ok(image.headers.get('content-type').startsWith('image/png'));
+    assert.deepEqual(Buffer.from(await image.arrayBuffer()), photos[0].bytes);
+    const etag = image.headers.get('etag');
+    assert.equal(
+      (await realFetch(base + state.potential_alert.image, { headers: { 'If-None-Match': etag } }))
+        .status,
+      304,
+    );
+    briefingClock('10:10:20', 2);
     saveConfig(cfg);
-    assert.ok(server.recordFinalBriefing('16:00', cfg));
+    await server.runBroadcast(cfg);
+    assert.equal(photos.length, 1);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM potential_pushes').get().c, 2);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 1);
+    db.prepare('UPDATE live SET price=20').run();
+    saveConfig(cfg);
+    const frozen = await realFetch(base + state.potential_alert.image);
+    assert.deepEqual(Buffer.from(await frozen.arrayBuffer()), photos[0].bytes);
+    assert.equal((await realFetch(base + '/api/potential-alerts/no/chart.png')).status, 401);
+    assert.equal((await realFetch(base + '/api/stocks/UNKNOWN/chart.png')).status, 404);
+  } finally {
+    Date.now = () => fixed;
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('failed photo retries the same frozen signal; expired photos are cancelled without a text fallback', async () => {
+  const cfg = seedPotentialScan();
+  let attempts = 0;
+  globalThis.fetch = async (url) => {
+    assert.ok(String(url).endsWith('/sendPhoto'));
+    attempts++;
+    return Response.json({ ok: false });
+  };
+  try {
+    const first = server.recordPotentialAlerts(cfg);
+    assert.ok(first);
+    await deliverOutbox(cfg);
+    assert.equal(attempts, 1);
+    assert.equal(server.buildState().potential_alert.delivery, '发送重试中');
+    assert.equal(server.recordPotentialAlerts(cfg), null);
+    globalThis.fetch = async (url) => {
+      assert.ok(String(url).endsWith('/sendPhoto'));
+      attempts++;
+      return Response.json({ ok: true });
+    };
+    await deliverOutbox(cfg);
+    assert.equal(attempts, 2);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 1);
+    db.prepare('UPDATE notification_outbox SET sent_at=NULL').run();
+    Date.now = () => Date.parse('2026-10-05T10:25:21+08:00');
+    await deliverOutbox(cfg);
+    assert.equal(attempts, 2);
+    assert.equal(server.buildState().status.pending_notifications, 0);
+  } finally {
+    Date.now = () => fixed;
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('only fresh, complete, eligible market scans can enqueue a potential alert', () => {
+  const cfg = seedPotentialScan();
+  try {
+    db.prepare('UPDATE live SET volume=500000').run();
+    saveConfig(cfg);
+    assert.equal(server.recordPotentialAlerts(cfg), null);
+    db.prepare('UPDATE live SET volume=2000000, price=13').run();
+    saveConfig(cfg);
+    assert.equal(server.recordPotentialAlerts(cfg), null); // already extended
+    db.prepare('UPDATE live SET price=11.02,mtime=?').run(Date.now() / 1000 - 181);
+    saveConfig(cfg);
+    assert.equal(server.recordPotentialAlerts(cfg), null);
+    briefingClock('10:05:20', 3);
+    saveConfig(cfg); // incomplete scan, two actual quotes
+    db.prepare('UPDATE kv SET v=? WHERE k=?').run(
+      JSON.stringify({ expected: 3, received: 2, at: Date.now() / 1000 }),
+      'market_scan_coverage',
+    );
+    saveConfig(cfg);
+    assert.equal(server.recordPotentialAlerts(cfg), null);
+    briefingClock('10:05:20', 2);
+    saveConfig(cfg);
+    assert.equal(server.recordPotentialAlerts({ ...cfg, screen_on: false }), null);
+    Date.now = () => Date.parse('2026-10-05T13:00:00+08:00');
+    saveConfig(cfg);
+    assert.equal(server.recordPotentialAlerts(cfg), null);
+    Date.now = () => Date.parse('2026-10-11T10:05:20+08:00');
+    saveConfig(cfg);
+    assert.equal(server.recordPotentialAlerts(cfg), null);
     assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 0);
   } finally {
     Date.now = () => fixed;
   }
 });
 
-test('the automatic closing scheduler forces a complete fresh scan, serializes ticks and retries a failed second slot', async () => {
-  reset();
-  seedTrendMarket(2);
-  const cfg = { ...DEFAULTS, telegram_bot_token: 'FAKE_TEST_TOKEN', telegram_chat_id: 'TEST_CHAT' };
-  saveConfig(cfg);
-  let sends = 0;
-  let scans = 0,
-    fail = false;
+test('a breakout upgrade is new once, and a transaction failure does not consume its signal', () => {
+  const cfg = seedPotentialScan('10:05:20', 1);
+  try {
+    assert.ok(server.recordPotentialAlerts(cfg));
+    briefingClock('10:10:20', 1);
+    db.prepare('UPDATE live SET price=11.12,high=11.15').run();
+    saveConfig(cfg);
+    db.exec(
+      "CREATE TRIGGER fail_potential BEFORE INSERT ON potential_pushes BEGIN SELECT RAISE(ABORT,'simulated'); END;",
+    );
+    assert.throws(() => server.recordPotentialAlerts(cfg), /simulated/);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM notification_outbox').get().c, 1);
+    db.exec('DROP TRIGGER fail_potential');
+    const upgraded = server.recordPotentialAlerts(cfg);
+    assert.ok(upgraded);
+    assert.equal(upgraded.charts[0].marker, '策略买点');
+    assert.equal(server.recordPotentialAlerts(cfg), null);
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS fail_potential');
+    Date.now = () => fixed;
+  }
+});
+
+test('one incomplete chart cannot block other valid signals and disabling Telegram cancels pending photos', async () => {
+  const cfg = seedPotentialScan();
+  try {
+    db.prepare("UPDATE daily_vol SET open=NULL WHERE stock='STRONG0'").run();
+    saveConfig(cfg);
+    const notice = server.recordPotentialAlerts(cfg);
+    assert.deepEqual(
+      notice.charts.map((c) => c.code),
+      ['STRONG1'],
+    );
+    globalThis.fetch = async () => {
+      throw new Error('must not send when disabled');
+    };
+    await deliverOutbox({ ...cfg, potential_alerts_telegram: false });
+    assert.equal(server.buildState().potential_alert.delivery, '仅网页');
+    assert.equal(server.buildState().status.pending_notifications, 0);
+  } finally {
+    Date.now = () => fixed;
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('legacy fixed-time settings are disabled and the whole-market poll is throttled to five minutes', async () => {
+  const cfg = seedPotentialScan('10:05:20', 1);
+  saveConfig({
+    ...cfg,
+    telegram_bot_token: '',
+    final_briefing_on: true,
+    half_hour_briefing_on: true,
+    poll_interval_minutes: 1,
+  });
+  assert.equal(server.loadConfig().poll_interval_minutes, 5);
+  assert.equal(server.loadConfig().final_briefing_on, false);
+  assert.equal(server.loadConfig().half_hour_briefing_on, false);
+  let scans = 0;
   globalThis.fetch = async (url) => {
     if (String(url).includes('scanner.tradingview.com')) {
       scans++;
-      if (fail) return new Response('temporary', { status: 503 });
       return Response.json({
-        totalCount: 2,
-        data: [0, 1].map((i) => ({
-          d: [
-            'STRONG' + i,
-            'Example ' + i,
-            11,
-            11.02,
-            2000000,
-            0.18,
-            0.02,
-            500000,
-            500000,
-            11.1,
-            10.9,
-            'MYQ0001OO001',
-          ],
-        })),
+        totalCount: 1,
+        data: [
+          {
+            d: [
+              'STRONG0',
+              'Example',
+              11,
+              11.02,
+              2000000,
+              0.18,
+              0.02,
+              500000,
+              500000,
+              11.1,
+              10.9,
+              'MYQ0001OO001',
+            ],
+          },
+        ],
       });
     }
-    if (String(url).includes('/sendMessage')) {
-      sends++;
-      return Response.json({ ok: true, result: {} });
-    }
-    return new Response('no fixture data', { status: 404 });
+    return new Response('no external data', { status: 404 });
   };
   try {
-    Date.now = () => Date.parse('2026-10-05T14:30:20+08:00');
-    await Promise.all([server.maybeFinalBriefings(), server.maybeFinalBriefings()]);
+    await server.maybePoll();
     assert.equal(scans, 1);
-    assert.equal(server.halfHourBriefingState().latest.slot, '14:30');
-    Date.now = () => Date.parse('2026-10-05T15:00:20+08:00');
-    await server.maybeFinalBriefings();
+    Date.now = () => Date.parse('2026-10-05T10:10:19+08:00');
+    await server.maybePoll();
+    assert.equal(scans, 1);
+    Date.now = () => Date.parse('2026-10-05T10:10:20+08:00');
+    await server.maybePoll();
     assert.equal(scans, 2);
-    assert.equal(server.halfHourBriefingState().latest.slot, '15:00');
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM closing_briefings').get().c, 2);
-    Date.now = () => Date.parse('2026-10-05T16:00:20+08:00');
-    await Promise.all([
-      server.maybeFinalBriefings(),
-      server.maybeFinalBriefings(),
-      server.maybeFinalBriefings(),
-    ]);
-    assert.equal(scans, 3);
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM closing_briefings').get().c, 3);
-    assert.equal(server.closingBriefingState().today[0].slot, '16:00');
-    await server.maybeFinalBriefings();
-    assert.equal(scans, 3);
-    Date.now = () => Date.parse('2026-10-05T16:30:20+08:00');
-    fail = true;
-    await server.maybeFinalBriefings();
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM closing_briefings').get().c, 3);
-    Date.now = () => Date.parse('2026-10-05T16:30:40+08:00');
-    fail = false;
-    await server.maybeFinalBriefings();
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM closing_briefings').get().c, 4);
-    assert.equal(server.closingBriefingState().today[0].slot, '16:30');
-    assert.equal(sends, 4); // one API send per slot, including both final slots.
-    assert.equal(
-      db.prepare('SELECT COUNT(*) c FROM notification_outbox WHERE sent_at IS NOT NULL').get().c,
-      4,
-    );
+    assert.equal((await post('/api/settings', { poll_interval_minutes: 1 })).status, 400);
   } finally {
     Date.now = () => fixed;
     globalThis.fetch = realFetch;

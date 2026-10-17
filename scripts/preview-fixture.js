@@ -18,14 +18,14 @@ for (const key of [
 globalThis.fetch = async () => {
   throw new Error('External network disabled in preview fixture');
 };
-const reviewDate = marketDate();
+const reviewDate = process.env.PREVIEW_DATE || marketDate();
 const previewTime = process.env.PREVIEW_TIME || '10:30:00';
 if (!/^\d{2}:\d{2}:\d{2}$/.test(previewTime)) throw new Error('PREVIEW_TIME must be HH:mm:ss');
 const fixed = Date.parse(reviewDate + 'T' + previewTime + '+08:00');
 if (!Number.isFinite(fixed)) throw new Error('Invalid PREVIEW_TIME');
 let clock = fixed;
 Date.now = () => clock;
-const { app, db, DEFAULTS, saveConfig, recordFinalBriefing } = await import('../server.js');
+const { app, db, DEFAULTS, saveConfig, recordPotentialAlerts } = await import('../server.js');
 const cfg = { ...DEFAULTS, watchlist: [], final_briefing_telegram: false };
 saveConfig(cfg);
 const dates = [],
@@ -95,6 +95,7 @@ db.prepare('INSERT INTO alerts(ts,stock,name,kind,message) VALUES(?,?,?,?,?)').r
   'pattern',
   '日线越过前期压力位，继续观察能否守住。此记录仅用于界面验收。',
 );
+db.prepare('UPDATE live SET high=price*1.02,low=price*0.98').run();
 db.prepare("INSERT INTO kv(k,v) VALUES('last_successful_poll',?)").run(String(fixed / 1000));
 const port = Number(process.env.PREVIEW_PORT || 8091);
 // An explicitly labelled historical replay for the BUSCAP acceptance case.
@@ -113,38 +114,12 @@ if (reviewDate === buscap.snapshot.date) {
   for (const b of buscap.bars)
     insert.run('BUSCAP', b.date, b.volume, b.open, b.high, b.low, b.close);
 }
-// Optional late-day acceptance snapshots, only in this isolated, network-disabled fixture.
-if (previewTime >= '16:30:00' && previewTime < '16:40:00') {
-  const count = db.prepare('SELECT COUNT(*) n FROM universe').get().n;
-  for (const slot of ['16:00', '16:30']) {
-    clock = Date.parse(reviewDate + 'T' + slot + ':30+08:00');
-    db.prepare('UPDATE live SET mtime=?').run(clock / 1000);
-    db.prepare('INSERT OR REPLACE INTO kv(k,v) VALUES(?,?)').run(
-      'market_scan_coverage',
-      JSON.stringify({ expected: count, received: count, valid: count, at: clock / 1000 }),
-    );
-    saveConfig(cfg);
-    recordFinalBriefing(slot, cfg);
-  }
-  const items = [
-    { code: 'EXAMPLE1', price: 11.5 },
-    { code: 'EXAMPLE2', price: 8.5 },
-  ];
-  db.prepare(
-    'INSERT INTO closing_briefings(date,slot,created_at,quote_at,status,items,text) VALUES(?,?,?,?,?,?,?)',
-  ).run(
-    dates.at(-1),
-    '16:30',
-    clock / 1000 - 86400,
-    clock / 1000 - 86400,
-    'ready',
-    JSON.stringify(items),
-    'Synthetic acceptance fixture',
-  );
-  clock = fixed;
-  db.prepare('UPDATE live SET mtime=?').run(fixed / 1000);
-  saveConfig(cfg);
-}
+const count = db.prepare('SELECT COUNT(*) n FROM universe').get().n;
+db.prepare('INSERT OR REPLACE INTO kv(k,v) VALUES(?,?)').run(
+  'market_scan_coverage',
+  JSON.stringify({ expected: count, received: count, valid: count, at: fixed / 1000 }),
+);
+recordPotentialAlerts({ ...cfg, potential_alerts_telegram: false });
 const httpServer = app.listen(port, '127.0.0.1', () =>
   console.log('Offline fixture: http://localhost:' + port + ' — labelled samples/replays only.'),
 );
