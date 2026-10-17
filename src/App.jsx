@@ -1490,7 +1490,10 @@ function PriceChart({ report }) {
       <a href={source} target="_blank" rel="noreferrer" aria-label="点击放大蜡烛K线">
         <img src={source} alt={report.code + '日K线、成交量、策略买点、突破位和止损参考位'} />
       </a>
-      <p className="data-note">实心箭头＝策略买点；空心箭头＝等待突破。图中盘中蜡烛尚未收盘。</p>
+      <p className="data-note">
+        实心箭头＝策略买点；空心箭头＝等待突破。
+        {report.snapshot ? '当前为历史收盘图。' : '盘中数据尚未定稿。'}
+      </p>
     </section>
   );
 }
