@@ -41,7 +41,7 @@ const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 const DB_PATH = path.join(DATA_DIR, 'data.db');
 const DIST = path.join(__dirname, 'dist');
 const PORT = process.env.PORT || 8080;
-const VERSION = 'v2.6-potential-candles';
+const VERSION = 'v2.6.1-potential-candles';
 let analysisCache = null;
 
 const DEFAULTS = {
@@ -1696,7 +1696,7 @@ function recordPotentialAlerts(cfg = loadConfig()) {
     '🔎 新潜力信号 · ' + date,
     ...picks.map(
       ({ report: r }) =>
-        `${r.code} · RM ${r.price} · ${(r.volume / 10000).toFixed(2)}万股 · 昨日${r.volume_signal.multiple.toFixed(2)}倍\n${conciseReason(r)}`,
+        `${r.code} · RM ${+r.price.toFixed(3)} · ${(r.volume / 10000).toFixed(2)}万股 · 昨日${r.volume_signal.multiple.toFixed(2)}倍\n${conciseReason(r)}`,
     ),
     '实心箭头＝策略买点；空心箭头＝待突破。盘中未收盘，不保证上涨。',
     process.env.PUBLIC_URL || 'https://synthe-fantasia.site/',

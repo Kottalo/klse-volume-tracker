@@ -32,6 +32,8 @@ test('candles use real OHLC, exclude future bars and reserve confirmed markers f
   assert.ok(!svg.includes('2026-10-19'));
   assert.ok(svg.includes('策略买点 RM 1.05'));
   assert.ok(svg.includes('止损参考 0.9'));
+  assert.match(chartSvg(chartModel({ ...report, price: 0.904999979 })), /RM 0.905/);
+  assert.ok(!chartSvg(chartModel({ ...report, price: 0.904999979 })).includes('0.904999979'));
 });
 test('the same chart renders to a real, portable PNG with the bundled Chinese font', () => {
   const models = [
