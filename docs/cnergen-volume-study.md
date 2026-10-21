@@ -1,5 +1,7 @@
 # CNERGEN：放量蓄势与后续突破
 
+规则更新：下文保留研究时采用两倍量门槛的历史分析。当前筛选最低为昨日三倍量；10月2日约2.24倍、9月22日约2.80倍，均不达当前门槛。真实历史数值保持不变，回归测试现验证10月2日不再入选。
+
 研究日期：2026-10-05。股票为 Cnergenz Berhad（Bursa 简称 CNERGEN，代码0246）。公司提供电子制造解决方案，业务包括集成生产线、智能工厂及设备工具，见[公司介绍](https://cnergenz.com/)。名称与代码可核对[Bursa IPO资料](https://www.bursamalaysia.com/sites/5d809dcf39fba22790cad230/content_entry617bfcc339fba20f70a0657b/626b671e39fba21570ca697e/files/IPO_factsheet__Cnergenz_Berhad_.pdf)。
 
 ## 数据与观察

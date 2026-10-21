@@ -43,14 +43,23 @@ test('half-hour slots repeat unchanged lists, stop for lunch, and reserve the tw
     quote_date: '2026-10-07',
     fetched_at: now,
     volume: 1000000,
-    volume_signal: { multiple: 2 },
+    volume_signal: { multiple: 3 },
   };
   assert.equal(halfHourCandidates([r], {}, '10:00', now).length, 1);
+  assert.equal(
+    halfHourCandidates(
+      [{ ...r, volume_signal: { multiple: 2.999999 } }],
+      { screen_vol_mult: 2 },
+      '10:00',
+      now,
+    ).length,
+    0,
+  );
   assert.equal(finalCandidates([r], {}, '10:00', now).length, 0);
   assert.equal(halfHourCandidates([{ ...r, fetched_at: now - 21 }], {}, '10:00', now).length, 0);
   assert.match(
     formatHalfHourBriefing(
-      { date: '2026-10-07', slot: '10:00', quote_at: now, minimum_multiple: 2, items: [] },
+      { date: '2026-10-07', slot: '10:00', quote_at: now, minimum_multiple: 3, items: [] },
       'https://example.test',
     ),
     /半小时精选.*10:00/,
@@ -79,7 +88,7 @@ test('three picks and concise updates fit a single Telegram message', () => {
       date: '2026-10-07',
       slot: '10:00',
       quote_at: at('2026-10-07T10:00:20'),
-      minimum_multiple: 2,
+      minimum_multiple: 3,
       items: Array.from({ length: 3 }, (_, i) => ({
         code: 'STOCK' + i,
         price: 1.234,

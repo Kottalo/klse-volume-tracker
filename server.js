@@ -84,7 +84,7 @@ const DEFAULTS = {
   screen_on: true, // 是否把筛选结果放进每日广播
   screen_min_gain: 15, // 20 交易日涨幅下限 %
   screen_max_gain: 25, // 20 交易日涨幅上限 %
-  screen_vol_mult: 2, // 放量倍数(今日量 ÷ 昨日量)
+  screen_vol_mult: 3, // 放量倍数(今日量 ÷ 昨日量)，最低3倍
   screen_min_volume: 1000000, // 精选成交量至少100万股
   screen_above_ma5: true, // 要求收盘站上 5 日均线
   screen_bullish: true, // 要求四线多头排列
@@ -160,6 +160,7 @@ function loadConfig() {
   if (process.env.LLM_API_KEY) cfg.llm_api_key = process.env.LLM_API_KEY;
   // Long legacy intervals can miss the entire early breakout window.
   cfg.poll_interval_minutes = 5;
+  cfg.screen_vol_mult = Math.max(3, cfg.screen_vol_mult ?? 3);
   cfg.final_briefing_on = false;
   cfg.half_hour_briefing_on = false;
   return cfg;
@@ -1145,7 +1146,7 @@ function cmdHelp() {
     '',
     '/bot <任何话>   直接跟 AI 对话, 例: /bot 你好 或 /bot MAYBANK 值得买吗',
     '/stock <代码>   查单只股票现在的完整情况',
-    '/screen         强势筛选: 20日涨15-25% + 放量2倍 + 站上MA5 + 四线多头排列',
+    '/screen         强势筛选: 20日涨15-25% + 放量3倍 + 站上MA5 + 四线多头排列',
     '/top            只看今日精选',
     '/watch [all]    观察名单及成绩',
     '/stats          规则观察结果',
@@ -2453,7 +2454,7 @@ function closingBriefingState(cfg = loadConfig()) {
     date,
     slots: BRIEFING_SLOTS,
     windows,
-    minimum_multiple: Math.max(3, cfg.screen_vol_mult || 2),
+    minimum_multiple: Math.max(3, cfg.screen_vol_mult || 3),
     enabled: cfg.final_briefing_on !== false,
     telegram:
       cfg.final_briefing_telegram !== false && !!(cfg.telegram_bot_token && cfg.telegram_chat_id),
@@ -2685,7 +2686,7 @@ function getAnalysisOverview(cfg) {
     snapshot_date: snapshotDate,
     historical: reports.filter((r) => r.stage === 'stale').length,
     covered: reports.filter((r) => !!r.metrics).length,
-    rule: '分别识别放量蓄势、回调整理后的放量转强、放量突破三条路径。当前精选须百万股及昨日两倍量同时达标，价格未明显拉升。过去已达标的信号另行持续追踪，不因今天量倍数下降而消失。',
+    rule: '分别识别放量蓄势、回调整理后的放量转强、放量突破三条路径。当前精选须百万股及昨日三倍量同时达标，价格未明显拉升。过去已达标的信号另行持续追踪，不因今天量倍数下降而消失。',
   };
   analysisCache = { ts: Date.now(), data, reports, decisions, tracking, ranked: candidates };
   return data;
@@ -2758,7 +2759,7 @@ function buildState() {
       screen_on: cfg.screen_on !== false,
       screen_min_gain: cfg.screen_min_gain ?? 15,
       screen_max_gain: cfg.screen_max_gain ?? 25,
-      screen_vol_mult: Math.max(2, cfg.screen_vol_mult ?? 2),
+      screen_vol_mult: Math.max(3, cfg.screen_vol_mult ?? 3),
       screen_min_volume: Math.max(1000000, cfg.screen_min_volume ?? 1000000),
     },
     watchlist: cfg.watchlist,
@@ -2937,7 +2938,7 @@ app.get('/api/tg-raw', async (req, res) => {
 function runScreen(opts = {}) {
   const minGain = opts.min_gain ?? 15,
     maxGain = opts.max_gain ?? 25,
-    volMult = Math.max(2, opts.vol_mult ?? 2),
+    volMult = Math.max(3, opts.vol_mult ?? 3),
     minVolume = Math.max(1000000, opts.min_volume ?? 1000000);
   if (![minGain, maxGain, volMult, minVolume].every(Number.isFinite) || minGain > maxGain)
     throw new ValidationError('筛选参数需要有效数值，涨幅下限不能高于上限。');
@@ -3031,7 +3032,7 @@ function runScreen(opts = {}) {
   };
 }
 
-// HTTP 入口(薄壳): /api/screen?min_gain=15&max_gain=25&vol=2&ma5=1&bull=1&asof=YYYY-MM-DD
+// HTTP 入口(薄壳): /api/screen?min_gain=15&max_gain=25&vol=3&ma5=1&bull=1&asof=YYYY-MM-DD
 app.get('/api/screen', (req, res) => {
   const q = req.query;
   const num = (v) => (v != null && v !== '' ? Number(v) : undefined);

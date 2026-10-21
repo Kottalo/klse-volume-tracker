@@ -351,7 +351,7 @@ export default function App() {
                         label="明显放量"
                         value={number(insights?.volume_qualified || 0, 0)}
                         unit="只"
-                        note="百万股以上，且至少昨日两倍"
+                        note="百万股以上，且至少昨日三倍"
                       />
                       <Stat
                         label="当前精选候选"
@@ -393,7 +393,7 @@ export default function App() {
                       </div>
                       <p className="criteria-line">
                         量 ≥{volume(state.settings.screen_min_volume ?? 1000000)} · 昨日 ≥
-                        {number(state.settings.screen_vol_mult ?? 2)}倍 · 价格未明显拉升
+                        {number(state.settings.screen_vol_mult ?? 3)}倍 · 价格未明显拉升
                       </p>
                       {candidates.length ? (
                         <div className="card-grid">
@@ -415,7 +415,7 @@ export default function App() {
                               ? '正在补齐历史资料，完成后会自动重新分析。'
                               : filter !== 'all'
                                 ? '当前精选没有这一阶段的候选，可切换其他阶段查看。'
-                                : '尚无股票同时满足百万股、两倍放量及蓄势、转强或突破条件。继续扫描，不用较弱信号凑数。'
+                                : '尚无股票同时满足百万股、三倍放量及蓄势、转强或突破条件。继续扫描，不用较弱信号凑数。'
                           }
                           action={() => navigate('market')}
                           actionLabel="查看全市场"
@@ -811,7 +811,7 @@ function VolumePanel({ report, compact = false }) {
           </strong>
         </div>
         <p className={signal.pass ? 'volume-pass' : 'volume-wait'}>
-          {signal.pass ? '百万股、两倍量达标' : '本次成交量未达标'}
+          {signal.pass ? '百万股、三倍量达标' : '本次成交量未达标'}
         </p>
       </section>
     );
@@ -984,7 +984,7 @@ function SetupPanel({ report, compact = false }) {
         。
       </p>
       <p>
-        其中 <strong>{setup.events.length} 天</strong>出现百万股以上、至少昨日两倍成交，而价格变化在
+        其中 <strong>{setup.events.length} 天</strong>出现百万股以上、至少昨日三倍成交，而价格变化在
         −1.5% 至 +3% 之间。
       </p>
       {!compact && setup.events.length > 0 && (
@@ -1506,13 +1506,13 @@ function Method() {
     ],
     [
       '02',
-      '成交量：百万股与两倍放量',
-      '所有精选都需本次成交量至少100万股，且至少上一交易日全天的2倍。分别显示相对昨日与此前20日均量的变化。盘中以累计量对比昨日全天，不做全天成交量外推。',
+      '成交量：百万股与三倍放量',
+      '所有精选都需本次成交量至少100万股，且至少上一交易日全天的3倍。分别显示相对昨日与此前20日均量的变化。盘中以累计量对比昨日全天，不做全天成交量外推。',
     ],
     [
       '03',
       '蓄势：量增价稳，尚未明显拉升',
-      '前10个有成交交易日价格窄幅整理，出现过平稳放量，或本次量达到20日均量1.5倍。当前仍需过百万股和两倍量门槛。平稳放量记录排除明显下跌、宽幅波动与收盘偏弱的日期。',
+      '前10个有成交交易日价格窄幅整理，出现过平稳放量，或本次量达到20日均量1.5倍。当前仍需过百万股和三倍量门槛。平稳放量记录排除明显下跌、宽幅波动与收盘偏弱的日期。',
     ],
     [
       '04',
@@ -1544,7 +1544,7 @@ function Method() {
           <div>
             <dt>放量蓄势 · 尚未突破</dt>
             <dd>
-              百万股与两倍放量同时达标，价格仍在整理区间，已有量增价稳依据。优先关注放量越过整理上沿；当前未确认突破。
+              百万股与三倍放量同时达标，价格仍在整理区间，已有量增价稳依据。优先关注放量越过整理上沿；当前未确认突破。
             </dd>
           </div>
           <div>
@@ -1592,7 +1592,7 @@ function AdminSettings({ state, close, updated }) {
 
     ['screen_min_gain', '20日涨幅下限（%）', -100, 1000],
     ['screen_max_gain', '20日涨幅上限（%）', -100, 1000],
-    ['screen_vol_mult', '本次 / 上一交易日全天量（至少2倍）', 2, 100],
+    ['screen_vol_mult', '本次 / 上一交易日全天量（至少3倍）', 3, 100],
     ['db_min_score', '形态评分门槛', 0, 100],
     ['db_min_rr', '最小目标 / 风险空间比', 0.1, 20],
   ];

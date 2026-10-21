@@ -22,7 +22,7 @@ const cfg = {
   poll_interval_minutes: 5,
   screen_min_gain: 15,
   screen_max_gain: 25,
-  screen_vol_mult: 2,
+  screen_vol_mult: 3,
   db_min_score: 70,
   db_min_rr: 1,
   market_holidays: [],
@@ -47,7 +47,7 @@ test('lunch preserves the final morning snapshot, rejects genuinely stale data a
     stock: 'EARLY',
     price: 12.3,
     prevClose: 12.24,
-    volume: 1200000,
+    volume: 1500000,
     session_date: '2026-10-05',
     mtime: at('12:24:00'),
   };
@@ -150,19 +150,20 @@ function cnergenReport(date, overrides = {}) {
   });
 }
 
-test('CNERGEN is a pre-breakout setup on Oct 2 using only then-available data, and extended after its rally', () => {
+test('CNERGEN Oct 2 no longer qualifies below three-times volume, and remains extended after its rally', () => {
   const report = cnergenReport('2026-10-02');
-  assert.equal(report.stage, 'coiled');
+  assert.equal(report.stage, 'watch');
+  assert.equal(report.volume_signal.pass, false);
+  assert.equal(report.potential_eligible, false);
+  assert.equal(report.potential_signal, null);
   assert.equal(report.volume_signal.current, 2168900);
   assert.ok(Math.abs(report.volume_signal.multiple - 2.23713254) < 0.000001);
   assert.equal(report.volume_setup.resistance, 0.98);
   assert.equal(report.volume_setup.support, 0.89);
-  assert.equal(report.volume_setup.events[0].date, '2026-09-22');
-  assert.equal(report.volume_setup.events[0].change_pct, 0);
+  assert.equal(report.volume_setup.events.length, 0); // Sep 22 was also below three-times volume.
   assert.equal(report.volume_setup.base_end, '2026-10-01');
   assert.ok(Math.abs(report.volume_setup.average_multiple - 1.19996127) < 0.000001);
-  assert.match(report.entry_plan, /尚未突破/);
-  assert.match(formatReport(report), /放量蓄势/);
+  assert.match(report.conclusion, /未达到昨日3倍/);
   const rallied = cnergenReport('2026-10-05');
   assert.equal(rallied.stage, 'extended');
   assert.equal(rallied.volume_setup.qualified, false);
@@ -183,12 +184,12 @@ test('flat-price setups still require both volume gates, current support and usa
   const rows = cnergen.filter((r) => r.date < '2026-10-02');
   for (const [price, volume] of [
     [0.91, 999999],
-    [0.91, 1938999],
+    [0.91, 2908499],
     [0.88, 3000000],
     [1.1, 3000000],
   ])
     assert.equal(consolidationSetup(rows, price, volume, '2026-10-02').qualified, false);
-  assert.equal(consolidationSetup(rows, 0.91, 1939000, '2026-10-02').qualified, true);
+  assert.equal(consolidationSetup(rows, 0.91, 2908500, '2026-10-02').qualified, true);
   const reviewNow = Date.parse('2026-10-02T10:30:00+08:00') / 1000;
   assert.equal(
     explainStock({
@@ -298,7 +299,7 @@ test('reports explain measured evidence without converting it into a winning pro
   });
   assert.equal(report.stage, 'watch');
   assert.equal(report.potential_eligible, false);
-  assert.equal(report.evidence_count, 2);
+  assert.equal(report.evidence_count, 1);
   assert.equal(report.levels, null);
   assert.match(formatReport(report), /不是上涨概率/);
   assert.match(report.checks[1].detail, /尚未收盘/);
@@ -363,10 +364,11 @@ test('settings reject nonfinite values, malformed ranges and member credential c
     { market_holidays: ['2026-02-30'] },
     { price_thresholds: [{ max: 2, threshold: 200 }] },
     { screen_min_volume: 999999 },
-    { screen_vol_mult: 1.9 },
+    { screen_vol_mult: 2.999999 },
   ])
     assert.throws(() => validateSettings(patch, defaults), ValidationError);
   assert.equal(validateSettings({ screen_on: false }, defaults).screen_on, false);
+  assert.equal(validateSettings({ screen_vol_mult: 3 }, defaults).screen_vol_mult, 3);
   assert.equal(
     validateSettings({ llm_api_key: 'test' }, defaults, { allowSecrets: true }).llm_api_key,
     'test',
@@ -397,11 +399,11 @@ test('a recent closed-session report uses the completed daily bar rather than an
   assert.match(report.sources.quotes, /完成交易日快照/);
 });
 
-test('low turnover cannot be promoted even with million-share double volume', () => {
+test('low turnover cannot be promoted even with million-share triple volume', () => {
   const stock = {
     stock: 'TEST',
     price: 0.065,
-    volume: 1000000,
+    volume: 1500000,
     session_date: '2026-10-05',
     mtime: now,
   };
@@ -416,7 +418,7 @@ test('low turnover cannot be promoted even with million-share double volume', ()
   assert.match(report.label, /成交/);
 });
 
-test('million-share and double-volume gates both apply inclusively, even with a valid pattern', () => {
+test('million-share and triple-volume gates both apply inclusively, even with a valid pattern', () => {
   const pattern = {
     neck: 12.9,
     stop: 12.5,
@@ -427,9 +429,11 @@ test('million-share and double-volume gates both apply inclusively, even with a 
     gap: 20,
   };
   for (const [current, previous, pass] of [
-    [1000000, 500000, true],
-    [999999, 400000, false],
-    [1000000, 500001, false],
+    [1000000, 300000, true],
+    [1500000, 500000, true],
+    [999999, 300000, false],
+    [1499999, 500000, false],
+    [1000000, 500000, false],
     [2000000, 0, false],
   ]) {
     const rows = history.map((r) => ({ ...r, volume: previous }));
@@ -452,8 +456,11 @@ test('million-share and double-volume gates both apply inclusively, even with a 
     assert.equal(report.volume_signal.current, current);
   }
   assert.equal(volumeSignal(999999, 400000, { minVolume: 0, minMultiple: 0 }).pass, false);
+  assert.equal(volumeSignal(1499999, 500000, { minMultiple: 2 }).pass, false);
+  assert.equal(volumeSignal(1500000, 500000, { minMultiple: 2 }).pass, true);
+  assert.equal(volumeSignal(1500000, 500000, { minMultiple: 4 }).pass, false);
   assert.equal(volumeSignal(1000000, 500001).pass, false);
-  assert.equal(volumeSignal(0, 500000).shortfall, 1000000);
+  assert.equal(volumeSignal(0, 500000).shortfall, 1500000);
   assert.equal(volumeSignal(2000000, 0).multiple, null);
 });
 
@@ -468,7 +475,7 @@ test('early volume expansion can qualify before 15 percent gain, while falling p
     stock: 'EARLY',
     price: 12.3,
     prevClose: 12.24,
-    volume: 1200000,
+    volume: 1500000,
     session_date: '2026-10-05',
     mtime: now,
   };
@@ -477,7 +484,7 @@ test('early volume expansion can qualify before 15 percent gain, while falling p
   assert.equal(report.screen_pass, false);
   assert.ok(['coiled', 'confirmed', 'building'].includes(report.stage));
   assert.equal(report.potential_eligible, true);
-  assert.equal(report.volume_signal.current, 1200000);
+  assert.equal(report.volume_signal.current, 1500000);
   const down = explainStock({
     stock: { ...stock, price: 12, prevClose: 12.24 },
     rows,

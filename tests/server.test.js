@@ -102,7 +102,7 @@ test('screen asof is invariant to changes in later bars', () => {
     insert.run(
       'TEST',
       new Date(Date.parse('2026-08-01') + i * 86400000).toISOString().slice(0, 10),
-      i === 22 ? 1200000 : 500000,
+      i === 22 ? 1500000 : 500000,
       10 + i,
     );
   const opts = {
@@ -226,7 +226,7 @@ function seedTrendMarket(count = 5) {
   );
   for (let i = 0; i < count; i++) {
     const code = 'STRONG' + i;
-    quote(code, 11.02, 500000 * (i + 2));
+    quote(code, 11.02, 500000 * (i + 3));
     dates.forEach((date, index) =>
       insert.run(code, date, index === 19 ? 1500000 : 500000, 11, 11.1, 10.9),
     );
@@ -234,6 +234,40 @@ function seedTrendMarket(count = 5) {
     db.prepare('UPDATE live SET high=11.1,low=10.9 WHERE stock=?').run(code);
   }
 }
+
+test('three-times volume is inclusive across legacy settings, shortlist, screen and potential alerts', async () => {
+  reset();
+  seedTrendMarket(1);
+  saveConfig({ ...DEFAULTS, screen_vol_mult: 2 });
+  assert.equal(server.loadConfig().screen_vol_mult, 3);
+  assert.equal((await post('/api/settings', { screen_vol_mult: 2.999999 })).status, 400);
+  db.prepare('INSERT INTO kv(k,v) VALUES(?,?)').run(
+    'market_scan_coverage',
+    JSON.stringify({ expected: 1, received: 1, valid: 1, at: fixed / 1000 }),
+  );
+  for (const [volume, qualified] of [
+    [1000000, false],
+    [1499999, false],
+    [1500000, true],
+  ]) {
+    db.prepare('UPDATE live SET volume=?').run(volume);
+    saveConfig({ ...DEFAULTS, screen_vol_mult: 2 });
+    const state = await (await realFetch(base + '/api/state')).json();
+    assert.equal(state.settings.screen_vol_mult, 3);
+    assert.equal(state.insights.candidates.length, qualified ? 1 : 0);
+    const screen = runScreen({
+      min_gain: -100,
+      vol_mult: 2,
+      above_ma5: false,
+      bullish_stack: false,
+    });
+    assert.equal(screen.params.vol_mult, 3);
+    assert.equal(screen.count, qualified ? 1 : 0);
+    assert.equal(!!server.recordPotentialAlerts(server.loadConfig()), qualified);
+  }
+  assert.equal((await post('/api/settings', { screen_vol_mult: 4 })).status, 200);
+  assert.equal(server.loadConfig().screen_vol_mult, 4);
+});
 
 test('the whole universe is analyzed but only the strongest few are returned, without filling weak slots', async () => {
   reset();
@@ -250,7 +284,7 @@ test('the whole universe is analyzed but only the strongest few are returned, wi
   assert.equal(state.insights.candidates[0].code, 'STRONG4');
   assert.ok(
     state.insights.candidates.every(
-      (r) => r.volume_signal.current >= 1000000 && r.volume_signal.multiple >= 2,
+      (r) => r.volume_signal.current >= 1000000 && r.volume_signal.multiple >= 3,
     ),
   );
   updateWatchlist(DEFAULTS);
@@ -594,7 +628,7 @@ test('qualified signals outside the top three remain queryable and ledger dedupl
   assert.match(signals.note, /不代表当时/);
 });
 
-test('BUSCAP historical breakout is tracked by public APIs even though current double-volume fails', async () => {
+test('BUSCAP historical breakout is tracked by public APIs even though current triple-volume fails', async () => {
   reset();
   const fixture = JSON.parse(
     fs.readFileSync(new URL('./fixtures/buscap-2026.json', import.meta.url), 'utf8'),
