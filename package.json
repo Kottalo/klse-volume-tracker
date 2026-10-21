@@ -1,6 +1,6 @@
 {
   "name": "klse-volume-tracker",
-  "version": "2.1.0",
+  "version": "3.0.0",
   "private": true,
   "type": "module",
   "description": "马来西亚股票(KLSE)成交量异动追踪 — React + Express + SSE",
@@ -17,7 +17,6 @@
     "format:check": "prettier --check server.js lib src tests scripts README.md package.json index.html .prettierrc.json .github/workflows/check.yml render.yaml"
   },
   "dependencies": {
-    "@resvg/resvg-js": "^2.6.2",
     "dotenv": "^17.4.2",
     "express": "^4.21.2",
     "react": "^18.3.1",
