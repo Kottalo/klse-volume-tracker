@@ -9,13 +9,16 @@ import {
 } from '../lib/volume.js';
 import { validateSettings, ValidationError } from '../lib/settings.js';
 
-test('only the inclusive three-times ratio decides eligibility, without a volume floor', () => {
+test('million-share and three-times gates both apply inclusively', () => {
   for (const [current, previous, pass] of [
-    [300, 100, true],
+    [1000000, 300000, true],
+    [999999, 100000, false],
+    [1500000, 500000, true],
+    [1499999, 500000, false],
     [299, 100, false],
     [3000000, 1000000, true],
     [2999999, 1000000, false],
-    [10, 1, true],
+    [10, 1, false],
     [0, 100, false],
     [300, 0, false],
     [300, null, false],

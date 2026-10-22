@@ -16,10 +16,11 @@ Date.now = () => fixed;
 const { app, db, DEFAULTS, saveConfig, recordVolumeAlerts } = await import('../server.js');
 saveConfig({ ...DEFAULTS, potential_alerts_telegram: false });
 for (const [code, volume, previous] of [
-  ['EXAMPLE1', 30000, 10000],
-  ['EXAMPLE2', 50000, 10000],
-  ['EXAMPLE3', 29999, 10000],
-  ['EXAMPLE4', 10000, null],
+  ['EXAMPLE1', 1000000, 300000],
+  ['EXAMPLE2', 1500000, 500000],
+  ['EXAMPLE3', 1499999, 500000],
+  ['EXAMPLE4', 1000000, null],
+  ['EXAMPLE5', 999999, 100000],
 ]) {
   db.prepare('INSERT INTO universe(stock,name,code) VALUES(?,?,?)').run(
     code,
@@ -44,7 +45,7 @@ for (const [key, value] of [
   ['last_successful_poll', String(fixed / 1000)],
   [
     'market_scan_coverage',
-    JSON.stringify({ at: fixed / 1000, expected: 4, received: 4, valid: 4 }),
+    JSON.stringify({ at: fixed / 1000, expected: 5, received: 5, valid: 5 }),
   ],
 ])
   db.prepare('INSERT INTO kv(k,v) VALUES(?,?)').run(key, value);

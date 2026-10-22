@@ -11,6 +11,7 @@ import {
   volumeSignal,
   formatVolumeAlert,
   VOLUME_MULTIPLE,
+  MINIMUM_VOLUME,
 } from './lib/volume.js';
 import { validateSettings, ValidationError } from './lib/settings.js';
 import { protectApi } from './lib/security.js';
@@ -360,7 +361,9 @@ function recordVolumeAlerts(cfg = loadConfig()) {
     (s) =>
       s.qualified &&
       s.fresh &&
-      !db.prepare('SELECT 1 FROM volume_alerts WHERE stock=? AND date=?').get(s.code, date),
+      !db
+        .prepare('SELECT 1 FROM volume_alerts WHERE stock=? AND date=? AND volume>=?')
+        .get(s.code, date, MINIMUM_VOLUME),
   );
   if (!matches.length) return [];
   // Batch by Telegram's text limit, never by rank or a maximum number of stocks.
@@ -395,7 +398,10 @@ function recordVolumeAlerts(cfg = loadConfig()) {
       );
       for (const s of batch.stocks)
         db.prepare(
-          'INSERT INTO volume_alerts(stock,date,name,numeric_code,volume,previous_volume,previous_date,multiple,ts,outbox_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
+          `INSERT INTO volume_alerts(stock,date,name,numeric_code,volume,previous_volume,previous_date,multiple,ts,outbox_id) VALUES(?,?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(stock,date) DO UPDATE SET name=excluded.name,numeric_code=excluded.numeric_code,
+          volume=excluded.volume,previous_volume=excluded.previous_volume,previous_date=excluded.previous_date,
+          multiple=excluded.multiple,ts=excluded.ts,outbox_id=excluded.outbox_id`,
         ).run(
           s.code,
           date,
@@ -482,6 +488,27 @@ function deliverOutbox(cfg = loadConfig()) {
         );
         continue;
       }
+      const records = db
+        .prepare('SELECT *,stock AS code FROM volume_alerts WHERE outbox_id=?')
+        .all(item.id);
+      const eligible = records.filter(
+        (stock) => volumeSignal(stock.volume, stock.previous_volume).pass,
+      );
+      if (!eligible.length) {
+        db.prepare('UPDATE notification_outbox SET cancelled_at=?,last_error=? WHERE id=?').run(
+          Math.floor(now),
+          '未达百万股及三倍量门槛',
+          item.id,
+        );
+        continue;
+      }
+      if (eligible.length !== records.length) {
+        item.text = [
+          `📊 三倍放量提醒 · ${eligible[0].date}`,
+          ...eligible.map(formatVolumeAlert),
+        ].join('\n\n');
+        db.prepare('UPDATE notification_outbox SET text=? WHERE id=?').run(item.text, item.id);
+      }
       const result = await sendTelegramText(item.text, cfg);
       db.prepare(
         'UPDATE notification_outbox SET attempts=attempts+1,sent_at=?,last_error=? WHERE id=?',
@@ -508,7 +535,7 @@ function handleTelegramMessage(message, cfg = loadConfig()) {
     const stocks = getStocks(cfg).filter((s) => s.qualified);
     return stocks.length
       ? '三倍放量 · ' + stocks[0].date + '\n\n' + stocks.map(formatVolumeAlert).join('\n\n')
-      : '目前没有达到昨日3倍量的股票。';
+      : '目前没有同时达到100万股及昨日3倍量的股票。';
   }
   if (cmd === '/stock') {
     const stock = getStocks(cfg).find(
@@ -521,7 +548,7 @@ function handleTelegramMessage(message, cfg = loadConfig()) {
         : stock.date + '\n' + formatVolumeAlert(stock);
   }
   if (['/start', '/help'].includes(cmd))
-    return '今日量达到昨日3倍就提醒，同一只股票每天一次。\n/top 查看达标股票\n/stock 代码 查看成交量';
+    return '今日量满100万股且达到昨日3倍就提醒，同一只股票每天一次。\n/top 查看达标股票\n/stock 代码 查看成交量';
   return null;
 }
 let telegramPolling = false;
@@ -605,6 +632,7 @@ function buildState() {
   return {
     version: '3.0.0',
     minimum_multiple: VOLUME_MULTIPLE,
+    minimum_volume: MINIMUM_VOLUME,
     stocks,
     alerts,
     coverage: {
@@ -643,7 +671,11 @@ app.get('/healthz', (_req, res) => res.json({ ok: true }));
 app.get('/api/state', (_req, res) => res.json(buildState()));
 app.get('/api/coverage', (_req, res) => res.json(buildState().coverage));
 app.get('/api/screen', (_req, res) =>
-  res.json({ minimum_multiple: 3, stocks: getStocks().filter((s) => s.qualified) }),
+  res.json({
+    minimum_multiple: VOLUME_MULTIPLE,
+    minimum_volume: MINIMUM_VOLUME,
+    stocks: getStocks().filter((s) => s.qualified),
+  }),
 );
 app.get('/api/stocks/:code', (req, res) => {
   const code = req.params.code.toUpperCase(),

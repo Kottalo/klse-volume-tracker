@@ -50,7 +50,7 @@ function scan(at = Date.now() / 1000, expected = 1, received = expected) {
     JSON.stringify({ at, expected, received }),
   );
 }
-function stock(code = 'TEST', volume = 300, previous = 100, extra = {}) {
+function stock(code = 'TEST', volume = 1500000, previous = 500000, extra = {}) {
   db.prepare('INSERT INTO universe(stock,name,code,active) VALUES(?,?,?,1)').run(
     code,
     code + ' Company',
@@ -89,6 +89,7 @@ test('public volume queries work; settings require admin and never expose creden
   const state = await (await realFetch(base + '/api/state')).json();
   assert.equal(state.stocks[0].qualified, true);
   assert.equal(state.minimum_multiple, 3);
+  assert.equal(state.minimum_volume, 1000000);
   assert.equal(state.settings.telegram_ready, true);
   assert.doesNotMatch(
     JSON.stringify(state),
@@ -100,9 +101,10 @@ test('public volume queries work; settings require admin and never expose creden
   assert.equal((await realFetch(base + '/api/stocks/0123')).status, 200);
   const screen = await (await realFetch(base + '/api/screen?vol=1&min_volume=0')).json();
   assert.equal(screen.minimum_multiple, 3);
+  assert.equal(screen.minimum_volume, 1000000);
   assert.equal(screen.stocks.length, 1);
 });
-test('low-volume stocks, one prior bar, no OHLC and old restrictive settings cannot block notifications', () => {
+test('both volume gates apply without OHLC, long history or old strategy restrictions', () => {
   reset();
   const config = {
     ...DEFAULTS,
@@ -112,31 +114,33 @@ test('low-volume stocks, one prior bar, no OHLC and old restrictive settings can
     min_average_daily_value: 1e12,
     pick_count: 1,
   };
-  stock('TINY', 300, 100);
-  stock('OTHER', 600, 100);
-  stock('THIRD', 900, 100);
-  stock('FOURTH', 1200, 100);
-  stock('BELOW', 299, 100);
-  stock('ZERO', 100, 0);
-  stock('MISSING', 100, null);
-  scan(fixed / 1000, 7);
+  stock('MINIMUM', 1000000, 300000);
+  stock('TINY', 999999, 100000);
+  stock('OTHER', 1500000, 500000);
+  stock('THIRD', 2000000, 500000);
+  stock('FOURTH', 2500000, 500000);
+  stock('BELOW', 1499999, 500000);
+  stock('ZERO', 1500000, 0);
+  stock('MISSING', 1500000, null);
+  scan(fixed / 1000, 8);
   const matches = recordVolumeAlerts(config);
-  assert.deepEqual(matches.map((s) => s.code).sort(), ['FOURTH', 'OTHER', 'THIRD', 'TINY']);
+  assert.deepEqual(matches.map((s) => s.code).sort(), ['FOURTH', 'MINIMUM', 'OTHER', 'THIRD']);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM volume_alerts').get().n, 4);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM notification_outbox').get().n, 1);
   const text = db.prepare('SELECT text FROM notification_outbox').get().text;
-  assert.match(text, /TINY/);
+  assert.match(text, /MINIMUM/);
+  assert.doesNotMatch(text, /TINY|BELOW|ZERO|MISSING/);
   assert.match(text, /FOURTH/);
   assert.doesNotMatch(text, /买点|支撑|PNG|精选|突破/);
 });
 test('ratio boundary is exact and threshold crossing alerts once per stock/date, including after restart', () => {
   reset();
-  stock('TEST', 299);
+  stock('TEST', 1499999);
   scan();
   assert.equal(recordVolumeAlerts().length, 0);
-  db.prepare('UPDATE live SET volume=300').run();
+  db.prepare('UPDATE live SET volume=1500000').run();
   assert.equal(recordVolumeAlerts().length, 1);
-  db.prepare('UPDATE live SET volume=500').run();
+  db.prepare('UPDATE live SET volume=2500000').run();
   assert.equal(recordVolumeAlerts().length, 0);
   const child = spawnSync(
     process.execPath,
@@ -151,10 +155,67 @@ test('ratio boundary is exact and threshold crossing alerts once per stock/date,
   assert.equal(child.stdout.trim(), '0');
   Date.now = () => fixed + 86400000;
   db.prepare("UPDATE live SET session_date='2026-10-06',mtime=?").run(Date.now() / 1000);
-  db.prepare("INSERT INTO daily_vol(stock,date,volume) VALUES('TEST','2026-10-05',100)").run();
+  db.prepare("INSERT INTO daily_vol(stock,date,volume) VALUES('TEST','2026-10-05',500000)").run();
   scan();
   assert.equal(recordVolumeAlerts().length, 1);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM volume_alerts').get().n, 2);
+});
+test('legacy pending notices exclude sub-million stocks without blocking their later million-share alert', async () => {
+  reset();
+  stock('SMALL', 999999, 100000);
+  stock('PASS', 1500000, 500000);
+  stock('ALONE', 999999, 100000);
+  scan(fixed / 1000, 3);
+  const records = getStocks();
+  const queue = (codes) => {
+    const id = Number(
+      db
+        .prepare("INSERT INTO notification_outbox(ts,text,kind) VALUES(?,?,'volume')")
+        .run(fixed / 1000, codes.join(' ')).lastInsertRowid,
+    );
+    for (const code of codes) {
+      const record = records.find((s) => s.code === code);
+      db.prepare(
+        'INSERT INTO volume_alerts(stock,date,volume,previous_volume,multiple,ts,outbox_id) VALUES(?,?,?,?,?,?,?)',
+      ).run(
+        code,
+        record.date,
+        record.volume,
+        record.previous_volume,
+        record.multiple,
+        fixed / 1000,
+        id,
+      );
+    }
+    return id;
+  };
+  queue(['SMALL', 'PASS']);
+  const belowOnly = queue(['ALONE']);
+  const sent = [];
+  globalThis.fetch = async (url, options) => {
+    assert.ok(String(url).endsWith('/sendMessage'));
+    sent.push(JSON.parse(options.body).text);
+    return Response.json({ ok: true });
+  };
+  await deliverOutbox(telegram);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /PASS/);
+  assert.doesNotMatch(sent[0], /SMALL|ALONE/);
+  assert.ok(
+    db.prepare('SELECT cancelled_at FROM notification_outbox WHERE id=?').get(belowOnly)
+      .cancelled_at,
+  );
+  assert.equal(recordVolumeAlerts(telegram).length, 0);
+  db.prepare("UPDATE live SET volume=1000000 WHERE stock='SMALL'").run();
+  assert.deepEqual(
+    recordVolumeAlerts(telegram).map((s) => s.code),
+    ['SMALL'],
+  );
+  await deliverOutbox(telegram);
+  assert.equal(sent.length, 2);
+  assert.match(sent[1], /SMALL/);
+  assert.match(sent[1], /1,000,000/);
+  assert.equal(recordVolumeAlerts(telegram).length, 0);
 });
 test('absent, stale, future, incomplete, inactive and lunch snapshots cannot masquerade as current alerts', () => {
   reset();
@@ -227,7 +288,7 @@ test('text failures retry the frozen notice and old notices expire; disabling Te
     assert.equal(JSON.parse(options.body).text, original);
     return Response.json({ ok: true });
   };
-  db.prepare('UPDATE live SET volume=900').run();
+  db.prepare('UPDATE live SET volume=4500000').run();
   await deliverOutbox(telegram);
   assert.ok(db.prepare('SELECT sent_at FROM notification_outbox').get().sent_at);
   db.prepare('UPDATE notification_outbox SET sent_at=NULL').run();
@@ -312,7 +373,10 @@ test('polling keeps a five-minute interval and preserves the last good snapshot 
   globalThis.fetch = async (url) => {
     if (String(url).includes('tradingview.com')) {
       scans++;
-      return Response.json({ totalCount: 1, data: [{ d: ['TEST', 'Test', 300, 'MYL0123OO000'] }] });
+      return Response.json({
+        totalCount: 1,
+        data: [{ d: ['TEST', 'Test', 1500000, 'MYL0123OO000'] }],
+      });
     }
     return Response.json({
       chart: {
@@ -320,7 +384,7 @@ test('polling keeps a five-minute interval and preserves the last good snapshot 
           {
             meta: { symbol: '0123.KL' },
             timestamp: [Date.parse('2026-10-02T09:00:00+08:00') / 1000],
-            indicators: { quote: [{ volume: [100] }] },
+            indicators: { quote: [{ volume: [500000] }] },
           },
         ],
       },
@@ -336,12 +400,12 @@ test('polling keeps a five-minute interval and preserves the last good snapshot 
   Date.now = () => fixed + 300000;
   globalThis.fetch = async () => new Response('unavailable', { status: 503 });
   await server.maybePoll();
-  assert.equal(getStocks()[0].volume, 300);
+  assert.equal(getStocks()[0].volume, 1500000);
   assert.match(server.buildState().status.error, /保留最近/);
 });
 test('backfill needs only volume, excludes unfinished/future days and recovers after upstream failure', async () => {
   reset();
-  stock('TEST', 300, null);
+  stock('TEST', 1500000, null);
   scan();
   let fail = true;
   globalThis.fetch = async () => {
@@ -354,7 +418,7 @@ test('backfill needs only volume, excludes unfinished/future days and recovers a
             timestamp: ['2026-10-02', '2026-10-05', '2026-10-06'].map(
               (d) => Date.parse(d + 'T09:00:00+08:00') / 1000,
             ),
-            indicators: { quote: [{ volume: [100, 999999, 999999] }] },
+            indicators: { quote: [{ volume: [500000, 999999, 999999] }] },
           },
         ],
       },
@@ -366,7 +430,7 @@ test('backfill needs only volume, excludes unfinished/future days and recovers a
   assert.equal((await server.performBackfill({ force: true })).done, 1);
   const bars = db.prepare('SELECT date,volume FROM daily_vol').all();
   assert.equal(bars.length, 1);
-  assert.equal(bars[0].volume, 100);
+  assert.equal(bars[0].volume, 500000);
   assert.equal(bars[0].date, '2026-10-02');
   assert.equal(db.prepare('SELECT COUNT(*) n FROM volume_alerts').get().n, 1);
 });
@@ -415,7 +479,8 @@ test('migration keeps old data but cancels unsent strategy/image notifications o
     assert.ok(result.old.cancelled_at);
     assert.equal(result.bar.close, 1.2);
     assert.equal(result.bar.volume, 100);
-    assert.equal(result.stock.qualified, true);
+    assert.equal(result.stock.qualified, false);
+    assert.equal(result.stock.multiple, 3);
   } finally {
     fs.rmSync(migration, { recursive: true, force: true });
   }

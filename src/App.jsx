@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useRef } from 'react';
 import './styles.css';
-import { formatMultiple } from '../lib/volume.js';
+import { formatMultiple, MINIMUM_VOLUME } from '../lib/volume.js';
 
 const shares = (value) =>
   Number.isFinite(value) ? Math.round(value).toLocaleString('zh-CN') : '—';
@@ -92,9 +92,11 @@ export default function App() {
       <section className="intro">
         <div className="eyebrow">只看成交量</div>
         <h1>
-          达到昨日 <em>3倍</em>，就提醒。
+          满100万股，达昨日 <em>3倍</em>就提醒。
         </h1>
-        <p>今日累计成交量 ÷ 上一有成交交易日全天量 ≥ 3。同一只股票每天提醒一次。</p>
+        <p>
+          今日累计成交量 ≥ 100万股，且至少是上一有成交交易日全天量的3倍。同一只股票每天提醒一次。
+        </p>
         <div className="status">
           <span className={connected ? 'dot online' : 'dot'} />
           {state?.status.market_open ? '开市中 · 每5分钟扫描' : '休市中 · 显示最近快照'}
@@ -114,7 +116,7 @@ export default function App() {
       )}
       <section className="stats" aria-label="市场概况">
         <div>
-          <span>三倍以上</span>
+          <span>百万股 · 三倍以上</span>
           <strong>
             {qualified.length}
             <small>只</small>
@@ -139,7 +141,7 @@ export default function App() {
         <div className="toolbar">
           <div className="tabs" role="tablist" aria-label="成交量列表">
             {[
-              ['qualified', '三倍以上'],
+              ['qualified', '百万股 · 三倍以上'],
               ['all', '全部股票'],
               ['alerts', '通知记录'],
             ].map(([key, label]) => (
@@ -184,18 +186,24 @@ export default function App() {
                   <td>{shares(s.volume)}</td>
                   <td>{shares(s.previous_volume)}</td>
                   <td>
-                    <span className={s.multiple >= 3 ? 'multiple pass' : 'multiple'}>
+                    <span
+                      className={
+                        s.multiple >= 3 && s.volume >= MINIMUM_VOLUME ? 'multiple pass' : 'multiple'
+                      }
+                    >
                       {s.multiple != null ? `${formatMultiple(s.multiple)}×` : '—'}
                     </span>
                   </td>
                   <td className="muted">
                     {tab === 'alerts' ? (
                       <>
-                        {s.sent_at
-                          ? '已发送'
-                          : s.cancelled_at
-                            ? s.last_error || '已停止'
-                            : '等待发送'}
+                        {s.volume < MINIMUM_VOLUME
+                          ? '旧规则记录'
+                          : s.sent_at
+                            ? '已发送'
+                            : s.cancelled_at
+                              ? s.last_error || '已停止'
+                              : '等待发送'}
                         <span className="company">{time(s.ts)}</span>
                       </>
                     ) : (
@@ -224,7 +232,7 @@ export default function App() {
               : query
                 ? '没有找到这只股票。'
                 : tab === 'qualified'
-                  ? '目前没有达到昨日3倍量的股票。'
+                  ? '目前没有同时达到100万股及昨日3倍量的股票。'
                   : tab === 'alerts'
                     ? '暂时没有通知记录。'
                     : '正在补齐市场资料。'}
@@ -288,7 +296,7 @@ function Settings({ state, close }) {
           关闭
         </button>
       </div>
-      <p>达到昨日3倍即提醒。仅发送股票代码、今日量、昨日量和倍数。</p>
+      <p>今日量满100万股且达到昨日3倍才提醒。仅发送股票代码、今日量、昨日量和倍数。</p>
       {!state.admin_enabled && <p className="notice">请先在服务器配置 ADMIN_TOKEN。</p>}
       <form onSubmit={submit}>
         <label>
