@@ -51,15 +51,19 @@ test('MYT trading dates skip weekends and configured holidays; lunch never gener
   for (const time of ['09:00', '12:29', '14:30', '16:59'])
     assert.ok(sessionStart(Date.parse(`2026-10-05T${time}:00+08:00`) / 1000));
 });
-test('settings retain notification controls and reject removed strategy parameters', () => {
+test('notification switches are independent and invalid settings are rejected', () => {
   assert.equal(
     validateSettings({ potential_alerts_telegram: false }, {}).potential_alerts_telegram,
     false,
   );
+  assert.equal(
+    validateSettings({ volume_alerts_telegram: false }, {}).volume_alerts_telegram,
+    false,
+  );
   for (const patch of [
-    { screen_vol_mult: 4 },
-    { screen_min_volume: 1000000 },
-    { pick_count: 3 },
+    { screen_vol_mult: 2 },
+    { screen_min_volume: 999999 },
+    { pick_count: 0 },
     { llm_api_key: 'x' },
     { potential_alerts_telegram: 'yes' },
     { market_holidays: ['2026-02-30'] },
