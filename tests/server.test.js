@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { chartPng } from '../lib/chart-image.js';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'klse-tests-'));
 process.env.DATA_DIR = root;
@@ -784,7 +785,7 @@ function seedPotentialScan(time = '10:05:20', count = 2) {
   return cfg;
 }
 
-test('new potential signals send one photo with a short caption, freeze its chart and persist deduplication', async () => {
+test('new potential signals send one matching photo per stock, freeze charts and persist deduplication', async () => {
   const cfg = seedPotentialScan();
   const photos = [];
   globalThis.fetch = async (url, options) => {
@@ -799,15 +800,29 @@ test('new potential signals send one photo with a short caption, freeze its char
   };
   try {
     await server.runBroadcast(cfg);
-    assert.equal(photos.length, 1);
+    assert.equal(photos.length, 2);
     assert.ok(photos[0].caption.length <= 1024);
     assert.match(photos[0].caption, /新潜力信号/);
+    const rows = db
+      .prepare('SELECT * FROM notification_outbox WHERE kind IS NULL ORDER BY id')
+      .all();
+    assert.equal(rows.length, 2);
+    for (const [index, row] of rows.entries()) {
+      const charts = JSON.parse(row.charts);
+      assert.equal(charts.length, 1);
+      assert.ok(photos[index].caption.includes(charts[0].code));
+      assert.doesNotMatch(
+        photos[index].caption,
+        new RegExp(charts[0].code === 'STRONG0' ? 'STRONG1' : 'STRONG0'),
+      );
+      assert.equal(photos[index].bytes.readUInt32BE(20), 620);
+    }
     const state = server.buildState();
-    assert.equal(state.potential_alert.codes.length, 2);
+    assert.equal(state.potential_alert.codes.length, 1);
     assert.equal(state.potential_alert.delivery, 'Telegram已发送');
     const image = await realFetch(base + state.potential_alert.image);
     assert.ok(image.headers.get('content-type').startsWith('image/png'));
-    assert.deepEqual(Buffer.from(await image.arrayBuffer()), photos[0].bytes);
+    assert.deepEqual(Buffer.from(await image.arrayBuffer()), photos.at(-1).bytes);
     const etag = image.headers.get('etag');
     assert.equal(
       (await realFetch(base + state.potential_alert.image, { headers: { 'If-None-Match': etag } }))
@@ -817,7 +832,7 @@ test('new potential signals send one photo with a short caption, freeze its char
     briefingClock('10:10:20', 2);
     saveConfig(cfg);
     await server.runBroadcast(cfg);
-    assert.equal(photos.length, 1);
+    assert.equal(photos.length, 2);
     assert.equal(db.prepare('SELECT COUNT(*) c FROM potential_pushes').get().c, 2);
     assert.equal(
       db
@@ -825,12 +840,12 @@ test('new potential signals send one photo with a short caption, freeze its char
           'SELECT COUNT(*) c FROM notification_outbox WHERE charts IS NOT NULL AND kind IS NULL',
         )
         .get().c,
-      1,
+      2,
     );
     db.prepare('UPDATE live SET price=20').run();
     saveConfig(cfg);
     const frozen = await realFetch(base + state.potential_alert.image);
-    assert.deepEqual(Buffer.from(await frozen.arrayBuffer()), photos[0].bytes);
+    assert.deepEqual(Buffer.from(await frozen.arrayBuffer()), photos.at(-1).bytes);
     assert.equal((await realFetch(base + '/api/potential-alerts/no/chart.png')).status, 401);
     assert.equal((await realFetch(base + '/api/stocks/UNKNOWN/chart.png')).status, 404);
   } finally {
@@ -839,8 +854,63 @@ test('new potential signals send one photo with a short caption, freeze its char
   }
 });
 
-test('failed photo retries the same frozen signal; expired photos are cancelled without a text fallback', async () => {
+test('pending combined potential images split into matching frozen messages without resetting deduplication', async () => {
   const cfg = seedPotentialScan();
+  try {
+    server.recordPotentialAlerts(cfg);
+    const rows = db.prepare('SELECT * FROM notification_outbox ORDER BY id').all();
+    const charts = rows.flatMap((row) => JSON.parse(row.charts));
+    const text = [...new Set(rows.flatMap((row) => row.text.split('\n\n')))].join('\n\n');
+    const id = rows[0].id;
+    const ts = rows[0].ts - 60;
+    db.prepare('UPDATE notification_outbox SET charts=?,text=?,ts=? WHERE id=?').run(
+      JSON.stringify(charts),
+      text,
+      ts,
+      id,
+    );
+    db.prepare('UPDATE potential_pushes SET outbox_id=?').run(id);
+    db.prepare('DELETE FROM notification_outbox WHERE id!=?').run(id);
+    db.prepare('UPDATE live SET price=20').run();
+    const sent = [];
+    globalThis.fetch = async (_url, options) => {
+      const caption = options.body.get('caption');
+      const code = caption.match(/STRONG\d/)[0];
+      assert.equal((caption.match(/STRONG\d/g) || []).length, 1);
+      assert.deepEqual(
+        Buffer.from(await options.body.get('photo').arrayBuffer()),
+        chartPng([charts.find((chart) => chart.code === code)]),
+      );
+      sent.push(code);
+      return Response.json({ ok: sent.length !== 1 });
+    };
+    await deliverOutbox(cfg);
+    await deliverOutbox(cfg);
+    await deliverOutbox(cfg);
+    assert.deepEqual(sent, [charts[0].code, charts[0].code, charts[1].code]);
+    const split = db.prepare('SELECT * FROM notification_outbox').all();
+    assert.equal(split.length, 2);
+    assert.ok(
+      split.every((row) => row.ts === ts && row.sent_at && JSON.parse(row.charts).length === 1),
+    );
+    assert.equal(
+      new Set(
+        db
+          .prepare('SELECT outbox_id FROM potential_pushes')
+          .all()
+          .map((row) => row.outbox_id),
+      ).size,
+      2,
+    );
+    assert.equal(server.recordPotentialAlerts(cfg), null);
+  } finally {
+    Date.now = () => fixed;
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('failed photo retries the same frozen signal; expired photos are cancelled without a text fallback', async () => {
+  const cfg = seedPotentialScan('10:05:20', 1);
   let attempts = 0;
   globalThis.fetch = async (url) => {
     assert.ok(String(url).endsWith('/sendPhoto'));
@@ -1032,17 +1102,17 @@ test('both notification types send images, including volume matches without OHLC
   };
   try {
     await server.runBroadcast(cfg);
-    assert.equal(sent.potential.length, 1);
-    assert.equal(sent.volume.length, 1);
+    assert.equal(sent.potential.length, 2);
+    assert.equal(sent.volume.length, 3);
     assert.doesNotMatch(sent.potential[0], /PLAINONLY/);
-    assert.match(sent.volume[0], /PLAINONLY/);
+    assert.equal(sent.volume.filter((text) => text.includes('PLAINONLY')).length, 1);
     assert.equal(db.prepare('SELECT COUNT(*) c FROM potential_pushes').get().c, 2);
     assert.equal(db.prepare('SELECT COUNT(*) c FROM volume_alerts').get().c, 3);
-    assert.equal(server.buildState().potential_alert.codes.length, 2);
+    assert.equal(server.buildState().potential_alert.codes.length, 1);
     assert.equal(server.buildState().volume_notifications.alerts.length, 3);
     await server.runBroadcast(cfg);
-    assert.equal(sent.potential.length, 1);
-    assert.equal(sent.volume.length, 1);
+    assert.equal(sent.potential.length, 2);
+    assert.equal(sent.volume.length, 3);
   } finally {
     Date.now = () => fixed;
     globalThis.fetch = realFetch;

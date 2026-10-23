@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
+import { chartPng } from '../lib/chart-image.js';
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'klse-tests-'));
 process.env.DATA_DIR = root;
 process.env.ADMIN_TOKEN = 'test-admin';
@@ -126,7 +127,7 @@ test('both volume gates apply without OHLC, long history or old strategy restric
   const matches = recordVolumeAlerts(config);
   assert.deepEqual(matches.map((s) => s.code).sort(), ['FOURTH', 'MINIMUM', 'OTHER', 'THIRD']);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM volume_alerts').get().n, 4);
-  assert.equal(db.prepare('SELECT COUNT(*) n FROM notification_outbox').get().n, 2);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM notification_outbox').get().n, 4);
   const text = db
     .prepare('SELECT text FROM notification_outbox')
     .all()
@@ -256,7 +257,7 @@ test('an older traded-day baseline needs a completed refresh to avoid treating m
   db.prepare('UPDATE universe SET history_success=?').run(fixed / 1000);
   assert.equal(recordVolumeAlerts().length, 1);
 });
-test('all volume matches receive real PNG analysis images in readable batches without a top-three limit', async () => {
+test('all volume matches receive one matching caption and PNG per stock without a top-three limit', async () => {
   reset();
   for (let i = 0; i < 100; i++) stock('STOCK' + String(i).padStart(3, '0'));
   scan(fixed / 1000, 100);
@@ -267,11 +268,23 @@ test('all volume matches receive real PNG analysis images in readable batches wi
     assert.ok(caption.length <= 1024);
     const bytes = Buffer.from(await options.body.get('photo').arrayBuffer());
     assert.equal(bytes.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
-    assert.ok(bytes.readUInt32BE(20) <= 1860);
+    assert.equal(bytes.readUInt32BE(20), 620);
+    assert.equal((caption.match(/STOCK\d{3}/g) || []).length, 1);
     calls.push(caption);
     return Response.json({ ok: true });
   };
   assert.equal(recordVolumeAlerts(telegram).length, 100);
+  const queued = db.prepare('SELECT * FROM notification_outbox').all();
+  assert.equal(queued.length, 100);
+  for (const row of queued) {
+    const charts = JSON.parse(row.charts);
+    assert.equal(charts.length, 1);
+    assert.ok(row.text.includes(charts[0].code));
+    assert.equal(
+      db.prepare('SELECT stock FROM volume_alerts WHERE outbox_id=?').get(row.id).stock,
+      charts[0].code,
+    );
+  }
   for (
     let round = 0;
     round < 20 &&
@@ -283,8 +296,12 @@ test('all volume matches receive real PNG analysis images in readable batches wi
     db.prepare('SELECT COUNT(*) n FROM notification_outbox WHERE sent_at IS NULL').get().n,
     0,
   );
+  assert.equal(calls.length, 100);
   for (let i = 0; i < 100; i++)
-    assert.ok(calls.join('\n').includes('STOCK' + String(i).padStart(3, '0')));
+    assert.equal(
+      calls.filter((text) => text.includes('STOCK' + String(i).padStart(3, '0'))).length,
+      1,
+    );
   assert.equal(recordVolumeAlerts(telegram).length, 0);
 });
 test('image failures retry the frozen caption and PNG; expired notices stop and disabled notices stay on the web', async () => {
@@ -571,7 +588,7 @@ test('volume image is publicly viewable, frozen after quotes change and separate
   );
 });
 
-test('legacy text batches upgrade into readable image batches once, preserving every stock and its original time', async () => {
+test('legacy text batches split into one image message per stock once, preserving every stock and its original time', async () => {
   reset();
   for (let i = 0; i < 7; i++) stock('LEGACY' + i);
   scan(fixed / 1000, 7);
@@ -603,15 +620,65 @@ test('legacy text batches upgrade into readable image batches once, preserving e
   await deliverOutbox(telegram);
   await deliverOutbox(telegram);
   await deliverOutbox(telegram);
-  assert.equal(sent.length, 3);
+  assert.equal(sent.length, 7);
   for (let i = 0; i < 7; i++)
     assert.equal(sent.filter((text) => text.includes('LEGACY' + i)).length, 1);
   const records = db.prepare('SELECT * FROM notification_outbox').all();
-  assert.equal(records.length, 3);
+  assert.equal(records.length, 7);
   assert.ok(
     records.every(
-      (row) => row.ts === fixed / 1000 && row.sent_at && JSON.parse(row.charts).length <= 3,
+      (row) => row.ts === fixed / 1000 && row.sent_at && JSON.parse(row.charts).length === 1,
     ),
+  );
+  assert.equal(recordVolumeAlerts(telegram).length, 0);
+});
+
+test('pending combined volume images split into frozen per-stock messages and retry only the failed stock', async () => {
+  reset();
+  for (let i = 0; i < 3; i++) stock('FROZEN' + i);
+  scan(fixed / 1000, 3);
+  recordVolumeAlerts(telegram);
+  const rows = db.prepare('SELECT * FROM notification_outbox ORDER BY id').all();
+  const charts = rows.flatMap((row) => JSON.parse(row.charts));
+  const id = rows[0].id;
+  const ts = fixed / 1000 - 60;
+  db.prepare('UPDATE notification_outbox SET charts=?,ts=? WHERE id=?').run(
+    JSON.stringify(charts),
+    ts,
+    id,
+  );
+  db.prepare('UPDATE volume_alerts SET outbox_id=?,ts=?').run(id, ts);
+  db.prepare('DELETE FROM notification_outbox WHERE id!=?').run(id);
+  db.prepare('UPDATE live SET volume=9000000').run();
+  const sent = [];
+  globalThis.fetch = async (_url, options) => {
+    const caption = options.body.get('caption');
+    const code = caption.match(/FROZEN\d/)[0];
+    assert.equal((caption.match(/FROZEN\d/g) || []).length, 1);
+    assert.deepEqual(
+      Buffer.from(await options.body.get('photo').arrayBuffer()),
+      chartPng([charts.find((chart) => chart.code === code)]),
+    );
+    sent.push(code);
+    return Response.json({ ok: sent.length !== 1 });
+  };
+  await deliverOutbox(telegram);
+  await deliverOutbox(telegram);
+  await deliverOutbox(telegram);
+  assert.deepEqual(sent, ['FROZEN0', 'FROZEN0', 'FROZEN1', 'FROZEN2']);
+  const split = db.prepare('SELECT * FROM notification_outbox').all();
+  assert.equal(split.length, 3);
+  assert.ok(
+    split.every((row) => row.ts === ts && row.sent_at && JSON.parse(row.charts).length === 1),
+  );
+  assert.equal(
+    new Set(
+      db
+        .prepare('SELECT outbox_id FROM volume_alerts')
+        .all()
+        .map((row) => row.outbox_id),
+    ).size,
+    3,
   );
   assert.equal(recordVolumeAlerts(telegram).length, 0);
 });

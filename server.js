@@ -1736,44 +1736,46 @@ function recordPotentialAlerts(cfg = loadConfig()) {
     .filter((r) => r.chart.rows.length >= 20)
     .slice(0, 3);
   if (!picks.length) return null;
-  const charts = picks.map((r) => r.chart);
-  const text = [
-    '🔎 新潜力信号 · ' + date,
-    ...picks.map(
-      ({ report: r }) =>
-        `${r.code} · RM ${+r.price.toFixed(3)} · ${(r.volume / 10000).toFixed(2)}万股 · 昨日${r.volume_signal.multiple.toFixed(2)}倍\n${conciseReason(r)}`,
-    ),
-    '实心箭头＝策略买点；空心箭头＝待突破。盘中未收盘，不保证上涨。',
-    process.env.PUBLIC_URL || 'https://synthe-fantasia.site/',
-  ].join('\n\n');
-  if (text.length > 1024) throw new Error('图文说明超过Telegram图片说明长度');
   db.exec('SAVEPOINT potential_alert');
   try {
-    const id = Number(
-      db
-        .prepare(
-          'INSERT INTO notification_outbox(ts,text,charts,cancelled_at,last_error) VALUES(?,?,?,?,?)',
-        )
-        .run(
-          Math.floor(now),
-          text,
-          JSON.stringify(charts),
-          cfg.potential_alerts_telegram === false ||
-            !(cfg.telegram_bot_token && cfg.telegram_chat_id)
-            ? Math.floor(now)
-            : null,
-          cfg.potential_alerts_telegram === false ||
-            !(cfg.telegram_bot_token && cfg.telegram_chat_id)
-            ? '仅网页'
-            : null,
-        ).lastInsertRowid,
-    );
-    for (const item of picks)
+    let notice;
+    for (const item of picks) {
+      const charts = [item.chart];
+      const r = item.report;
+      const text = [
+        '🔎 新潜力信号 · ' + date,
+        `${r.code} · RM ${+r.price.toFixed(3)} · ${(r.volume / 10000).toFixed(2)}万股 · 昨日${r.volume_signal.multiple.toFixed(2)}倍\n${conciseReason(r)}`,
+        '实心箭头＝策略买点；空心箭头＝待突破。盘中未收盘，不保证上涨。',
+        process.env.PUBLIC_URL || 'https://synthe-fantasia.site/',
+      ].join('\n\n');
+      if (text.length > 1024) throw new Error('图文说明超过Telegram图片说明长度');
+
+      const id = Number(
+        db
+          .prepare(
+            'INSERT INTO notification_outbox(ts,text,charts,cancelled_at,last_error) VALUES(?,?,?,?,?)',
+          )
+          .run(
+            Math.floor(now),
+            text,
+            JSON.stringify(charts),
+            cfg.potential_alerts_telegram === false ||
+              !(cfg.telegram_bot_token && cfg.telegram_chat_id)
+              ? Math.floor(now)
+              : null,
+            cfg.potential_alerts_telegram === false ||
+              !(cfg.telegram_bot_token && cfg.telegram_chat_id)
+              ? '仅网页'
+              : null,
+          ).lastInsertRowid,
+      );
       db.prepare(
         'INSERT INTO potential_pushes(key,stock,date,kind,created_at,outbox_id) VALUES(?,?,?,?,?,?)',
       ).run(item.key, item.report.code, date, item.report.potential_signal.kind, now, id);
+      notice = { id, text, charts };
+    }
     db.exec('RELEASE potential_alert');
-    return { id, text, charts };
+    return notice;
   } catch (error) {
     db.exec('ROLLBACK TO potential_alert');
     db.exec('RELEASE potential_alert');
@@ -1805,6 +1807,52 @@ function potentialAlertState() {
               : '等待发送',
       }
     : null;
+}
+
+// Preserve frozen images and per-stock text when upgrading pending combined notices.
+function preparePotentialNotice(item) {
+  const charts = JSON.parse(item.charts);
+  if (charts.length <= 1) return;
+  const paragraphs = item.text.split('\n\n');
+  db.exec('SAVEPOINT potential_notice_split');
+  try {
+    for (const [index, chart] of charts.entries()) {
+      const text = paragraphs
+        .filter(
+          (paragraph) =>
+            !charts.some((other) => paragraph.startsWith(`${other.code} · `)) ||
+            paragraph.startsWith(`${chart.code} · `),
+        )
+        .join('\n\n');
+      const frozen = JSON.stringify([chart]);
+      let id = item.id;
+      if (index === 0) {
+        db.prepare('UPDATE notification_outbox SET text=?,charts=? WHERE id=?').run(
+          text,
+          frozen,
+          id,
+        );
+        item.text = text;
+        item.charts = frozen;
+      } else {
+        id = Number(
+          db
+            .prepare('INSERT INTO notification_outbox(ts,text,charts) VALUES(?,?,?)')
+            .run(item.ts, text, frozen).lastInsertRowid,
+        );
+        db.prepare('UPDATE potential_pushes SET outbox_id=? WHERE outbox_id=? AND stock=?').run(
+          id,
+          item.id,
+          chart.code,
+        );
+      }
+    }
+    db.exec('RELEASE potential_notice_split');
+  } catch (error) {
+    db.exec('ROLLBACK TO potential_notice_split');
+    db.exec('RELEASE potential_notice_split');
+    throw error;
+  }
 }
 
 async function sendTelegramChart(caption, charts, cfg) {
@@ -1877,6 +1925,7 @@ function deliverOutbox(cfg = loadConfig()) {
         );
         continue;
       }
+      if (item.kind !== 'volume' && item.charts) preparePotentialNotice(item);
       const result = item.charts
         ? await sendTelegramChart(item.text, JSON.parse(item.charts), cfg)
         : await sendTelegramText(item.text, cfg);
