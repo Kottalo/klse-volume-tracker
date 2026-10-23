@@ -28,7 +28,7 @@ const time = (v) =>
 const change = (s) => (s.prevClose > 0 ? (s.price / s.prevClose - 1) * 100 : null);
 const navItems = [
   ['overview', 'grid', '图文精选'],
-  ['volume', 'bell', '文字放量'],
+  ['volume', 'bell', '放量分析'],
   ['market', 'chart', '全市场'],
   ['watch', 'star', '我的关注'],
   ['alerts', 'bell', '异动提醒'],
@@ -223,7 +223,7 @@ export default function App() {
   };
   const subtitles = {
     overview: '原版图文通知：分析蓄势、转强与突破，附K线及策略买点。',
-    volume: '独立文字通知：今日量至少100万股且达到昨日3倍，无形态和排名限制。',
+    volume: '独立放量通知：今日量至少100万股且达到昨日3倍，附成交量对比和真实K线分析图。',
     market: '搜索公司或代码，点开股票查看分析依据。',
     watch: '你的关注保存在当前浏览器；系统观察记录用于跟踪规则表现。',
     alerts: '异动是研究的起点。价格变化本身不等于买入理由。',
@@ -1601,7 +1601,7 @@ function VolumeNotifications({ data, open }) {
   return (
     <section className="panel market-panel">
       <div className="section-heading volume-heading">
-        <h2>文字通知 · 三倍量＋100万股</h2>
+        <h2>放量通知 · 三倍量＋100万股</h2>
         <span className="muted">当前达标 {candidates.length} 只</span>
       </div>
       <p className="volume-rule">
@@ -1612,7 +1612,7 @@ function VolumeNotifications({ data, open }) {
         <label className="search">
           <Icon name="search" size={18} />
           <input
-            aria-label="搜索文字通知股票"
+            aria-label="搜索放量通知股票"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="搜索代码或公司名称"
@@ -1620,10 +1620,10 @@ function VolumeNotifications({ data, open }) {
         </label>
         <label className="sort-label">
           查看
-          <select value={tab} onChange={(e) => setTab(e.target.value)} aria-label="文字通知列表">
+          <select value={tab} onChange={(e) => setTab(e.target.value)} aria-label="放量通知列表">
             <option value="qualified">当前达标</option>
             <option value="all">全部成交量</option>
-            <option value="history">文字通知记录</option>
+            <option value="history">放量通知记录</option>
           </select>
         </label>
       </div>
@@ -1636,6 +1636,7 @@ function VolumeNotifications({ data, open }) {
               <th>昨日量（股）</th>
               <th>昨日倍数</th>
               <th>{tab === 'history' ? '发送状态' : '资料日期'}</th>
+              {tab === 'history' && <th>分析图</th>}
             </tr>
           </thead>
           <tbody>
@@ -1672,6 +1673,17 @@ function VolumeNotifications({ data, open }) {
                     : s.issue || s.date || '等待资料'}
                   {tab === 'history' && <span className="volume-time">{time(s.ts)}</span>}
                 </td>
+                {tab === 'history' && (
+                  <td>
+                    {s.image ? (
+                      <a href={s.image} target="_blank" rel="noreferrer">
+                        查看分析图 ↗
+                      </a>
+                    ) : (
+                      '旧记录'
+                    )}
+                  </td>
+                )}
               </tr>
             ))}
           </tbody>
@@ -1679,7 +1691,7 @@ function VolumeNotifications({ data, open }) {
       </div>
       {!rows.length && (
         <Empty
-          title={tab === 'history' ? '暂无文字通知' : '暂无达标股票'}
+          title={tab === 'history' ? '暂无放量通知' : '暂无达标股票'}
           text="只核对百万股与三倍量，不用形态或涨幅补入。"
         />
       )}
@@ -1801,7 +1813,7 @@ function AdminSettings({ state, close, updated }) {
               checked={draft.volume_alerts_telegram !== false}
               onChange={(e) => setDraft({ ...draft, volume_alerts_telegram: e.target.checked })}
             />
-            文字通知：三倍量＋100万股
+            放量通知：三倍量＋100万股（附分析图）
           </label>
           <label>
             Telegram Bot Token
@@ -1822,7 +1834,7 @@ function AdminSettings({ state, close, updated }) {
             />
           </label>
           <p className="data-note">
-            两类通知独立开关、独立去重，可同时发送。上面的分析参数只影响图文精选，不影响文字筛选。固定每5分钟扫描。
+            两类通知独立开关、独立去重，可同时发送。上面的分析参数只影响图文精选，不影响放量筛选。固定每5分钟扫描。
           </p>
         </div>
         <p className="data-note">

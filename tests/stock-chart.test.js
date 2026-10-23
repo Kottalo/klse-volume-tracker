@@ -46,3 +46,40 @@ test('the same chart renders to a real, portable PNG with the bundled Chinese fo
   assert.equal(png.readUInt32BE(20), 1240);
   assert.match(combinedChartSvg(models), /translate\(0,620\)/);
 });
+
+test('volume analysis uses real candles when available and always compares today with yesterday', async () => {
+  const { volumeChartModel } = await import('../lib/stock-chart.js');
+  const stock = {
+    code: 'VOLUME<&',
+    date: '2026-10-16',
+    volume: 1500000,
+    previous_volume: 500000,
+    previous_date: '2026-10-15',
+    multiple: 3,
+  };
+  const model = volumeChartModel(stock, report.history, {
+    price: 1.05,
+    open: 0.98,
+    high: 1.06,
+    low: 0.97,
+  });
+  assert.equal(model.rows.length, 3);
+  assert.equal(model.marker, null);
+  const svg = chartSvg(model);
+  assert.match(svg, /1,500,000 股/);
+  assert.match(svg, /500,000 股/);
+  assert.match(svg, /3.00倍/);
+  assert.match(svg, /VOLUME&lt;&amp;/);
+  assert.doesNotMatch(svg, /2026-10-19|NaN|Infinity/);
+  const fallback = volumeChartModel(stock, [], {});
+  assert.equal(fallback.rows.length, 0);
+  const fallbackSvg = chartSvg(fallback);
+  assert.match(fallbackSvg, /1,500,000 股/);
+  assert.match(fallbackSvg, /500,000 股/);
+  assert.match(fallbackSvg, /完整OHLC不足/);
+  assert.doesNotMatch(fallbackSvg, /NaN|Infinity/);
+  assert.doesNotMatch(chartSvg(volumeChartModel(stock, report.history, {})), /NaN|Infinity/);
+  const png = Buffer.from(chartPng([fallback]));
+  assert.equal(png.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+  assert.equal(png.readUInt32BE(20), 620);
+});

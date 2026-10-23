@@ -788,7 +788,7 @@ test('new potential signals send one photo with a short caption, freeze its char
   const cfg = seedPotentialScan();
   const photos = [];
   globalThis.fetch = async (url, options) => {
-    if (String(url).includes('/sendPhoto')) {
+    if (String(url).includes('/sendPhoto') && options.body.get('caption').startsWith('🔎')) {
       assert.ok(options.body instanceof FormData);
       photos.push({
         caption: options.body.get('caption'),
@@ -820,7 +820,11 @@ test('new potential signals send one photo with a short caption, freeze its char
     assert.equal(photos.length, 1);
     assert.equal(db.prepare('SELECT COUNT(*) c FROM potential_pushes').get().c, 2);
     assert.equal(
-      db.prepare('SELECT COUNT(*) c FROM notification_outbox WHERE charts IS NOT NULL').get().c,
+      db
+        .prepare(
+          'SELECT COUNT(*) c FROM notification_outbox WHERE charts IS NOT NULL AND kind IS NULL',
+        )
+        .get().c,
       1,
     );
     db.prepare('UPDATE live SET price=20').run();
@@ -1005,7 +1009,12 @@ test('legacy fixed-time settings are disabled and the whole-market poll is throt
   }
 });
 
-test('both notification types send independently and text also includes stocks without chart history', async () => {
+function notificationType(url, options) {
+  if (!String(url).endsWith('/sendPhoto')) return null;
+  return options.body.get('caption').startsWith('📊') ? 'volume' : 'potential';
+}
+
+test('both notification types send images, including volume matches without OHLC history', async () => {
   const cfg = seedPotentialScan();
   quote('PLAINONLY', 0.25, 1500000);
   db.prepare('INSERT INTO daily_vol(stock,date,volume) VALUES(?,?,?)').run(
@@ -1014,59 +1023,55 @@ test('both notification types send independently and text also includes stocks w
     500000,
   );
   briefingClock('10:05:20', 3);
-  const sent = { photos: [], texts: [] };
+  const sent = { potential: [], volume: [] };
   globalThis.fetch = async (url, options) => {
-    if (String(url).endsWith('/sendPhoto')) sent.photos.push(options.body.get('caption'));
-    if (String(url).endsWith('/sendMessage')) sent.texts.push(JSON.parse(options.body).text);
+    assert.ok(!String(url).endsWith('/sendMessage'));
+    const type = notificationType(url, options);
+    if (type) sent[type].push(options.body.get('caption'));
     return Response.json({ ok: true });
   };
   try {
     await server.runBroadcast(cfg);
-    assert.equal(sent.photos.length, 1);
-    assert.equal(sent.texts.length, 1);
-    assert.doesNotMatch(sent.photos[0], /PLAINONLY/);
-    assert.match(sent.texts[0], /PLAINONLY/);
-    assert.match(sent.texts[0], /三倍量＋100万股/);
+    assert.equal(sent.potential.length, 1);
+    assert.equal(sent.volume.length, 1);
+    assert.doesNotMatch(sent.potential[0], /PLAINONLY/);
+    assert.match(sent.volume[0], /PLAINONLY/);
     assert.equal(db.prepare('SELECT COUNT(*) c FROM potential_pushes').get().c, 2);
     assert.equal(db.prepare('SELECT COUNT(*) c FROM volume_alerts').get().c, 3);
-    assert.equal(
-      server.buildState().volume_notifications.stocks.filter((s) => s.qualified).length,
-      3,
-    );
+    assert.equal(server.buildState().potential_alert.codes.length, 2);
+    assert.equal(server.buildState().volume_notifications.alerts.length, 3);
     await server.runBroadcast(cfg);
-    assert.equal(sent.photos.length, 1);
-    assert.equal(sent.texts.length, 1);
+    assert.equal(sent.potential.length, 1);
+    assert.equal(sent.volume.length, 1);
   } finally {
     Date.now = () => fixed;
     globalThis.fetch = realFetch;
   }
 });
 
-test('failure of either notification type cannot block delivery or deduplication of the other', async () => {
-  for (const failed of ['photo', 'text']) {
+test('failure of either image notification type cannot block delivery or deduplication of the other', async () => {
+  for (const failed of ['potential', 'volume']) {
     const cfg = seedPotentialScan('10:05:20', 1);
-    const attempts = { photo: 0, text: 0 };
+    const attempts = { potential: 0, volume: 0 };
     let retry = false;
-    globalThis.fetch = async (url) => {
-      const type = String(url).endsWith('/sendPhoto')
-        ? 'photo'
-        : String(url).endsWith('/sendMessage')
-          ? 'text'
-          : null;
+    globalThis.fetch = async (url, options) => {
+      const type = notificationType(url, options);
       if (type) attempts[type]++;
       return Response.json({ ok: !type || retry || type !== failed });
     };
     try {
       await server.runBroadcast(cfg);
-      const photo = db.prepare('SELECT * FROM notification_outbox WHERE charts IS NOT NULL').get();
-      const text = db.prepare("SELECT * FROM notification_outbox WHERE kind='volume'").get();
-      assert.equal(!!photo.sent_at, failed !== 'photo');
-      assert.equal(!!text.sent_at, failed !== 'text');
-      assert.deepEqual(attempts, { photo: 1, text: 1 });
+      const potential = db
+        .prepare('SELECT * FROM notification_outbox WHERE charts IS NOT NULL AND kind IS NULL')
+        .get();
+      const volume = db.prepare("SELECT * FROM notification_outbox WHERE kind='volume'").get();
+      assert.equal(!!potential.sent_at, failed !== 'potential');
+      assert.equal(!!volume.sent_at, failed !== 'volume');
+      assert.deepEqual(attempts, { potential: 1, volume: 1 });
       retry = true;
       await deliverOutbox(cfg);
       assert.equal(attempts[failed], 2);
-      assert.equal(attempts[failed === 'photo' ? 'text' : 'photo'], 1);
+      assert.equal(attempts[failed === 'potential' ? 'volume' : 'potential'], 1);
       assert.equal(
         db.prepare('SELECT COUNT(*) c FROM notification_outbox WHERE sent_at IS NULL').get().c,
         0,
@@ -1078,19 +1083,19 @@ test('failure of either notification type cannot block delivery or deduplication
   }
 });
 
-test('each Telegram switch controls only its notification type and text ignores graphic screening settings', async () => {
+test('independent switches still control only their own image notification type', async () => {
   for (const disabled of ['potential_alerts_telegram', 'volume_alerts_telegram', 'screen_on']) {
     const cfg = { ...seedPotentialScan('10:05:20', 1), [disabled]: false };
     saveConfig(cfg);
     const sent = [];
-    globalThis.fetch = async (url) => {
-      if (String(url).endsWith('/sendPhoto')) sent.push('photo');
-      if (String(url).endsWith('/sendMessage')) sent.push('text');
+    globalThis.fetch = async (url, options) => {
+      const type = notificationType(url, options);
+      if (type) sent.push(type);
       return Response.json({ ok: true });
     };
     try {
       await server.runBroadcast(cfg);
-      assert.deepEqual(sent, disabled === 'volume_alerts_telegram' ? ['photo'] : ['text']);
+      assert.deepEqual(sent, disabled === 'volume_alerts_telegram' ? ['potential'] : ['volume']);
     } finally {
       Date.now = () => fixed;
       globalThis.fetch = realFetch;

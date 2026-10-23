@@ -126,8 +126,12 @@ test('both volume gates apply without OHLC, long history or old strategy restric
   const matches = recordVolumeAlerts(config);
   assert.deepEqual(matches.map((s) => s.code).sort(), ['FOURTH', 'MINIMUM', 'OTHER', 'THIRD']);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM volume_alerts').get().n, 4);
-  assert.equal(db.prepare('SELECT COUNT(*) n FROM notification_outbox').get().n, 1);
-  const text = db.prepare('SELECT text FROM notification_outbox').get().text;
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM notification_outbox').get().n, 2);
+  const text = db
+    .prepare('SELECT text FROM notification_outbox')
+    .all()
+    .map((r) => r.text)
+    .join('\n');
   assert.match(text, /MINIMUM/);
   assert.doesNotMatch(text, /TINY|BELOW|ZERO|MISSING/);
   assert.match(text, /FOURTH/);
@@ -193,8 +197,8 @@ test('legacy pending notices exclude sub-million stocks without blocking their l
   const belowOnly = queue(['ALONE']);
   const sent = [];
   globalThis.fetch = async (url, options) => {
-    assert.ok(String(url).endsWith('/sendMessage'));
-    sent.push(JSON.parse(options.body).text);
+    assert.ok(String(url).endsWith('/sendPhoto'));
+    sent.push(options.body.get('caption'));
     return Response.json({ ok: true });
   };
   await deliverOutbox(telegram);
@@ -252,21 +256,29 @@ test('an older traded-day baseline needs a completed refresh to avoid treating m
   db.prepare('UPDATE universe SET history_success=?').run(fixed / 1000);
   assert.equal(recordVolumeAlerts().length, 1);
 });
-test('all matches are batched as short plain text, without image calls or a top-three limit', async () => {
+test('all volume matches receive real PNG analysis images in readable batches without a top-three limit', async () => {
   reset();
   for (let i = 0; i < 100; i++) stock('STOCK' + String(i).padStart(3, '0'));
   scan(fixed / 1000, 100);
   const calls = [];
   globalThis.fetch = async (url, options) => {
-    assert.ok(String(url).endsWith('/sendMessage'));
-    const body = JSON.parse(options.body);
-    assert.ok(body.text.length <= 4000);
-    assert.equal(body.photo, undefined);
-    calls.push(body.text);
+    assert.ok(String(url).endsWith('/sendPhoto'));
+    const caption = options.body.get('caption');
+    assert.ok(caption.length <= 1024);
+    const bytes = Buffer.from(await options.body.get('photo').arrayBuffer());
+    assert.equal(bytes.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+    assert.ok(bytes.readUInt32BE(20) <= 1860);
+    calls.push(caption);
     return Response.json({ ok: true });
   };
   assert.equal(recordVolumeAlerts(telegram).length, 100);
-  await deliverOutbox(telegram);
+  for (
+    let round = 0;
+    round < 20 &&
+    db.prepare('SELECT COUNT(*) n FROM notification_outbox WHERE sent_at IS NULL').get().n;
+    round++
+  )
+    await deliverOutbox(telegram);
   assert.equal(
     db.prepare('SELECT COUNT(*) n FROM notification_outbox WHERE sent_at IS NULL').get().n,
     0,
@@ -275,17 +287,22 @@ test('all matches are batched as short plain text, without image calls or a top-
     assert.ok(calls.join('\n').includes('STOCK' + String(i).padStart(3, '0')));
   assert.equal(recordVolumeAlerts(telegram).length, 0);
 });
-test('text failures retry the frozen notice and old notices expire; disabling Telegram retains web records', async () => {
+test('image failures retry the frozen caption and PNG; expired notices stop and disabled notices stay on the web', async () => {
   reset();
   stock();
   scan();
   recordVolumeAlerts(telegram);
   const original = db.prepare('SELECT text FROM notification_outbox').get().text;
-  globalThis.fetch = async () => Response.json({ ok: false });
+  let originalImage;
+  globalThis.fetch = async (_url, options) => {
+    originalImage = Buffer.from(await options.body.get('photo').arrayBuffer());
+    return Response.json({ ok: false });
+  };
   await deliverOutbox(telegram);
   assert.equal(db.prepare('SELECT attempts FROM notification_outbox').get().attempts, 1);
   globalThis.fetch = async (_url, options) => {
-    assert.equal(JSON.parse(options.body).text, original);
+    assert.equal(options.body.get('caption'), original);
+    assert.deepEqual(Buffer.from(await options.body.get('photo').arrayBuffer()), originalImage);
     return Response.json({ ok: true });
   };
   db.prepare('UPDATE live SET volume=4500000').run();
@@ -526,4 +543,75 @@ test('migration preserves old data and both pending notification types', () => {
   } finally {
     fs.rmSync(migration, { recursive: true, force: true });
   }
+});
+
+test('volume image is publicly viewable, frozen after quotes change and separate from potential images', async () => {
+  reset();
+  stock();
+  scan();
+  recordVolumeAlerts();
+  const state = server.buildState();
+  assert.equal(state.potential_alert, null);
+  const image = state.volume_notifications.alerts[0].image;
+  assert.match(image, /^\/api\/volume-alerts\/\d+\/chart.png$/);
+  const response = await realFetch(base + image);
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-type'), /^image\/png/);
+  const original = Buffer.from(await response.arrayBuffer());
+  const etag = response.headers.get('etag');
+  db.prepare('UPDATE live SET volume=4500000').run();
+  db.prepare('UPDATE daily_vol SET volume=100').run();
+  const unchanged = await realFetch(base + image);
+  assert.deepEqual(Buffer.from(await unchanged.arrayBuffer()), original);
+  assert.equal(unchanged.headers.get('etag'), etag);
+  assert.equal((await realFetch(base + image, { headers: { 'If-None-Match': etag } })).status, 304);
+  assert.equal(
+    (await realFetch(base + image.replace('/volume-alerts/', '/potential-alerts/'))).status,
+    404,
+  );
+});
+
+test('legacy text batches upgrade into readable image batches once, preserving every stock and its original time', async () => {
+  reset();
+  for (let i = 0; i < 7; i++) stock('LEGACY' + i);
+  scan(fixed / 1000, 7);
+  const id = Number(
+    db
+      .prepare("INSERT INTO notification_outbox(ts,text,kind) VALUES(?,'legacy text','volume')")
+      .run(fixed / 1000).lastInsertRowid,
+  );
+  for (const row of getStocks())
+    db.prepare(
+      'INSERT INTO volume_alerts(stock,date,volume,previous_volume,previous_date,multiple,ts,outbox_id) VALUES(?,?,?,?,?,?,?,?)',
+    ).run(
+      row.code,
+      row.date,
+      row.volume,
+      row.previous_volume,
+      row.previous_date,
+      row.multiple,
+      fixed / 1000,
+      id,
+    );
+  const sent = [];
+  globalThis.fetch = async (url, options) => {
+    assert.ok(String(url).endsWith('/sendPhoto'));
+    assert.ok(options.body.get('caption').length <= 1024);
+    sent.push(options.body.get('caption'));
+    return Response.json({ ok: true });
+  };
+  await deliverOutbox(telegram);
+  await deliverOutbox(telegram);
+  await deliverOutbox(telegram);
+  assert.equal(sent.length, 3);
+  for (let i = 0; i < 7; i++)
+    assert.equal(sent.filter((text) => text.includes('LEGACY' + i)).length, 1);
+  const records = db.prepare('SELECT * FROM notification_outbox').all();
+  assert.equal(records.length, 3);
+  assert.ok(
+    records.every(
+      (row) => row.ts === fixed / 1000 && row.sent_at && JSON.parse(row.charts).length <= 3,
+    ),
+  );
+  assert.equal(recordVolumeAlerts(telegram).length, 0);
 });

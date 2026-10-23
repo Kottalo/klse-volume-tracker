@@ -48,7 +48,7 @@ const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 const DB_PATH = path.join(DATA_DIR, 'data.db');
 const DIST = path.join(__dirname, 'dist');
 const PORT = process.env.PORT || 8080;
-const VERSION = 'v3.1-dual-notifications';
+const VERSION = 'v3.2-volume-analysis-images';
 let analysisCache = null;
 
 const DEFAULTS = {
@@ -1167,7 +1167,7 @@ function cmdHelp() {
     '/stock <代码>   查单只股票现在的完整情况',
     '/screen         强势筛选: 20日涨15-25% + 放量3倍 + 站上MA5 + 四线多头排列',
     '/top            只看今日图文精选',
-    '/volume         三倍量＋100万股，独立文字筛选',
+    '/volume         三倍量＋100万股，独立放量分析图',
     '/watch [all]    观察名单及成绩',
     '/stats          规则观察结果',
     '/set <项> <值>  改参数, 例: /set pick_count 2',
@@ -1520,7 +1520,7 @@ async function pollTelegram() {
       const cmds = [
         { command: 'stock', description: '查单只股票(例 /stock MAYBANK)' },
         { command: 'top', description: '潜力精选（图文策略）' },
-        { command: 'volume', description: '三倍量＋100万股（文字通知）' },
+        { command: 'volume', description: '三倍量＋100万股（附分析图）' },
         { command: 'watch', description: '观察名单及成绩' },
         { command: 'stats', description: '规则观察结果' },
         { command: 'params', description: '查看当前所有参数' },
@@ -1784,7 +1784,7 @@ function recordPotentialAlerts(cfg = loadConfig()) {
 function potentialAlertState() {
   const row = db
     .prepare(
-      'SELECT id,ts,text,sent_at,attempts,cancelled_at,last_error,charts FROM notification_outbox WHERE charts IS NOT NULL ORDER BY id DESC LIMIT 1',
+      "SELECT id,ts,text,sent_at,attempts,cancelled_at,last_error,charts FROM notification_outbox WHERE charts IS NOT NULL AND (kind IS NULL OR kind!='volume') ORDER BY id DESC LIMIT 1",
     )
     .get();
   return row
@@ -1848,7 +1848,7 @@ function deliverOutbox(cfg = loadConfig()) {
     ];
     for (const item of pending) {
       if (
-        (item.charts && cfg.potential_alerts_telegram === false) ||
+        (item.kind !== 'volume' && item.charts && cfg.potential_alerts_telegram === false) ||
         (item.kind === 'volume' && cfg.volume_alerts_telegram === false)
       ) {
         db.prepare('UPDATE notification_outbox SET cancelled_at=?,last_error=? WHERE id=?').run(
@@ -1883,7 +1883,7 @@ function deliverOutbox(cfg = loadConfig()) {
       db.prepare(
         'UPDATE notification_outbox SET attempts=attempts+1,sent_at=?,last_error=? WHERE id=?',
       ).run(result.ok ? Math.floor(Date.now() / 1000) : null, result.error || null, item.id);
-      // A failed photo must not block the independent text notification, or vice versa.
+      // A failure of one notification type must not block the other.
     }
     if (pending.length && clients.size) broadcast();
   })().finally(() => {
@@ -2936,7 +2936,18 @@ app.get('/api/stocks/:code/chart.png', (req, res) => {
 app.get('/api/potential-alerts/:id/chart.png', (req, res) => {
   if (!/^\d+$/.test(req.params.id)) return res.status(404).end();
   const row = db
-    .prepare('SELECT charts FROM notification_outbox WHERE id=? AND charts IS NOT NULL')
+    .prepare(
+      "SELECT charts FROM notification_outbox WHERE id=? AND charts IS NOT NULL AND (kind IS NULL OR kind!='volume')",
+    )
+    .get(req.params.id);
+  if (!row) return res.status(404).end();
+  serveChart(req, res, JSON.parse(row.charts));
+});
+app.get('/api/volume-alerts/:id/chart.png', (req, res) => {
+  const row = db
+    .prepare(
+      "SELECT charts FROM notification_outbox WHERE id=? AND kind='volume' AND charts IS NOT NULL",
+    )
     .get(req.params.id);
   if (!row) return res.status(404).end();
   serveChart(req, res, JSON.parse(row.charts));
