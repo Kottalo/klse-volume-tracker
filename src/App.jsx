@@ -607,7 +607,10 @@ export default function App() {
                   </>
                 )}
                 {page === 'volume' && (
-                  <VolumeNotifications data={state.volume_notifications} open={setSelected} />
+                  <>
+                    <GainNotifications data={state.gain_notifications} />
+                    <VolumeNotifications data={state.volume_notifications} open={setSelected} />
+                  </>
                 )}
                 {page === 'market' && (
                   <MarketTable
@@ -1587,6 +1590,58 @@ function Method() {
   );
 }
 
+function GainNotifications({ data }) {
+  return (
+    <section className="panel market-panel">
+      <div className="section-heading">
+        <h2>涨幅通知 · 5%–10%</h2>
+      </div>
+      <p className="volume-rule">
+        Pick A Stock 当日 Gain%
+        前30名，含5%和10%。每只每天一次，附真实K线；不要求三倍量。行情不一致或K线不足时等待资料。
+      </p>
+      {!data?.alerts?.length ? (
+        <p className="muted">暂无涨幅通知记录</p>
+      ) : (
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>股票</th>
+                <th>现价</th>
+                <th>涨幅</th>
+                <th>通知时间</th>
+                <th>发送状态</th>
+                <th>K线</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.alerts.map((s) => (
+                <tr key={s.stock + s.date}>
+                  <td>
+                    <strong>{s.stock}</strong>
+                  </td>
+                  <td>RM {number(s.price, 3)}</td>
+                  <td>+{number(s.gain)}%</td>
+                  <td>{time(s.ts)}</td>
+                  <td>
+                    {s.sent_at ? '已发送' : s.cancelled_at ? s.last_error || '仅网页' : '等待发送'}
+                  </td>
+                  <td>
+                    <a href={s.image} target="_blank" rel="noreferrer">
+                      查看K线 ↗
+                    </a>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function VolumeNotifications({ data, open }) {
   const [tab, setTab] = useState('qualified'),
     [query, setQuery] = useState('');
@@ -1741,6 +1796,7 @@ function AdminSettings({ state, close, updated }) {
     patch.screen_on = draft.screen_on;
     patch.potential_alerts_telegram = draft.potential_alerts_telegram !== false;
     patch.volume_alerts_telegram = draft.volume_alerts_telegram !== false;
+    patch.gain_alerts_telegram = draft.gain_alerts_telegram !== false;
     if (botToken.trim()) patch.telegram_bot_token = botToken.trim();
     if (chatId.trim()) patch.telegram_chat_id = chatId.trim();
     mutate('/api/settings', patch);
@@ -1814,6 +1870,14 @@ function AdminSettings({ state, close, updated }) {
               onChange={(e) => setDraft({ ...draft, volume_alerts_telegram: e.target.checked })}
             />
             放量通知：三倍量＋100万股（附分析图）
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={draft.gain_alerts_telegram !== false}
+              onChange={(e) => setDraft({ ...draft, gain_alerts_telegram: e.target.checked })}
+            />
+            涨幅通知：Pick A Stock 当日涨5%–10%（附K线）
           </label>
           <label>
             Telegram Bot Token
