@@ -1154,7 +1154,7 @@ function Alerts({ alerts, open }) {
           </span>
           <span className="alert-copy">
             <strong>
-              {a.name} <small>{a.stock}</small>
+              股票代号：{a.stock} <small>{a.name}</small>
             </strong>
             <span>{a.message || `时段成交量比率 ${number(a.ratio)}%`}</span>
           </span>

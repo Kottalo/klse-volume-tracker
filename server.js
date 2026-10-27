@@ -1749,7 +1749,7 @@ function recordPotentialAlerts(cfg = loadConfig()) {
       const r = item.report;
       const text = [
         '🔎 新潜力信号 · ' + date,
-        `${r.code} · RM ${+r.price.toFixed(3)} · ${(r.volume / 10000).toFixed(2)}万股 · 昨日${r.volume_signal.multiple.toFixed(2)}倍\n${conciseReason(r)}`,
+        `股票代号：${r.code} · RM ${+r.price.toFixed(3)} · ${(r.volume / 10000).toFixed(2)}万股 · 昨日${r.volume_signal.multiple.toFixed(2)}倍\n${conciseReason(r)}`,
         '实心箭头＝策略买点；空心箭头＝待突破。盘中未收盘，不保证上涨。',
         process.env.PUBLIC_URL || 'https://synthe-fantasia.site/',
       ].join('\n\n');
@@ -1825,8 +1825,14 @@ function preparePotentialNotice(item) {
       const text = paragraphs
         .filter(
           (paragraph) =>
-            !charts.some((other) => paragraph.startsWith(`${other.code} · `)) ||
-            paragraph.startsWith(`${chart.code} · `),
+            !charts.some((other) =>
+              [other.code, `股票代号：${other.code}`].some((label) =>
+                paragraph.startsWith(`${label} · `),
+              ),
+            ) ||
+            [chart.code, `股票代号：${chart.code}`].some((label) =>
+              paragraph.startsWith(`${label} · `),
+            ),
         )
         .join('\n\n');
       const frozen = JSON.stringify([chart]);
@@ -2109,7 +2115,7 @@ async function evaluateAlerts(cfg) {
       .slice(0, 30)
       .map(
         (m) =>
-          `• ${m.name} (${m.code}) 价 ${m.price ?? '-'} · 放量 ${m.ratio.toFixed(1)}%\n  ${m.curLabel} ${fmtNum(m.current)} vs ${m.prevLabel} ${fmtNum(m.previous)} · 4W ${fmtNum(m.avg4w)} / 5D ${fmtNum(m.avg5d)}`,
+          `• 股票代号：${m.code} · ${m.name} 价 ${m.price ?? '-'} · 放量 ${m.ratio.toFixed(1)}%\n  ${m.curLabel} ${fmtNum(m.current)} vs ${m.prevLabel} ${fmtNum(m.previous)} · 4W ${fmtNum(m.avg4w)} / 5D ${fmtNum(m.avg5d)}`,
       );
     const more = fired.length > 30 ? `\n…等共 ${fired.length} 只` : '';
     pushBroadcast('📊', '放量异动', lines.slice(0, 12).join('\n\n'), fired.length);
@@ -2275,7 +2281,7 @@ async function evaluateDoubleBottom(cfg) {
       const rr = risk > 0 ? rew / risk : 0; // 盈亏比
       const when = x.barsSince === 0 ? '今天刚突破' : `${x.barsSince} 天前突破`;
       return [
-        `• ${x.name} (${x.code})  评分 ${x.score}/100   [${when}]`,
+        `• 股票代号：${x.code} · ${x.name}  评分 ${x.score}/100   [${when}]`,
         `  两底    ${x.A.p.toFixed(3)} (${x.A.d}) / ${x.C.p.toFixed(3)} (${x.C.d})   相差 ${x.diffPct.toFixed(1)}%`,
         `  颈线    ${x.neck.toFixed(3)}  →  现价 ${x.price}  (已突破 +${x.brkPct.toFixed(1)}%)`,
         `  买入区  ${x.neck.toFixed(3)} ~ ${(x.neck * 1.03).toFixed(3)}`,
@@ -2344,7 +2350,7 @@ async function evaluatePriceDrop(cfg, suppliedPool) {
       .slice(0, 30)
       .map(
         (x) =>
-          `• ${x.name} (${x.stock}) 现价 ${x.price} · 跌 ${x.drop.toFixed(1)}%\n  开盘 ${x.ref} · 4W ${fmtNum(x.avg4w)} / 5D ${fmtNum(x.avg5d)}`,
+          `• 股票代号：${x.stock} · ${x.name} 现价 ${x.price} · 跌 ${x.drop.toFixed(1)}%\n  开盘 ${x.ref} · 4W ${fmtNum(x.avg4w)} / 5D ${fmtNum(x.avg5d)}`,
       );
     const more = fired.length > 30 ? `\n…等共 ${fired.length} 只` : '';
     pushBroadcast('🔴', '暴跌异动', lines.slice(0, 10).join('\n'), fired.length);
@@ -2406,7 +2412,7 @@ async function evaluateGapUp(cfg, suppliedPool) {
       .slice(0, 30)
       .map(
         (x) =>
-          `• ${x.name} (${x.stock}) 现价 ${x.price} · 涨 ${x.gain.toFixed(1)}%\n  开盘 ${x.open} · 4W ${fmtNum(x.avg4w)} / 5D ${fmtNum(x.avg5d)}`,
+          `• 股票代号：${x.stock} · ${x.name} 现价 ${x.price} · 涨 ${x.gain.toFixed(1)}%\n  开盘 ${x.open} · 4W ${fmtNum(x.avg4w)} / 5D ${fmtNum(x.avg5d)}`,
       );
     const more = fired.length > 30 ? `\n…等共 ${fired.length} 只` : '';
     pushBroadcast('🟢', '急涨异动', lines.slice(0, 10).join('\n'), fired.length);

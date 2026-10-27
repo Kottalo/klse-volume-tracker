@@ -28,7 +28,7 @@ test('candles use real OHLC, exclude future bars and reserve confirmed markers f
   assert.equal(chartModel({ ...report, snapshot: true }).marker, null);
   assert.equal(chartModel(report, { open: 0.98, high: 0.9, low: 1.1 }).rows.length, 2);
   const svg = chartSvg(model);
-  assert.ok(svg.includes('TEST&lt;&amp;'));
+  assert.ok(svg.includes('Stock code: TEST&lt;&amp;'));
   assert.ok(!svg.includes('2026-10-19'));
   assert.ok(svg.includes('策略买点 RM 1.05'));
   assert.ok(svg.includes('止损参考 0.9'));

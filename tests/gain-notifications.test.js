@@ -52,6 +52,7 @@ test('Pick A Stock daily gain notifications: boundaries, fresh OHLC, dedup and i
     assert.equal(rows.length, 2);
     assert.equal(JSON.parse(rows[0].charts)[0].rows.length, 2);
     assert.match(rows[0].text, /参考昨收/);
+    assert.match(rows[0].text, /股票代号：FIVE/);
     const http = app.listen(0, '127.0.0.1');
     await new Promise((resolve) => http.once('listening', resolve));
     try {

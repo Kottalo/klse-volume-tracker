@@ -810,7 +810,7 @@ test('new potential signals send one matching photo per stock, freeze charts and
     for (const [index, row] of rows.entries()) {
       const charts = JSON.parse(row.charts);
       assert.equal(charts.length, 1);
-      assert.ok(photos[index].caption.includes(charts[0].code));
+      assert.ok(photos[index].caption.includes(`股票代号：${charts[0].code}`));
       assert.doesNotMatch(
         photos[index].caption,
         new RegExp(charts[0].code === 'STRONG0' ? 'STRONG1' : 'STRONG0'),
@@ -860,7 +860,9 @@ test('pending combined potential images split into matching frozen messages with
     server.recordPotentialAlerts(cfg);
     const rows = db.prepare('SELECT * FROM notification_outbox ORDER BY id').all();
     const charts = rows.flatMap((row) => JSON.parse(row.charts));
-    const text = [...new Set(rows.flatMap((row) => row.text.split('\n\n')))].join('\n\n');
+    const text = [...new Set(rows.flatMap((row) => row.text.split('\n\n')))]
+      .join('\n\n')
+      .replace(`股票代号：${charts[0].code} · `, `${charts[0].code} · `);
     const id = rows[0].id;
     const ts = rows[0].ts - 60;
     db.prepare('UPDATE notification_outbox SET charts=?,text=?,ts=? WHERE id=?').run(
