@@ -38,7 +38,7 @@ test('messages contain just code, volumes and ratio', () => {
     previous_volume: 100,
     multiple: 3,
   });
-  assert.equal(text, 'TEST (0123) · 昨日 3.00 倍\n今日 300 股｜昨日 100 股');
+  assert.equal(text, '股票代号：TEST (0123) · 昨日 3.00 倍\n今日 300 股｜昨日 100 股');
   assert.doesNotMatch(text, /买点|支撑|目标|精选|突破|https:/);
   assert.equal(formatMultiple(2.999999), '<3.00');
   assert.equal(formatMultiple(3), '3.00');
