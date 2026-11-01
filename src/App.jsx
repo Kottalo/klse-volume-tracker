@@ -609,6 +609,7 @@ export default function App() {
                 {page === 'volume' && (
                   <>
                     <GainNotifications data={state.gain_notifications} />
+                    <GainNotifications data={state.period_gain_notifications} periods />
                     <VolumeNotifications data={state.volume_notifications} open={setSelected} />
                   </>
                 )}
@@ -1590,15 +1591,16 @@ function Method() {
   );
 }
 
-function GainNotifications({ data }) {
+function GainNotifications({ data, periods = false }) {
   return (
     <section className="panel market-panel">
       <div className="section-heading">
-        <h2>涨幅通知 · 5%–10%</h2>
+        <h2>{periods ? '周期涨幅通知 · 5日 / 20日' : '涨幅通知 · 5%–10%'}</h2>
       </div>
       <p className="volume-rule">
-        Pick A Stock 当日 Gain%
-        前30名，含5%和10%。每只每天一次，附真实K线；不要求三倍量。行情不一致或K线不足时等待资料。
+        {periods
+          ? '近5个交易日涨7%–15%、近20个交易日涨15%–25%，含边界。现价对比对应交易日前收盘价；各类型每股每天一次，附真实K线，不要求三倍量。交易日历史不完整时等待补齐。'
+          : 'Pick A Stock 当日 Gain% 前30名，含5%和10%。每只每天一次，附真实K线；不要求三倍量。行情不一致或K线不足时等待资料。'}
       </p>
       {!data?.alerts?.length ? (
         <p className="muted">暂无涨幅通知记录</p>
@@ -1608,6 +1610,7 @@ function GainNotifications({ data }) {
             <thead>
               <tr>
                 <th>股票</th>
+                {periods && <th>周期 / 基准</th>}
                 <th>现价</th>
                 <th>涨幅</th>
                 <th>通知时间</th>
@@ -1617,10 +1620,17 @@ function GainNotifications({ data }) {
             </thead>
             <tbody>
               {data.alerts.map((s) => (
-                <tr key={s.stock + s.date}>
+                <tr key={s.stock + s.date + (s.days || '')}>
                   <td>
                     <strong>{s.stock}</strong>
                   </td>
+                  {periods && (
+                    <td>
+                      {s.days}个交易日
+                      <br />
+                      {s.reference_date} · RM {number(s.reference, 3)}
+                    </td>
+                  )}
                   <td>RM {number(s.price, 3)}</td>
                   <td>+{number(s.gain)}%</td>
                   <td>{time(s.ts)}</td>
@@ -1797,6 +1807,8 @@ function AdminSettings({ state, close, updated }) {
     patch.potential_alerts_telegram = draft.potential_alerts_telegram !== false;
     patch.volume_alerts_telegram = draft.volume_alerts_telegram !== false;
     patch.gain_alerts_telegram = draft.gain_alerts_telegram !== false;
+    patch.gain_5d_alerts_telegram = draft.gain_5d_alerts_telegram !== false;
+    patch.gain_20d_alerts_telegram = draft.gain_20d_alerts_telegram !== false;
     if (botToken.trim()) patch.telegram_bot_token = botToken.trim();
     if (chatId.trim()) patch.telegram_chat_id = chatId.trim();
     mutate('/api/settings', patch);
@@ -1878,6 +1890,22 @@ function AdminSettings({ state, close, updated }) {
               onChange={(e) => setDraft({ ...draft, gain_alerts_telegram: e.target.checked })}
             />
             涨幅通知：Pick A Stock 当日涨5%–10%（附K线）
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={draft.gain_5d_alerts_telegram !== false}
+              onChange={(e) => setDraft({ ...draft, gain_5d_alerts_telegram: e.target.checked })}
+            />
+            5日涨幅通知：近5个交易日涨7%–15%（附K线）
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={draft.gain_20d_alerts_telegram !== false}
+              onChange={(e) => setDraft({ ...draft, gain_20d_alerts_telegram: e.target.checked })}
+            />
+            20日涨幅通知：近20个交易日涨15%–25%（附K线）
           </label>
           <label>
             Telegram Bot Token
