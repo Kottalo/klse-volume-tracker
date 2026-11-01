@@ -47,6 +47,18 @@ test('the same chart renders to a real, portable PNG with the bundled Chinese fo
   assert.match(combinedChartSvg(models), /translate\(0,620\)/);
 });
 
+test('period gain titles use portable ASCII labels and do not imply a buy-point assessment', () => {
+  const model = {
+    ...chartModel({ ...report, potential_eligible: false }),
+    kind: 'gain',
+    gain_days: 20,
+    gain: 20,
+  };
+  const svg = chartSvg(model);
+  assert.match(svg, /Stock code: TEST&lt;&amp; · 20d Gain \+20.00%/);
+  assert.doesNotMatch(svg, /暂未出现当前买点/);
+});
+
 test('volume analysis uses real candles when available and always compares today with yesterday', async () => {
   const { volumeChartModel } = await import('../lib/stock-chart.js');
   const stock = {
