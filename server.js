@@ -4,6 +4,11 @@
 import express from 'express';
 import { recordGainNotifications, gainNotificationState } from './lib/gain-notifications.js';
 import {
+  PERIOD_GAIN_RULES,
+  recordPeriodGainNotifications,
+  periodGainNotificationState,
+} from './lib/period-gain-notifications.js';
+import {
   volumeStocks,
   recordVolumeNotifications,
   prepareVolumeNotice,
@@ -86,6 +91,8 @@ const DEFAULTS = {
   potential_alerts_telegram: true,
   volume_alerts_telegram: true,
   gain_alerts_telegram: true,
+  gain_5d_alerts_telegram: true,
+  gain_20d_alerts_telegram: true,
   win_pct: 8, // 观察名单里涨到这个幅度算「应证」
   loss_pct: 5, // 跌到这个幅度算「证伪」
   watch_days: 15, // 观察多少天后没动静就归档
@@ -341,6 +348,9 @@ db.exec(`CREATE TABLE IF NOT EXISTS volume_alerts (
 db.exec(`CREATE TABLE IF NOT EXISTS gain_alerts (
   stock TEXT,date TEXT,price REAL,reference REAL,gain REAL,ts REAL,outbox_id INTEGER,
   PRIMARY KEY(stock,date));`);
+db.exec(`CREATE TABLE IF NOT EXISTS period_gain_alerts (
+  stock TEXT,date TEXT,days INTEGER,price REAL,reference REAL,reference_date TEXT,gain REAL,
+  ts REAL,outbox_id INTEGER,PRIMARY KEY(stock,date,days));`);
 // Retain old records but cancel outstanding fixed-time/text-only broadcasts.
 db.prepare(
   'UPDATE notification_outbox SET cancelled_at=?,last_error=? WHERE sent_at IS NULL AND cancelled_at IS NULL AND charts IS NULL AND kind IS NULL',
@@ -1791,7 +1801,7 @@ function recordPotentialAlerts(cfg = loadConfig()) {
 function potentialAlertState() {
   const row = db
     .prepare(
-      "SELECT id,ts,text,sent_at,attempts,cancelled_at,last_error,charts FROM notification_outbox WHERE charts IS NOT NULL AND (kind IS NULL OR kind NOT IN ('volume','gain')) ORDER BY id DESC LIMIT 1",
+      "SELECT id,ts,text,sent_at,attempts,cancelled_at,last_error,charts FROM notification_outbox WHERE charts IS NOT NULL AND (kind IS NULL OR kind NOT IN ('volume','gain','gain_5d','gain_20d')) ORDER BY id DESC LIMIT 1",
     )
     .get();
   return row
@@ -1896,7 +1906,7 @@ function deliverOutbox(cfg = loadConfig()) {
     const pending = [
       ...db
         .prepare(
-          "SELECT * FROM notification_outbox WHERE sent_at IS NULL AND cancelled_at IS NULL AND (kind IS NULL OR kind NOT IN ('volume','gain')) ORDER BY id LIMIT 5",
+          "SELECT * FROM notification_outbox WHERE sent_at IS NULL AND cancelled_at IS NULL AND (kind IS NULL OR kind NOT IN ('volume','gain','gain_5d','gain_20d')) ORDER BY id LIMIT 5",
         )
         .all(),
       ...db
@@ -1912,12 +1922,21 @@ function deliverOutbox(cfg = loadConfig()) {
         )
         .all(),
     );
+    for (const rule of PERIOD_GAIN_RULES)
+      pending.push(
+        ...db
+          .prepare(
+            'SELECT * FROM notification_outbox WHERE sent_at IS NULL AND cancelled_at IS NULL AND kind=? ORDER BY id LIMIT 5',
+          )
+          .all(rule.kind),
+      );
     for (const item of pending) {
       if (
-        (!['volume', 'gain'].includes(item.kind) &&
+        (!['volume', 'gain', 'gain_5d', 'gain_20d'].includes(item.kind) &&
           item.charts &&
           cfg.potential_alerts_telegram === false) ||
         (item.kind === 'gain' && cfg.gain_alerts_telegram === false) ||
+        PERIOD_GAIN_RULES.some((rule) => item.kind === rule.kind && cfg[rule.setting] === false) ||
         (item.kind === 'volume' && cfg.volume_alerts_telegram === false)
       ) {
         db.prepare('UPDATE notification_outbox SET cancelled_at=?,last_error=? WHERE id=?').run(
@@ -1946,7 +1965,8 @@ function deliverOutbox(cfg = loadConfig()) {
         );
         continue;
       }
-      if (!['volume', 'gain'].includes(item.kind) && item.charts) preparePotentialNotice(item);
+      if (!['volume', 'gain', 'gain_5d', 'gain_20d'].includes(item.kind) && item.charts)
+        preparePotentialNotice(item);
       const result = item.charts
         ? await sendTelegramChart(item.text, JSON.parse(item.charts), cfg)
         : await sendTelegramText(item.text, cfg);
@@ -1977,6 +1997,7 @@ function runBroadcast(cfg = loadConfig()) {
       recordPotentialAlerts(cfg);
       recordVolumeAlerts(cfg);
       recordGainNotifications(db, cfg, gapPool);
+      recordPeriodGainNotifications(db, cfg);
       bcastQueue = [];
       db.exec('COMMIT');
     } catch (e) {
@@ -2890,6 +2911,8 @@ function buildState() {
       potential_alerts_telegram: cfg.potential_alerts_telegram !== false,
       volume_alerts_telegram: cfg.volume_alerts_telegram !== false,
       gain_alerts_telegram: cfg.gain_alerts_telegram !== false,
+      gain_5d_alerts_telegram: cfg.gain_5d_alerts_telegram !== false,
+      gain_20d_alerts_telegram: cfg.gain_20d_alerts_telegram !== false,
       win_pct: cfg.win_pct ?? 8,
       loss_pct: cfg.loss_pct ?? 5,
       watch_days: cfg.watch_days ?? 15,
@@ -2909,6 +2932,7 @@ function buildState() {
     potential_alert: potentialAlertState(),
     volume_notifications: volumeNotificationState(db, cfg),
     gain_notifications: gainNotificationState(db, cfg),
+    period_gain_notifications: periodGainNotificationState(db, cfg),
     alerts: db.prepare('SELECT * FROM alerts ORDER BY id DESC LIMIT 50').all(),
     admin_enabled: !!process.env.ADMIN_TOKEN,
     status: {
@@ -3010,7 +3034,7 @@ app.get('/api/potential-alerts/:id/chart.png', (req, res) => {
   if (!/^\d+$/.test(req.params.id)) return res.status(404).end();
   const row = db
     .prepare(
-      "SELECT charts FROM notification_outbox WHERE id=? AND charts IS NOT NULL AND (kind IS NULL OR kind NOT IN ('volume','gain'))",
+      "SELECT charts FROM notification_outbox WHERE id=? AND charts IS NOT NULL AND (kind IS NULL OR kind NOT IN ('volume','gain','gain_5d','gain_20d'))",
     )
     .get(req.params.id);
   if (!row) return res.status(404).end();
@@ -3029,6 +3053,15 @@ app.get('/api/gain-alerts/:id/chart.png', (req, res) => {
   const row = db
     .prepare(
       "SELECT charts FROM notification_outbox WHERE id=? AND kind='gain' AND charts IS NOT NULL",
+    )
+    .get(req.params.id);
+  if (!row) return res.status(404).end();
+  serveChart(req, res, JSON.parse(row.charts));
+});
+app.get('/api/period-gain-alerts/:id/chart.png', (req, res) => {
+  const row = db
+    .prepare(
+      "SELECT charts FROM notification_outbox WHERE id=? AND kind IN ('gain_5d','gain_20d') AND charts IS NOT NULL",
     )
     .get(req.params.id);
   if (!row) return res.status(404).end();
