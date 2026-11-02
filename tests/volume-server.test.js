@@ -57,12 +57,16 @@ function stock(code = 'TEST', volume = 1500000, previous = 500000, extra = {}) {
     code + ' Company',
     extra.numeric_code || '0123',
   );
-  db.prepare('INSERT INTO live(stock,name,volume,mtime,session_date) VALUES(?,?,?,?,?)').run(
+  db.prepare(
+    'INSERT INTO live(stock,name,volume,mtime,session_date,price,prevClose) VALUES(?,?,?,?,?,?,?)',
+  ).run(
     code,
     code,
     volume,
     Date.now() / 1000,
     '2026-10-05',
+    Object.hasOwn(extra, 'price') ? extra.price : 1.1,
+    Object.hasOwn(extra, 'previous_close') ? extra.previous_close : 1,
   );
   if (previous != null)
     db.prepare('INSERT INTO daily_vol(stock,date,volume) VALUES(?,?,?)').run(
@@ -75,6 +79,124 @@ const headers = { 'Content-Type': 'application/json', Authorization: 'Bearer tes
 const post = (url, body, auth = headers) =>
   realFetch(base + url, { method: 'POST', headers: auth, body: JSON.stringify(body) });
 const telegram = { ...DEFAULTS, telegram_bot_token: 'FAKE', telegram_chat_id: '123' };
+
+test('triple-volume notifications require a rise from previous close; flat, down and unknown prices do not consume daily dedup', async () => {
+  reset();
+  stock('UP', 1500000, 500000, { price: 1.01 });
+  stock('DOWN', 1500000, 500000, { price: 0.99 });
+  stock('FLAT', 1500000, 500000, { price: 1 });
+  stock('NOPRICE', 1500000, 500000, { price: null });
+  stock('NOREF', 1500000, 500000, { previous_close: null });
+  stock('ZEROREF', 1500000, 500000, { previous_close: 0 });
+  scan(fixed / 1000, 6);
+  assert.deepEqual(
+    recordVolumeAlerts(telegram).map((s) => s.code),
+    ['UP'],
+  );
+  const state = await (await realFetch(base + '/api/volume')).json();
+  assert.equal(state.rising_only, true);
+  assert.deepEqual(
+    state.stocks.filter((s) => s.qualified).map((s) => s.code),
+    ['UP'],
+  );
+  const reply = await server.handleTelegramMessage(
+    { chat: { id: 123 }, text: '/volume' },
+    telegram,
+  );
+  assert.match(reply, /股票代号：UP/);
+  assert.doesNotMatch(reply, /DOWN|FLAT|NOPRICE|NOREF|ZEROREF/);
+  db.prepare("UPDATE live SET price=1.02 WHERE stock='DOWN'").run();
+  assert.deepEqual(
+    recordVolumeAlerts(telegram).map((s) => s.code),
+    ['DOWN'],
+  );
+});
+
+test('a failed rising-volume notice stops after turning down, then can notify once when it recovers', async () => {
+  reset();
+  stock();
+  scan();
+  recordVolumeAlerts(telegram);
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    return Response.json({ ok: false });
+  };
+  await deliverOutbox(telegram);
+  assert.equal(calls, 1);
+  const originalId = db.prepare('SELECT id FROM notification_outbox').get().id;
+  db.prepare('UPDATE live SET price=0.99').run();
+  await deliverOutbox(telegram);
+  assert.equal(calls, 1);
+  assert.match(
+    db.prepare('SELECT last_error FROM notification_outbox WHERE id=?').get(originalId).last_error,
+    /上涨条件/,
+  );
+  db.prepare('UPDATE live SET price=1.02').run();
+  assert.equal(recordVolumeAlerts(telegram).length, 1);
+  globalThis.fetch = async (_url, options) => {
+    calls++;
+    assert.match(options.body.get('caption'), /现价 RM 1.02.*昨收 RM 1.*上涨 \+2.00%/);
+    return Response.json({ ok: true });
+  };
+  await deliverOutbox(telegram);
+  assert.equal(calls, 2);
+  db.prepare('UPDATE live SET price=0.99').run();
+  assert.equal(recordVolumeAlerts(telegram).length, 0);
+  db.prepare('UPDATE live SET price=1.03').run();
+  assert.equal(recordVolumeAlerts(telegram).length, 0);
+});
+
+test('pending legacy volume records without a frozen rising-price proof are cancelled without a photo', async () => {
+  reset();
+  stock();
+  scan();
+  recordVolumeAlerts(telegram);
+  db.prepare('UPDATE volume_alerts SET price=NULL,previous_close=NULL').run();
+  globalThis.fetch = async () => {
+    throw new Error('unproven legacy notice must not send');
+  };
+  await deliverOutbox(telegram);
+  const row = db.prepare('SELECT * FROM notification_outbox').get();
+  assert.ok(row.cancelled_at);
+  assert.equal(row.attempts, 0);
+  assert.match(row.last_error, /上涨条件/);
+  assert.equal(recordVolumeAlerts(telegram).length, 1);
+});
+
+test('a stock excluded from a pending batch does not inherit another stock delivery or lose its later rising alert', async () => {
+  reset();
+  stock('UP');
+  stock('RECOVER');
+  scan(fixed / 1000, 2);
+  recordVolumeAlerts(telegram);
+  const rows = db.prepare('SELECT * FROM notification_outbox ORDER BY id').all(),
+    id = rows[0].id;
+  db.prepare('UPDATE notification_outbox SET charts=? WHERE id=?').run(
+    JSON.stringify(rows.flatMap((r) => JSON.parse(r.charts))),
+    id,
+  );
+  db.prepare('UPDATE volume_alerts SET outbox_id=?').run(id);
+  db.prepare('DELETE FROM notification_outbox WHERE id<>?').run(id);
+  db.prepare("UPDATE live SET price=.99 WHERE stock='RECOVER'").run();
+  const sent = [];
+  globalThis.fetch = async (_url, options) => {
+    sent.push(options.body.get('caption'));
+    return Response.json({ ok: true });
+  };
+  await deliverOutbox(telegram);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /股票代号：UP/);
+  assert.doesNotMatch(sent[0], /RECOVER/);
+  db.prepare("UPDATE live SET price=1.02 WHERE stock='RECOVER'").run();
+  assert.deepEqual(
+    recordVolumeAlerts(telegram).map((s) => s.code),
+    ['RECOVER'],
+  );
+  await deliverOutbox(telegram);
+  assert.equal(sent.length, 2);
+  assert.match(sent[1], /RECOVER/);
+});
 
 test('public volume queries work; settings require admin and never expose credentials', async () => {
   reset();
@@ -181,7 +303,7 @@ test('legacy pending notices exclude sub-million stocks without blocking their l
     for (const code of codes) {
       const record = records.find((s) => s.code === code);
       db.prepare(
-        'INSERT INTO volume_alerts(stock,date,volume,previous_volume,multiple,ts,outbox_id) VALUES(?,?,?,?,?,?,?)',
+        'INSERT INTO volume_alerts(stock,date,volume,previous_volume,multiple,ts,outbox_id,price,previous_close) VALUES(?,?,?,?,?,?,?,?,?)',
       ).run(
         code,
         record.date,
@@ -190,6 +312,8 @@ test('legacy pending notices exclude sub-million stocks without blocking their l
         record.multiple,
         fixed / 1000,
         id,
+        record.price,
+        record.previous_close,
       );
     }
     return id;
@@ -435,11 +559,11 @@ test('polling keeps a five-minute interval and preserves the last good snapshot 
             d: [
               'TEST',
               'Test',
-              null,
-              null,
+              1.05,
+              1.1,
               1500000,
-              null,
-              null,
+              10,
+              0.1,
               null,
               null,
               null,
@@ -599,7 +723,7 @@ test('legacy text batches split into one image message per stock once, preservin
   );
   for (const row of getStocks())
     db.prepare(
-      'INSERT INTO volume_alerts(stock,date,volume,previous_volume,previous_date,multiple,ts,outbox_id) VALUES(?,?,?,?,?,?,?,?)',
+      'INSERT INTO volume_alerts(stock,date,volume,previous_volume,previous_date,multiple,ts,outbox_id,price,previous_close) VALUES(?,?,?,?,?,?,?,?,?,?)',
     ).run(
       row.code,
       row.date,
@@ -609,6 +733,8 @@ test('legacy text batches split into one image message per stock once, preservin
       row.multiple,
       fixed / 1000,
       id,
+      row.price,
+      row.previous_close,
     );
   const sent = [];
   globalThis.fetch = async (url, options) => {

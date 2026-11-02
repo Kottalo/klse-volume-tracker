@@ -215,7 +215,7 @@ export default function App() {
   };
   const titles = {
     overview: '今日潜力精选。',
-    volume: '三倍量＋100万股。',
+    volume: '三倍量＋100万股，只通知现价高于昨收的股票。',
     market: '从全市场找到你的关注。',
     watch: '关注之后，继续核对。',
     alerts: '市场有变化，依据要更新。',
@@ -1671,7 +1671,7 @@ function VolumeNotifications({ data, open }) {
       </div>
       <p className="volume-rule">
         今日累计量 ≥ 100万股，且 ≥
-        上一有成交交易日全天量的3倍。同一股票每天一次；图文通知另行判断，不互相抵消。
+        上一有成交交易日全天量的3倍，且现价高于昨收。平盘、下跌或缺少价格资料不通知。同一股票每天一次；发送前复查上涨条件。
       </p>
       <div className="market-toolbar">
         <label className="search">
@@ -1700,6 +1700,7 @@ function VolumeNotifications({ data, open }) {
               <th>今日量（股）</th>
               <th>昨日量（股）</th>
               <th>昨日倍数</th>
+              <th>涨幅（相对昨收）</th>
               <th>{tab === 'history' ? '发送状态' : '资料日期'}</th>
               {tab === 'history' && <th>分析图</th>}
             </tr>
@@ -1726,9 +1727,10 @@ function VolumeNotifications({ data, open }) {
                       : number(s.multiple)}
                   倍
                 </td>
+                <td>{s.gain == null ? '—' : `${s.gain > 0 ? '+' : ''}${number(s.gain)}%`}</td>
                 <td className="muted">
                   {tab === 'history'
-                    ? s.volume < 1000000
+                    ? s.volume < 1000000 || s.price == null || s.previous_close == null
                       ? '旧规则记录'
                       : s.sent_at
                         ? '已发送'
@@ -1757,7 +1759,7 @@ function VolumeNotifications({ data, open }) {
       {!rows.length && (
         <Empty
           title={tab === 'history' ? '暂无放量通知' : '暂无达标股票'}
-          text="只核对百万股与三倍量，不用形态或涨幅补入。"
+          text="需同时达到百万股、三倍量且现价高于昨收；平盘或下跌不通知。"
         />
       )}
     </section>
@@ -1881,7 +1883,7 @@ function AdminSettings({ state, close, updated }) {
               checked={draft.volume_alerts_telegram !== false}
               onChange={(e) => setDraft({ ...draft, volume_alerts_telegram: e.target.checked })}
             />
-            放量通知：三倍量＋100万股（附分析图）
+            放量通知：三倍量＋100万股且上涨（附分析图）
           </label>
           <label className="checkbox-label">
             <input

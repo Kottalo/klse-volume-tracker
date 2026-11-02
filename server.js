@@ -14,7 +14,7 @@ import {
   prepareVolumeNotice,
   volumeNotificationState,
 } from './lib/volume-notifications.js';
-import { formatVolumeAlert } from './lib/volume.js';
+import { formatVolumeAlert, VOLUME_RULE_REJECTED } from './lib/volume.js';
 import { chartModel } from './lib/stock-chart.js';
 import { chartPng } from './lib/chart-image.js';
 import fs from 'node:fs';
@@ -345,6 +345,15 @@ for (const [table, column, type] of [
 db.exec(`CREATE TABLE IF NOT EXISTS volume_alerts (
   stock TEXT,date TEXT,name TEXT,numeric_code TEXT,volume INTEGER,previous_volume INTEGER,
   previous_date TEXT,multiple REAL,ts REAL,outbox_id INTEGER,PRIMARY KEY(stock,date));`);
+for (const column of ['price', 'previous_close']) {
+  if (
+    !db
+      .prepare('PRAGMA table_info(volume_alerts)')
+      .all()
+      .some((c) => c.name === column)
+  )
+    db.exec(`ALTER TABLE volume_alerts ADD COLUMN ${column} REAL`);
+}
 db.exec(`CREATE TABLE IF NOT EXISTS gain_alerts (
   stock TEXT,date TEXT,price REAL,reference REAL,gain REAL,ts REAL,outbox_id INTEGER,
   PRIMARY KEY(stock,date));`);
@@ -1182,7 +1191,7 @@ function cmdHelp() {
     '/stock <代码>   查单只股票现在的完整情况',
     '/screen         强势筛选: 20日涨15-25% + 放量3倍 + 站上MA5 + 四线多头排列',
     '/top            只看今日图文精选',
-    '/volume         三倍量＋100万股，独立放量分析图',
+    '/volume         三倍量＋100万股且上涨，独立放量分析图',
     '/watch [all]    观察名单及成绩',
     '/stats          规则观察结果',
     '/set <项> <值>  改参数, 例: /set pick_count 2',
@@ -1423,11 +1432,11 @@ async function handleTelegramMessage(msg, cfg) {
     if (String(msg.chat?.id) !== String(cfg.telegram_chat_id)) return null;
     const matches = getStocks(cfg).filter((s) => s.qualified);
     return matches.length
-      ? '三倍量＋100万股 · ' +
+      ? '三倍量＋100万股且上涨 · ' +
           matches[0].date +
           '\n\n' +
           matches.map(formatVolumeAlert).join('\n\n')
-      : '目前没有同时达到100万股及昨日3倍量的股票。';
+      : '目前没有同时达到100万股、昨日3倍量且现价高于昨收的股票。';
   }
 
   const text = (msg.text || '').trim();
@@ -1535,7 +1544,7 @@ async function pollTelegram() {
       const cmds = [
         { command: 'stock', description: '查单只股票(例 /stock MAYBANK)' },
         { command: 'top', description: '潜力精选（图文策略）' },
-        { command: 'volume', description: '三倍量＋100万股（附分析图）' },
+        { command: 'volume', description: '三倍量＋100万股且上涨（附分析图）' },
         { command: 'watch', description: '观察名单及成绩' },
         { command: 'stats', description: '规则观察结果' },
         { command: 'params', description: '查看当前所有参数' },
@@ -1960,7 +1969,7 @@ function deliverOutbox(cfg = loadConfig()) {
       if (item.kind === 'volume' && !prepareVolumeNotice(db, item)) {
         db.prepare('UPDATE notification_outbox SET cancelled_at=?,last_error=? WHERE id=?').run(
           Math.floor(Date.now() / 1000),
-          '未达百万股及三倍量门槛',
+          VOLUME_RULE_REJECTED,
           item.id,
         );
         continue;
