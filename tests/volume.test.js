@@ -6,6 +6,7 @@ import {
   formatMultiple,
   sessionStart,
   previousTradingDate,
+  risingPrice,
 } from '../lib/volume.js';
 import { validateSettings, ValidationError } from '../lib/settings.js';
 
@@ -42,6 +43,33 @@ test('messages contain just code, volumes and ratio', () => {
   assert.doesNotMatch(text, /买点|支撑|目标|精选|突破|https:/);
   assert.equal(formatMultiple(2.999999), '<3.00');
   assert.equal(formatMultiple(3), '3.00');
+  assert.match(
+    formatVolumeAlert({
+      code: 'UP',
+      multiple: 3,
+      volume: 1000000,
+      previous_volume: 300000,
+      price: 1.1,
+      previous_close: 1,
+    }),
+    /上涨 \+10.00%/,
+  );
+});
+
+test('only a finite price strictly above a positive previous close counts as rising', () => {
+  for (const [price, previousClose, pass] of [
+    [1.01, 1, true],
+    [1.000001, 1, true],
+    [1, 1, false],
+    [0.99, 1, false],
+    [1, 0, false],
+    [1, null, false],
+    [null, 1, false],
+    [Infinity, 1, false],
+    [1, Infinity, false],
+    ['1.1', 1, false],
+  ])
+    assert.equal(risingPrice(price, previousClose), pass, `${price}/${previousClose}`);
 });
 test('MYT trading dates skip weekends and configured holidays; lunch never generates alerts', () => {
   assert.equal(previousTradingDate('2026-10-05'), '2026-10-02');

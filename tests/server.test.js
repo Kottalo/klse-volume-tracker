@@ -1089,6 +1089,7 @@ function notificationType(url, options) {
 test('both notification types send images, including volume matches without OHLC history', async () => {
   const cfg = seedPotentialScan();
   quote('PLAINONLY', 0.25, 1500000);
+  db.prepare("UPDATE live SET prevClose=0.24 WHERE stock='PLAINONLY'").run();
   db.prepare('INSERT INTO daily_vol(stock,date,volume) VALUES(?,?,?)').run(
     'PLAINONLY',
     '2026-10-02',
