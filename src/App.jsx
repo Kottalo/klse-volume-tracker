@@ -215,7 +215,7 @@ export default function App() {
   };
   const titles = {
     overview: '今日潜力精选。',
-    volume: '三倍量＋100万股，只通知现价高于昨收的股票。',
+    volume: '三倍量＋100万股，当日涨7%–15%且现价高于MA5。',
     market: '从全市场找到你的关注。',
     watch: '关注之后，继续核对。',
     alerts: '市场有变化，依据要更新。',
@@ -1595,12 +1595,12 @@ function GainNotifications({ data, periods = false }) {
   return (
     <section className="panel market-panel">
       <div className="section-heading">
-        <h2>{periods ? '周期涨幅通知 · 5日 / 20日' : '涨幅通知 · 5%–10%'}</h2>
+        <h2>{periods ? '周期涨幅通知 · 5日 / 20日 · 7%–15%' : '当日涨幅通知 · 7%–15%'}</h2>
       </div>
       <p className="volume-rule">
         {periods
-          ? '近5个交易日涨7%–15%、近20个交易日涨15%–25%，含边界。现价对比对应交易日前收盘价；各类型每股每天一次，附真实K线，不要求三倍量。交易日历史不完整时等待补齐。'
-          : 'Pick A Stock 当日 Gain% 前30名，含5%和10%。每只每天一次，附真实K线；不要求三倍量。行情不一致或K线不足时等待资料。'}
+          ? '近5及20个交易日涨幅均为7%–15%（含边界）。5日通知要求今日累计量>300万股；20日>800万股。现价必须高于MA5及昨收；各类型每股每天一次，附真实K线。交易日历史不完整时等待补齐。'
+          : 'Pick A Stock 当日 Gain% 前30名，涨7%–15%（含边界），且现价高于MA5。每只每天一次，附真实K线。行情不一致或K线不足时等待资料。'}
       </p>
       {!data?.alerts?.length ? (
         <p className="muted">暂无涨幅通知记录</p>
@@ -1612,6 +1612,7 @@ function GainNotifications({ data, periods = false }) {
                 <th>股票</th>
                 {periods && <th>周期 / 基准</th>}
                 <th>现价</th>
+                <th>今日量（股） / MA5</th>
                 <th>涨幅</th>
                 <th>通知时间</th>
                 <th>发送状态</th>
@@ -1632,6 +1633,9 @@ function GainNotifications({ data, periods = false }) {
                     </td>
                   )}
                   <td>RM {number(s.price, 3)}</td>
+                  <td>
+                    {number(s.volume, 0)} / RM {number(s.ma5, 4)}
+                  </td>
                   <td>+{number(s.gain)}%</td>
                   <td>{time(s.ts)}</td>
                   <td>
@@ -1671,7 +1675,7 @@ function VolumeNotifications({ data, open }) {
       </div>
       <p className="volume-rule">
         今日累计量 ≥ 100万股，且 ≥
-        上一有成交交易日全天量的3倍，且现价高于昨收。平盘、下跌或缺少价格资料不通知。同一股票每天一次；发送前复查上涨条件。
+        上一有成交交易日全天量的3倍，且当日涨7%–15%、现价高于MA5。不通知下跌股票；同一股票每天一次，发送前复查全部条件。
       </p>
       <div className="market-toolbar">
         <label className="search">
@@ -1759,7 +1763,7 @@ function VolumeNotifications({ data, open }) {
       {!rows.length && (
         <Empty
           title={tab === 'history' ? '暂无放量通知' : '暂无达标股票'}
-          text="需同时达到百万股、三倍量且现价高于昨收；平盘或下跌不通知。"
+          text="需同时达到百万股、三倍量、当日涨7%–15%及现价高于MA5；下跌不通知。"
         />
       )}
     </section>
@@ -1875,7 +1879,7 @@ function AdminSettings({ state, close, updated }) {
               checked={draft.potential_alerts_telegram !== false}
               onChange={(e) => setDraft({ ...draft, potential_alerts_telegram: e.target.checked })}
             />
-            图文通知：原版潜力精选（含K线图片）
+            图文通知：原版潜力精选＋当日涨7%–15%、高于MA5（含K线）
           </label>
           <label className="checkbox-label">
             <input
@@ -1883,7 +1887,7 @@ function AdminSettings({ state, close, updated }) {
               checked={draft.volume_alerts_telegram !== false}
               onChange={(e) => setDraft({ ...draft, volume_alerts_telegram: e.target.checked })}
             />
-            放量通知：三倍量＋100万股且上涨（附分析图）
+            放量通知：三倍量＋100万股、当日涨7%–15%、高于MA5（附图）
           </label>
           <label className="checkbox-label">
             <input
@@ -1891,7 +1895,7 @@ function AdminSettings({ state, close, updated }) {
               checked={draft.gain_alerts_telegram !== false}
               onChange={(e) => setDraft({ ...draft, gain_alerts_telegram: e.target.checked })}
             />
-            涨幅通知：Pick A Stock 当日涨5%–10%（附K线）
+            涨幅通知：Pick A Stock 当日涨7%–15%、高于MA5（附K线）
           </label>
           <label className="checkbox-label">
             <input
@@ -1899,7 +1903,7 @@ function AdminSettings({ state, close, updated }) {
               checked={draft.gain_5d_alerts_telegram !== false}
               onChange={(e) => setDraft({ ...draft, gain_5d_alerts_telegram: e.target.checked })}
             />
-            5日涨幅通知：近5个交易日涨7%–15%（附K线）
+            5日通知：涨7%–15%、今日量&gt;300万股、高于MA5（附K线）
           </label>
           <label className="checkbox-label">
             <input
@@ -1907,7 +1911,7 @@ function AdminSettings({ state, close, updated }) {
               checked={draft.gain_20d_alerts_telegram !== false}
               onChange={(e) => setDraft({ ...draft, gain_20d_alerts_telegram: e.target.checked })}
             />
-            20日涨幅通知：近20个交易日涨15%–25%（附K线）
+            20日通知：涨7%–15%、今日量&gt;800万股、高于MA5（附K线）
           </label>
           <label>
             Telegram Bot Token

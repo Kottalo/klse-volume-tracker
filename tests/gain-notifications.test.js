@@ -28,15 +28,16 @@ test('Pick A Stock daily gain notifications: boundaries, fresh OHLC, dedup and i
       'INSERT INTO live(stock,name,price,prevClose,open,high,low,volume,mtime,session_date) VALUES(?,?,?,?,?,?,?,?,?,?)',
     ).run(code, code, price, 1, 1, price + 0.01, 0.99, 100, Date.now() / 1000, '2026-10-05');
     if (!extra.noHistory)
-      db.prepare(
-        'INSERT INTO daily_vol(stock,date,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?)',
-      ).run(code, '2026-10-02', 1, 1.01, 0.99, 1, 100);
+      for (const date of ['2026-10-02', '2026-10-01', '2026-09-30', '2026-09-29'])
+        db.prepare(
+          'INSERT INTO daily_vol(stock,date,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?)',
+        ).run(code, date, 1, 1.01, 0.99, 1, 100);
   }
   try {
-    stock('FIVE', 1.05);
-    stock('TEN', 1.1);
-    stock('LOW', 1.0499);
-    stock('HIGH', 1.1001);
+    stock('SEVEN', 1.07);
+    stock('FIFTEEN', 1.15);
+    stock('LOW', 1.0699);
+    stock('HIGH', 1.1501);
     stock('MISSING', 1.07, { noHistory: true });
     stock('STALE', 1.07);
     stock('MISMATCH', 1.07);
@@ -45,14 +46,14 @@ test('Pick A Stock daily gain notifications: boundaries, fresh OHLC, dedup and i
     assert.equal(recordGainNotifications(db, cfg, null).length, 0);
     assert.deepEqual(
       recordGainNotifications(db, cfg, pool).map((s) => s.code),
-      ['FIVE', 'TEN'],
+      ['SEVEN', 'FIFTEEN'],
     );
     assert.equal(recordGainNotifications(db, cfg, pool).length, 0);
     const rows = db.prepare("SELECT * FROM notification_outbox WHERE kind='gain'").all();
     assert.equal(rows.length, 2);
-    assert.equal(JSON.parse(rows[0].charts)[0].rows.length, 2);
+    assert.equal(JSON.parse(rows[0].charts)[0].rows.length, 5);
     assert.match(rows[0].text, /参考昨收/);
-    assert.match(rows[0].text, /股票代号：FIVE/);
+    assert.match(rows[0].text, /股票代号：SEVEN/);
     const http = app.listen(0, '127.0.0.1');
     await new Promise((resolve) => http.once('listening', resolve));
     try {
@@ -83,7 +84,7 @@ test('Pick A Stock daily gain notifications: boundaries, fresh OHLC, dedup and i
     await deliverOutbox(cfg);
     assert.equal(gainNotificationState(db, cfg).alerts.filter((s) => s.sent_at).length, 2);
     assert.equal(attempts, 3);
-    stock('WEB', 1.06);
+    stock('WEB', 1.08);
     assert.equal(
       recordGainNotifications(db, { ...cfg, gain_alerts_telegram: false }, pool).length,
       1,
@@ -96,9 +97,12 @@ test('Pick A Stock daily gain notifications: boundaries, fresh OHLC, dedup and i
         .get().last_error,
       '仅网页',
     );
+    db.prepare(
+      "INSERT INTO daily_vol(stock,date,open,high,low,close,volume) SELECT stock,'2026-10-05',open,high,low,price,volume FROM live",
+    ).run();
     Date.now = () => Date.parse('2026-10-06T10:30:00+08:00');
     db.prepare("UPDATE live SET session_date='2026-10-06',mtime=?").run(Date.now() / 1000);
-    assert.ok(recordGainNotifications(db, cfg, pool).some((s) => s.code === 'FIVE'));
+    assert.ok(recordGainNotifications(db, cfg, pool).some((s) => s.code === 'SEVEN'));
   } finally {
     Date.now = realNow;
     globalThis.fetch = realFetch;

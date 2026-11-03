@@ -135,7 +135,10 @@ test('fifteen polls on entry day do not expire an observation', () => {
 
 test('broadcast preview does not consume notification deduplication', async () => {
   reset();
-  quote('GAP', 11.6, 100);
+  quote('GAP', 12, 100);
+  db.prepare("UPDATE live SET open=11.4 WHERE stock='GAP'").run();
+  for (const date of ['2026-10-02', '2026-10-01', '2026-09-30', '2026-09-29'])
+    db.prepare("INSERT INTO daily_vol(stock,date,volume,close) VALUES('GAP',?,100,11)").run(date);
   const before = db.prepare('SELECT COUNT(*) c FROM gap_up_alert').get().c;
   const response = await realFetch(base + '/api/broadcast-test', { headers: admin });
   assert.equal(response.status, 200);
@@ -149,6 +152,8 @@ test('broadcast preview does not consume notification deduplication', async () =
 test('web alerts work without Telegram; cooldown crossing eventually fires', async () => {
   reset();
   quote('VOL', 12, 300);
+  for (const date of ['2026-10-01', '2026-09-30', '2026-09-29'])
+    db.prepare("INSERT INTO daily_vol(stock,date,volume,close) VALUES('VOL',?,0,11)").run(date);
   db.prepare('INSERT INTO daily_vol(stock,date,volume,close) VALUES(?,?,?,?)').run(
     'VOL',
     '2026-10-02',
@@ -240,6 +245,7 @@ function seedTrendMarket(count = 5) {
 test('three-times volume is inclusive across legacy settings, shortlist, screen and potential alerts', async () => {
   reset();
   seedTrendMarket(1);
+  db.prepare('UPDATE live SET prevClose=price/1.075').run();
   saveConfig({ ...DEFAULTS, screen_vol_mult: 2 });
   assert.equal(server.loadConfig().screen_vol_mult, 3);
   assert.equal((await post('/api/settings', { screen_vol_mult: 2.999999 })).status, 400);
@@ -779,6 +785,7 @@ test('next-day tracking waits for the next trading date, distinguishes intraday 
 function seedPotentialScan(time = '10:05:20', count = 2) {
   reset();
   seedTrendMarket(count);
+  db.prepare('UPDATE live SET prevClose=price/1.075').run();
   briefingClock(time, count);
   const cfg = { ...DEFAULTS, telegram_bot_token: 'FAKE_TEST_TOKEN', telegram_chat_id: 'TEST_CHAT' };
   saveConfig(cfg);
@@ -873,7 +880,7 @@ test('pending combined potential images split into matching frozen messages with
     );
     db.prepare('UPDATE potential_pushes SET outbox_id=?').run(id);
     db.prepare('DELETE FROM notification_outbox WHERE id!=?').run(id);
-    db.prepare('UPDATE live SET price=20').run();
+    db.prepare('UPDATE live SET price=11.03').run();
     const sent = [];
     globalThis.fetch = async (_url, options) => {
       const caption = options.body.get('caption');
@@ -1089,12 +1096,17 @@ function notificationType(url, options) {
 test('both notification types send images, including volume matches without OHLC history', async () => {
   const cfg = seedPotentialScan();
   quote('PLAINONLY', 0.25, 1500000);
-  db.prepare("UPDATE live SET prevClose=0.24 WHERE stock='PLAINONLY'").run();
+  db.prepare("UPDATE live SET prevClose=0.23 WHERE stock='PLAINONLY'").run();
   db.prepare('INSERT INTO daily_vol(stock,date,volume) VALUES(?,?,?)').run(
     'PLAINONLY',
     '2026-10-02',
     500000,
   );
+  db.prepare("UPDATE daily_vol SET close=0.23 WHERE stock='PLAINONLY'").run();
+  for (const date of ['2026-10-01', '2026-09-30', '2026-09-29'])
+    db.prepare("INSERT INTO daily_vol(stock,date,volume,close) VALUES('PLAINONLY',?,0,0.23)").run(
+      date,
+    );
   briefingClock('10:05:20', 3);
   const sent = { potential: [], volume: [] };
   globalThis.fetch = async (url, options) => {

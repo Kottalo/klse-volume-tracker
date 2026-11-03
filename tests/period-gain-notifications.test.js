@@ -56,7 +56,7 @@ after(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-function stock(code, gain5 = 10, gain20 = 20) {
+function stock(code, gain5 = 10, gain20 = 10) {
   const price = 1.2;
   db.prepare('INSERT INTO universe(stock,name,code,active) VALUES(?,?,?,1)').run(
     code,
@@ -65,7 +65,7 @@ function stock(code, gain5 = 10, gain20 = 20) {
   );
   db.prepare(
     'INSERT INTO live(stock,name,price,prevClose,open,high,low,volume,mtime,session_date) VALUES(?,?,?,?,?,?,?,?,?,?)',
-  ).run(code, code, price, 1.19, 1.19, 1.21, 1.18, 100, fixed / 1000, '2026-10-26');
+  ).run(code, code, price, 1.19, 1.19, 1.21, 1.18, 9000000, fixed / 1000, '2026-10-26');
   for (const [i, date] of dates.entries()) {
     const close =
       i === 4 ? price / (1 + gain5 / 100) : i === 19 ? price / (1 + gain20 / 100) : 1.19;
@@ -76,10 +76,10 @@ function stock(code, gain5 = 10, gain20 = 20) {
 }
 
 test('both rolling ranges include boundaries, use dated closes, exclude future data and remain independent of volume filters', () => {
-  stock('LOWER', 7, 15);
-  stock('UPPER', 15, 25);
-  stock('BELOW', 6.999, 14.999);
-  stock('ABOVE', 15.001, 25.001);
+  stock('LOWER', 7, 7);
+  stock('UPPER', 15, 15);
+  stock('BELOW', 6.999, 6.999);
+  stock('ABOVE', 15.001, 15.001);
   db.prepare(
     "INSERT INTO daily_vol(stock,date,close,volume) VALUES('LOWER','2026-10-27',999,100)",
   ).run();
@@ -149,7 +149,7 @@ test('daily dedup survives restart, rolls back atomically, and allows a separate
   ).run();
   for (const [date, close] of [
     [dates[3], 1.2 / 1.1],
-    [dates[18], 1],
+    [dates[18], 1.2 / 1.1],
   ])
     db.prepare(
       "UPDATE daily_vol SET open=?,high=?,low=?,close=? WHERE stock='BOTH' AND date=?",
@@ -205,7 +205,7 @@ test('each period has its own switch and queue; failures retry identical frozen 
   await deliverOutbox(cfg);
   assert.equal(calls.length, 2);
   assert.ok(calls.every((call) => call.png.readUInt32BE(20) === 620));
-  db.prepare('UPDATE live SET price=999').run();
+  db.prepare('UPDATE live SET price=1.201').run();
   globalThis.fetch = async (_url, options) => {
     assert.equal(options.body.get('caption'), calls[0].caption);
     assert.deepEqual(Buffer.from(await options.body.get('photo').arrayBuffer()), calls[0].png);
@@ -261,4 +261,34 @@ test('normal broadcast evaluates both periods; public state and image endpoints 
     http.closeAllConnections();
     await new Promise((resolve) => http.close(resolve));
   }
+});
+
+test('queued period notices stop if current price/volume fails and can re-arm after recovery without blocking the other period', async () => {
+  stock('RULES');
+  recordPeriodGainNotifications(db, cfg);
+  db.prepare('UPDATE live SET volume=8000000').run();
+  const sent = [];
+  globalThis.fetch = async (_url, options) => {
+    sent.push(options.body.get('caption'));
+    return Response.json({ ok: true });
+  };
+  await deliverOutbox(cfg);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /近5个/);
+  db.prepare('UPDATE live SET volume=8000001').run();
+  assert.deepEqual(
+    recordPeriodGainNotifications(db, cfg).map((row) => row.days),
+    [20],
+  );
+  db.prepare('UPDATE live SET price=1.18').run();
+  await deliverOutbox(cfg);
+  assert.equal(sent.length, 1);
+  db.prepare('UPDATE live SET price=1.2').run();
+  assert.deepEqual(
+    recordPeriodGainNotifications(db, cfg).map((row) => row.days),
+    [20],
+  );
+  await deliverOutbox(cfg);
+  assert.equal(sent.length, 2);
+  assert.match(sent[1], /近20个/);
 });
