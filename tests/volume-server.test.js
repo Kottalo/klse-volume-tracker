@@ -69,11 +69,14 @@ function stock(code = 'TEST', volume = 1500000, previous = 500000, extra = {}) {
     Object.hasOwn(extra, 'previous_close') ? extra.previous_close : 1,
   );
   if (previous != null)
-    db.prepare('INSERT INTO daily_vol(stock,date,volume) VALUES(?,?,?)').run(
+    db.prepare('INSERT INTO daily_vol(stock,date,volume,close) VALUES(?,?,?,?)').run(
       code,
       '2026-10-02',
       previous,
+      1,
     );
+  for (const date of ['2026-10-01', '2026-09-30', '2026-09-29'])
+    db.prepare('INSERT INTO daily_vol(stock,date,volume,close) VALUES(?,?,0,1)').run(code, date);
 }
 const headers = { 'Content-Type': 'application/json', Authorization: 'Bearer test-admin' };
 const post = (url, body, auth = headers) =>
@@ -82,7 +85,7 @@ const telegram = { ...DEFAULTS, telegram_bot_token: 'FAKE', telegram_chat_id: '1
 
 test('triple-volume notifications require a rise from previous close; flat, down and unknown prices do not consume daily dedup', async () => {
   reset();
-  stock('UP', 1500000, 500000, { price: 1.01 });
+  stock('UP', 1500000, 500000, { price: 1.07 });
   stock('DOWN', 1500000, 500000, { price: 0.99 });
   stock('FLAT', 1500000, 500000, { price: 1 });
   stock('NOPRICE', 1500000, 500000, { price: null });
@@ -105,7 +108,7 @@ test('triple-volume notifications require a rise from previous close; flat, down
   );
   assert.match(reply, /股票代号：UP/);
   assert.doesNotMatch(reply, /DOWN|FLAT|NOPRICE|NOREF|ZEROREF/);
-  db.prepare("UPDATE live SET price=1.02 WHERE stock='DOWN'").run();
+  db.prepare("UPDATE live SET price=1.08 WHERE stock='DOWN'").run();
   assert.deepEqual(
     recordVolumeAlerts(telegram).map((s) => s.code),
     ['DOWN'],
@@ -132,18 +135,18 @@ test('a failed rising-volume notice stops after turning down, then can notify on
     db.prepare('SELECT last_error FROM notification_outbox WHERE id=?').get(originalId).last_error,
     /上涨条件/,
   );
-  db.prepare('UPDATE live SET price=1.02').run();
+  db.prepare('UPDATE live SET price=1.08').run();
   assert.equal(recordVolumeAlerts(telegram).length, 1);
   globalThis.fetch = async (_url, options) => {
     calls++;
-    assert.match(options.body.get('caption'), /现价 RM 1.02.*昨收 RM 1.*上涨 \+2.00%/);
+    assert.match(options.body.get('caption'), /现价 RM 1.08.*昨收 RM 1.*上涨 \+8.00%/);
     return Response.json({ ok: true });
   };
   await deliverOutbox(telegram);
   assert.equal(calls, 2);
   db.prepare('UPDATE live SET price=0.99').run();
   assert.equal(recordVolumeAlerts(telegram).length, 0);
-  db.prepare('UPDATE live SET price=1.03').run();
+  db.prepare('UPDATE live SET price=1.09').run();
   assert.equal(recordVolumeAlerts(telegram).length, 0);
 });
 
@@ -188,7 +191,7 @@ test('a stock excluded from a pending batch does not inherit another stock deliv
   assert.equal(sent.length, 1);
   assert.match(sent[0], /股票代号：UP/);
   assert.doesNotMatch(sent[0], /RECOVER/);
-  db.prepare("UPDATE live SET price=1.02 WHERE stock='RECOVER'").run();
+  db.prepare("UPDATE live SET price=1.08 WHERE stock='RECOVER'").run();
   assert.deepEqual(
     recordVolumeAlerts(telegram).map((s) => s.code),
     ['RECOVER'],
@@ -282,7 +285,9 @@ test('ratio boundary is exact and threshold crossing alerts once per stock/date,
   assert.equal(child.stdout.trim(), '0');
   Date.now = () => fixed + 86400000;
   db.prepare("UPDATE live SET session_date='2026-10-06',mtime=?").run(Date.now() / 1000);
-  db.prepare("INSERT INTO daily_vol(stock,date,volume) VALUES('TEST','2026-10-05',500000)").run();
+  db.prepare(
+    "INSERT INTO daily_vol(stock,date,volume,close) VALUES('TEST','2026-10-05',500000,1.05)",
+  ).run();
   scan();
   assert.equal(recordVolumeAlerts().length, 1);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM volume_alerts').get().n, 2);
@@ -374,7 +379,8 @@ test('absent, stale, future, incomplete, inactive and lunch snapshots cannot mas
 test('an older traded-day baseline needs a completed refresh to avoid treating missing yesterday data as zero', () => {
   reset();
   stock();
-  db.prepare("UPDATE daily_vol SET date='2026-10-01'").run();
+  db.prepare("UPDATE daily_vol SET volume=0 WHERE date='2026-10-02'").run();
+  db.prepare("UPDATE daily_vol SET volume=500000 WHERE date='2026-10-01'").run();
   scan();
   assert.equal(getStocks()[0].multiple, null);
   assert.equal(recordVolumeAlerts().length, 0);
@@ -614,7 +620,17 @@ test('backfill needs only volume, excludes unfinished/future days and recovers a
             timestamp: ['2026-10-02', '2026-10-05', '2026-10-06'].map(
               (d) => Date.parse(d + 'T09:00:00+08:00') / 1000,
             ),
-            indicators: { quote: [{ volume: [500000, 999999, 999999] }] },
+            indicators: {
+              quote: [
+                {
+                  volume: [500000, 999999, 999999],
+                  close: [1, 1.1, 1.1],
+                  open: [1, 1.1, 1.1],
+                  high: [1.01, 1.11, 1.11],
+                  low: [0.99, 1.09, 1.09],
+                },
+              ],
+            },
           },
         ],
       },
@@ -625,9 +641,8 @@ test('backfill needs only volume, excludes unfinished/future days and recovers a
   fail = false;
   assert.equal((await server.backfillDailyVol({ force: true })).done, 1);
   const bars = db.prepare('SELECT date,volume FROM daily_vol').all();
-  assert.equal(bars.length, 1);
-  assert.equal(bars[0].volume, 500000);
-  assert.equal(bars[0].date, '2026-10-02');
+  assert.equal(bars.length, 4);
+  assert.equal(bars.find((row) => row.date === '2026-10-02').volume, 500000);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM volume_alerts').get().n, 1);
 });
 test('SSE supplies state immediately and Telegram commands only return simple volume data in the configured chat', async () => {

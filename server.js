@@ -2,6 +2,11 @@
 // Node.js + Express + 内置 node:sqlite + SSE 推送
 // 数据源: Yahoo Finance 免费盘中接口(无需 key)
 import express from 'express';
+import {
+  readNotificationSignal,
+  frozenNotificationSignal,
+  NOTIFICATION_RULE_REJECTED,
+} from './lib/notification-rules.js';
 import { recordGainNotifications, gainNotificationState } from './lib/gain-notifications.js';
 import {
   PERIOD_GAIN_RULES,
@@ -54,7 +59,7 @@ const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 const DB_PATH = path.join(DATA_DIR, 'data.db');
 const DIST = path.join(__dirname, 'dist');
 const PORT = process.env.PORT || 8080;
-const VERSION = 'v3.2-volume-analysis-images';
+const VERSION = 'v3.3-gain-ma5-alerts';
 let analysisCache = null;
 
 const DEFAULTS = {
@@ -1191,7 +1196,7 @@ function cmdHelp() {
     '/stock <代码>   查单只股票现在的完整情况',
     '/screen         强势筛选: 20日涨15-25% + 放量3倍 + 站上MA5 + 四线多头排列',
     '/top            只看今日图文精选',
-    '/volume         三倍量＋100万股且上涨，独立放量分析图',
+    '/volume         三倍量＋100万股、当日涨7%–15%、高于MA5',
     '/watch [all]    观察名单及成绩',
     '/stats          规则观察结果',
     '/set <项> <值>  改参数, 例: /set pick_count 2',
@@ -1432,11 +1437,11 @@ async function handleTelegramMessage(msg, cfg) {
     if (String(msg.chat?.id) !== String(cfg.telegram_chat_id)) return null;
     const matches = getStocks(cfg).filter((s) => s.qualified);
     return matches.length
-      ? '三倍量＋100万股且上涨 · ' +
+      ? '三倍量＋100万股、当日涨7%–15%、高于MA5 · ' +
           matches[0].date +
           '\n\n' +
           matches.map(formatVolumeAlert).join('\n\n')
-      : '目前没有同时达到100万股、昨日3倍量且现价高于昨收的股票。';
+      : '目前没有同时达到100万股、昨日3倍量、当日涨7%–15%且现价高于MA5的股票。';
   }
 
   const text = (msg.text || '').trim();
@@ -1544,7 +1549,7 @@ async function pollTelegram() {
       const cmds = [
         { command: 'stock', description: '查单只股票(例 /stock MAYBANK)' },
         { command: 'top', description: '潜力精选（图文策略）' },
-        { command: 'volume', description: '三倍量＋100万股且上涨（附分析图）' },
+        { command: 'volume', description: '三倍量＋100万股、涨7%–15%、高于MA5（附图）' },
         { command: 'watch', description: '观察名单及成绩' },
         { command: 'stats', description: '规则观察结果' },
         { command: 'params', description: '查看当前所有参数' },
@@ -1751,11 +1756,19 @@ function recordPotentialAlerts(cfg = loadConfig()) {
         r.fetched_at <= now &&
         now - r.fetched_at <= 180,
     )
+    .filter((r) => readNotificationSignal(db, r.code, 'potential', cfg).pass)
     .map((r) => ({
       report: r,
       key: `${r.code}|${r.potential_signal.date}|${r.potential_signal.kind}`,
     }))
-    .filter((r) => !db.prepare('SELECT 1 FROM potential_pushes WHERE key=?').get(r.key))
+    .filter(
+      (r) =>
+        !db
+          .prepare(
+            `SELECT 1 FROM potential_pushes a JOIN notification_outbox o ON o.id=a.outbox_id WHERE a.key=? AND (o.cancelled_at IS NULL OR o.sent_at IS NOT NULL OR COALESCE(o.last_error,'')<>?)`,
+          )
+          .get(r.key, NOTIFICATION_RULE_REJECTED),
+    )
     .map((r) => ({ ...r, chart: getStockReport(r.report.code, cfg).chart }))
     .filter((r) => r.chart.rows.length >= 20)
     .slice(0, 3);
@@ -1766,9 +1779,10 @@ function recordPotentialAlerts(cfg = loadConfig()) {
     for (const item of picks) {
       const charts = [item.chart];
       const r = item.report;
+      const policy = readNotificationSignal(db, r.code, 'potential', cfg);
       const text = [
         '🔎 新潜力信号 · ' + date,
-        `股票代号：${r.code} · RM ${+r.price.toFixed(3)} · ${(r.volume / 10000).toFixed(2)}万股 · 昨日${r.volume_signal.multiple.toFixed(2)}倍\n${conciseReason(r)}`,
+        `股票代号：${r.code} · RM ${+r.price.toFixed(3)} · ${(r.volume / 10000).toFixed(2)}万股 · 昨日${r.volume_signal.multiple.toFixed(2)}倍\n当日 +${policy.gain.toFixed(2)}% · MA5 RM ${+policy.ma5.toFixed(4)}\n${conciseReason(r)}`,
         '实心箭头＝策略买点；空心箭头＝待突破。盘中未收盘，不保证上涨。',
         process.env.PUBLIC_URL || 'https://synthe-fantasia.site/',
       ].join('\n\n');
@@ -1794,7 +1808,7 @@ function recordPotentialAlerts(cfg = loadConfig()) {
           ).lastInsertRowid,
       );
       db.prepare(
-        'INSERT INTO potential_pushes(key,stock,date,kind,created_at,outbox_id) VALUES(?,?,?,?,?,?)',
+        'INSERT INTO potential_pushes(key,stock,date,kind,created_at,outbox_id) VALUES(?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET created_at=excluded.created_at,outbox_id=excluded.outbox_id',
       ).run(item.key, item.report.code, date, item.report.potential_signal.kind, now, id);
       notice = { id, text, charts };
     }
@@ -1825,7 +1839,7 @@ function potentialAlertState() {
           : row.cancelled_at
             ? row.last_error === '仅网页'
               ? '仅网页'
-              : '信号过期，已停止发送'
+              : row.last_error || '信号过期，已停止发送'
             : row.attempts
               ? '发送重试中'
               : '等待发送',
@@ -1966,7 +1980,7 @@ function deliverOutbox(cfg = loadConfig()) {
         );
         continue;
       }
-      if (item.kind === 'volume' && !prepareVolumeNotice(db, item)) {
+      if (item.kind === 'volume' && !prepareVolumeNotice(db, item, cfg)) {
         db.prepare('UPDATE notification_outbox SET cancelled_at=?,last_error=? WHERE id=?').run(
           Math.floor(Date.now() / 1000),
           VOLUME_RULE_REJECTED,
@@ -1976,6 +1990,24 @@ function deliverOutbox(cfg = loadConfig()) {
       }
       if (!['volume', 'gain', 'gain_5d', 'gain_20d'].includes(item.kind) && item.charts)
         preparePotentialNotice(item);
+      if (item.charts) {
+        const charts = JSON.parse(item.charts);
+        if (
+          !charts.length ||
+          charts.some(
+            (chart) =>
+              !frozenNotificationSignal(chart, item.kind, cfg).pass ||
+              !readNotificationSignal(db, chart.code, item.kind, cfg).pass,
+          )
+        ) {
+          db.prepare('UPDATE notification_outbox SET cancelled_at=?,last_error=? WHERE id=?').run(
+            Math.floor(Date.now() / 1000),
+            NOTIFICATION_RULE_REJECTED,
+            item.id,
+          );
+          continue;
+        }
+      }
       const result = item.charts
         ? await sendTelegramChart(item.text, JSON.parse(item.charts), cfg)
         : await sendTelegramText(item.text, cfg);
@@ -2111,7 +2143,7 @@ async function evaluateAlerts(cfg) {
   const cooldown = Math.max(1, cfg.cooldown_minutes || 30) * 60;
   const fired = [];
   for (const m of computeMetrics(cfg)) {
-    if (m.status !== 'alert') {
+    if (m.status !== 'alert' || !readNotificationSignal(db, m.code, 'daily', cfg).pass) {
       db.prepare(
         'INSERT INTO state(stock, above, last_alert) VALUES(?,0,0) ON CONFLICT(stock) DO UPDATE SET above=0',
       ).run(m.code);
@@ -2643,6 +2675,7 @@ function broadcast() {
 
 // ---------------- State ----------------
 function recordAlert(stock, name, kind, message, metrics = {}) {
+  if (kind === 'drop' || !readNotificationSignal(db, stock, 'daily', loadConfig()).pass) return;
   db.prepare(
     'INSERT INTO alerts(ts,stock,name,window,current,previous,ratio,direction,kind,message) VALUES(?,?,?,?,?,?,?,?,?,?)',
   ).run(
@@ -2899,6 +2932,15 @@ function buildState() {
   const universeCount = db.prepare('SELECT COUNT(*) c FROM universe WHERE active=1').get().c;
   return {
     version: VERSION,
+    notification_rules: {
+      minimum_gain: 7,
+      maximum_gain: 15,
+      above_ma5: true,
+      current_price_above_previous_close: true,
+      ma5_basis: '现价与前4个完整交易日收盘价的简单平均',
+      volume_5d_exclusive: 3000000,
+      volume_20d_exclusive: 8000000,
+    },
     universe_count: universeCount,
     settings: {
       poll_interval_minutes: cfg.poll_interval_minutes,
