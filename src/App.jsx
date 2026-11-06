@@ -1873,6 +1873,9 @@ function AdminSettings({ state, close, updated }) {
             />{' '}
             启用趋势筛选
           </label>
+          {state?.notification_rules?.price_limit_exclusive != null && (
+            <p>所有股票通知均要求现价低于 RM {state.notification_rules.price_limit_exclusive}。</p>
+          )}
           <label className="checkbox-label">
             <input
               type="checkbox"

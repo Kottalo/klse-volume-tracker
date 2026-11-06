@@ -61,6 +61,28 @@ test('5-day and 20-day current-day volumes must be strictly greater than 3m and 
       );
 });
 
+test('all stock notices require both the current and frozen price to be below RM 3', () => {
+  const priceHistory = history.map((row) => ({ ...row, close: 2.7 }));
+  for (const kind of ['potential', 'volume', 'gain', 'gain_5d', 'gain_20d']) {
+    for (const [price, pass] of [
+      [2.99, true],
+      [3, false],
+      [3.01, false],
+    ]) {
+      const quote = { ...live, price, prevClose: 2.7 };
+      const chart = {
+        price,
+        previous_close: quote.prevClose,
+        volume: quote.volume,
+        date: quote.session_date,
+        close_history: priceHistory,
+      };
+      assert.equal(notificationSignal(quote, priceHistory, kind, cfg).pass, pass, kind);
+      assert.equal(frozenNotificationSignal(chart, kind, cfg).pass, pass, kind);
+    }
+  }
+});
+
 test('all types reject a currently falling/flat price, missing MA history, and equality/below MA5', () => {
   for (const kind of ['potential', 'volume', 'gain', 'gain_5d', 'gain_20d']) {
     for (const prevClose of [live.price, live.price + 0.01, null, 0])
@@ -204,6 +226,17 @@ test('the shared sender enforces current and frozen conditions for every stock n
     await deliverOutbox(telegram);
     assert.equal(sent.length, 4);
     assert.ok(!sent.includes('queue-gain_20d'));
+    queue();
+    db.prepare('UPDATE live SET price=3, prevClose=2.7').run();
+    db.prepare('UPDATE daily_vol SET close=2.7').run();
+    sent.length = 0;
+    await deliverOutbox(telegram);
+    assert.equal(sent.length, 0);
+    assert.equal(
+      db.prepare('SELECT COUNT(*) n FROM notification_outbox WHERE cancelled_at IS NOT NULL').get()
+        .n,
+      5,
+    );
   } finally {
     Date.now = realNow;
     globalThis.fetch = realFetch;
