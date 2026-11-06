@@ -135,10 +135,10 @@ test('fifteen polls on entry day do not expire an observation', () => {
 
 test('broadcast preview does not consume notification deduplication', async () => {
   reset();
-  quote('GAP', 12, 100);
-  db.prepare("UPDATE live SET open=11.4 WHERE stock='GAP'").run();
+  quote('GAP', 2.4, 100);
+  db.prepare("UPDATE live SET open=2.28,prevClose=2.2 WHERE stock='GAP'").run();
   for (const date of ['2026-10-02', '2026-10-01', '2026-09-30', '2026-09-29'])
-    db.prepare("INSERT INTO daily_vol(stock,date,volume,close) VALUES('GAP',?,100,11)").run(date);
+    db.prepare("INSERT INTO daily_vol(stock,date,volume,close) VALUES('GAP',?,100,2.2)").run(date);
   const before = db.prepare('SELECT COUNT(*) c FROM gap_up_alert').get().c;
   const response = await realFetch(base + '/api/broadcast-test', { headers: admin });
   assert.equal(response.status, 200);
@@ -151,14 +151,15 @@ test('broadcast preview does not consume notification deduplication', async () =
 
 test('web alerts work without Telegram; cooldown crossing eventually fires', async () => {
   reset();
-  quote('VOL', 12, 300);
+  quote('VOL', 2.4, 300);
+  db.prepare("UPDATE live SET open=2.2,prevClose=2.2 WHERE stock='VOL'").run();
   for (const date of ['2026-10-01', '2026-09-30', '2026-09-29'])
-    db.prepare("INSERT INTO daily_vol(stock,date,volume,close) VALUES('VOL',?,0,11)").run(date);
+    db.prepare("INSERT INTO daily_vol(stock,date,volume,close) VALUES('VOL',?,0,2.2)").run(date);
   db.prepare('INSERT INTO daily_vol(stock,date,volume,close) VALUES(?,?,?,?)').run(
     'VOL',
     '2026-10-02',
     100,
-    11,
+    2.2,
   );
   const cfg = {
     ...DEFAULTS,
@@ -221,7 +222,7 @@ test('SSE sends an initial snapshot without waiting for a market poll', async ()
   controller.abort();
 });
 
-function seedTrendMarket(count = 5) {
+function seedTrendMarket(count = 5, priceScale = 1) {
   const dates = [],
     day = new Date('2026-10-02');
   while (dates.length < 25) {
@@ -233,18 +234,31 @@ function seedTrendMarket(count = 5) {
   );
   for (let i = 0; i < count; i++) {
     const code = 'STRONG' + i;
-    quote(code, 11.02, 500000 * (i + 3));
+    quote(code, 11.02 * priceScale, 500000 * (i + 3));
     dates.forEach((date, index) =>
-      insert.run(code, date, index === 19 ? 1500000 : 500000, 11, 11.1, 10.9),
+      insert.run(
+        code,
+        date,
+        index === 19 ? 1500000 : 500000,
+        11 * priceScale,
+        11.1 * priceScale,
+        10.9 * priceScale,
+      ),
     );
     db.prepare('UPDATE daily_vol SET open=close WHERE stock=?').run(code);
-    db.prepare('UPDATE live SET high=11.1,low=10.9 WHERE stock=?').run(code);
+    db.prepare('UPDATE live SET open=?,prevClose=?,high=?,low=? WHERE stock=?').run(
+      11 * priceScale,
+      11 * priceScale,
+      11.1 * priceScale,
+      10.9 * priceScale,
+      code,
+    );
   }
 }
 
 test('three-times volume is inclusive across legacy settings, shortlist, screen and potential alerts', async () => {
   reset();
-  seedTrendMarket(1);
+  seedTrendMarket(1, 0.25);
   db.prepare('UPDATE live SET prevClose=price/1.075').run();
   saveConfig({ ...DEFAULTS, screen_vol_mult: 2 });
   assert.equal(server.loadConfig().screen_vol_mult, 3);
@@ -784,7 +798,7 @@ test('next-day tracking waits for the next trading date, distinguishes intraday 
 
 function seedPotentialScan(time = '10:05:20', count = 2) {
   reset();
-  seedTrendMarket(count);
+  seedTrendMarket(count, 0.25);
   db.prepare('UPDATE live SET prevClose=price/1.075').run();
   briefingClock(time, count);
   const cfg = { ...DEFAULTS, telegram_bot_token: 'FAKE_TEST_TOKEN', telegram_chat_id: 'TEST_CHAT' };
@@ -880,7 +894,7 @@ test('pending combined potential images split into matching frozen messages with
     );
     db.prepare('UPDATE potential_pushes SET outbox_id=?').run(id);
     db.prepare('DELETE FROM notification_outbox WHERE id!=?').run(id);
-    db.prepare('UPDATE live SET price=11.03').run();
+    db.prepare('UPDATE live SET price=2.7575').run();
     const sent = [];
     globalThis.fetch = async (_url, options) => {
       const caption = options.body.get('caption');
@@ -958,10 +972,10 @@ test('only fresh, complete, eligible market scans can enqueue a potential alert'
     db.prepare('UPDATE live SET volume=500000').run();
     saveConfig(cfg);
     assert.equal(server.recordPotentialAlerts(cfg), null);
-    db.prepare('UPDATE live SET volume=2000000, price=13').run();
+    db.prepare('UPDATE live SET volume=2000000, price=2.945').run();
     saveConfig(cfg);
     assert.equal(server.recordPotentialAlerts(cfg), null); // already extended
-    db.prepare('UPDATE live SET price=11.02,mtime=?').run(Date.now() / 1000 - 181);
+    db.prepare('UPDATE live SET price=2.755,mtime=?').run(Date.now() / 1000 - 181);
     saveConfig(cfg);
     assert.equal(server.recordPotentialAlerts(cfg), null);
     briefingClock('10:05:20', 3);
@@ -992,7 +1006,7 @@ test('a breakout upgrade is new once, and a transaction failure does not consume
   try {
     assert.ok(server.recordPotentialAlerts(cfg));
     briefingClock('10:10:20', 1);
-    db.prepare('UPDATE live SET price=11.12,high=11.15').run();
+    db.prepare('UPDATE live SET price=2.78,high=2.7875').run();
     saveConfig(cfg);
     db.exec(
       "CREATE TRIGGER fail_potential BEFORE INSERT ON potential_pushes BEGIN SELECT RAISE(ABORT,'simulated'); END;",
@@ -1055,15 +1069,15 @@ test('legacy fixed-time settings are disabled and the whole-market poll is throt
             d: [
               'STRONG0',
               'Example',
-              11,
-              11.02,
+              2.75,
+              2.755,
               2000000,
               0.18,
-              0.02,
+              0.005,
               500000,
               500000,
-              11.1,
-              10.9,
+              2.775,
+              2.725,
               'MYQ0001OO001',
             ],
           },

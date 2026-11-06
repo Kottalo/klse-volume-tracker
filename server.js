@@ -6,6 +6,7 @@ import {
   readNotificationSignal,
   frozenNotificationSignal,
   NOTIFICATION_RULE_REJECTED,
+  NOTIFICATION_PRICE_LIMIT,
 } from './lib/notification-rules.js';
 import { recordGainNotifications, gainNotificationState } from './lib/gain-notifications.js';
 import {
@@ -59,7 +60,7 @@ const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 const DB_PATH = path.join(DATA_DIR, 'data.db');
 const DIST = path.join(__dirname, 'dist');
 const PORT = process.env.PORT || 8080;
-const VERSION = 'v3.3-gain-ma5-alerts';
+const VERSION = 'v3.4-notification-price-cap';
 let analysisCache = null;
 
 const DEFAULTS = {
@@ -2935,6 +2936,7 @@ function buildState() {
     notification_rules: {
       minimum_gain: 7,
       maximum_gain: 15,
+      price_limit_exclusive: NOTIFICATION_PRICE_LIMIT,
       above_ma5: true,
       current_price_above_previous_close: true,
       ma5_basis: '现价与前4个完整交易日收盘价的简单平均',
